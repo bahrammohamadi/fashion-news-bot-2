@@ -5,7 +5,8 @@ from googletrans import Translator
 import os
 import time
 
-def main():
+
+def main(context=None):  # ← این خط را تغییر دادیم (context=None)
     bot_token = os.getenv('TELEGRAM_BOT_TOKEN')
     channel_id = os.getenv('TELEGRAM_CHANNEL_ID')
     
@@ -28,22 +29,25 @@ def main():
     today = datetime.now().strftime("%Y-%m-%d")
     
     for feed_url in feeds:
-        if posted_count >= 5:
+        if posted_count >= 5:  # حداکثر ۵ پست در روز
             break
             
         feed = feedparser.parse(feed_url)
         
-        for entry in feed.entries[:3]:
+        for entry in feed.entries[:3]:  # حداکثر ۳ خبر از هر منبع
             title = entry.title
             summary = entry.get('summary', '') or entry.get('description', '')
             link = entry.link
             
+            # ترجمه به فارسی
             try:
                 trans_title = translator.translate(title, dest='fa').text
                 trans_summary = translator.translate(summary[:300], dest='fa').text if summary else ''
-            except:
+            except Exception as e:
+                print(f"خطا در ترجمه: {e}")
                 continue
             
+            # پیام نهایی
             message = f"""
 📰 <b>خبر روز مد و فشن</b>
 
@@ -64,17 +68,20 @@ def main():
                 'disable_web_page_preview': False
             }
             
-            response = requests.post(url, data=data)
-            
-            if response.status_code == 200:
+            try:
+                response = requests.post(url, data=data, timeout=15)
+                response.raise_for_status()  # اگر کد وضعیت غیر 200 بود خطا بده
+                
                 posted_count += 1
                 print(f"✅ پست شد: {trans_title[:50]}...")
-            else:
-                print(f"❌ خطا در ارسال: {response.text}")
+            except Exception as e:
+                print(f"❌ خطا در ارسال پیام: {e}")
+                print(f"پاسخ سرور: {response.text if 'response' in locals() else 'هیچ پاسخی دریافت نشد'}")
             
-            time.sleep(3)
+            time.sleep(4)  # کمی بیشتر صبر می‌کنیم تا از rate limit تلگرام جلوگیری شود
     
     print(f"🎉 {posted_count} خبر امروز پست شد!")
+
 
 if __name__ == "__main__":
     main()
