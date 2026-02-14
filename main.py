@@ -6,17 +6,17 @@ import os
 import time
 
 
-def main(context=None):  # ← این خط را تغییر دادیم (context=None)
+def main(context=None):
     bot_token = os.getenv('TELEGRAM_BOT_TOKEN')
     channel_id = os.getenv('TELEGRAM_CHANNEL_ID')
     
     if not bot_token or not channel_id:
         print("❌ متغیرهای محیطی تنظیم نشده")
-        return
+        return context.res.empty() if context else None  # ← اضافه برای امنیت
     
     translator = Translator()
     
-    # منابع اخبار (جهانی + ایرانی)
+    # منابع اخبار ...
     feeds = [
         "https://news.google.com/rss/search?q=%D9%85%D8%AF+%D9%81%D8%B4%D9%86+%D8%A7%D8%B3%D8%AA%D8%A7%DB%8C%D9%84&hl=fa&gl=IR&ceid=IR:fa",
         "https://www.vogue.com/feed/rss",
@@ -26,28 +26,25 @@ def main(context=None):  # ← این خط را تغییر دادیم (context=N
     ]
     
     posted_count = 0
-    today = datetime.now().strftime("%Y-%m-%d")
     
     for feed_url in feeds:
-        if posted_count >= 5:  # حداکثر ۵ پست در روز
+        if posted_count >= 5:
             break
             
         feed = feedparser.parse(feed_url)
         
-        for entry in feed.entries[:3]:  # حداکثر ۳ خبر از هر منبع
+        for entry in feed.entries[:3]:
             title = entry.title
             summary = entry.get('summary', '') or entry.get('description', '')
             link = entry.link
             
-            # ترجمه به فارسی
             try:
                 trans_title = translator.translate(title, dest='fa').text
                 trans_summary = translator.translate(summary[:300], dest='fa').text if summary else ''
             except Exception as e:
-                print(f"خطا در ترجمه: {e}")
+                print(f"ترجمه ناموفق: {e}")
                 continue
             
-            # پیام نهایی
             message = f"""
 📰 <b>خبر روز مد و فشن</b>
 
@@ -70,17 +67,18 @@ def main(context=None):  # ← این خط را تغییر دادیم (context=N
             
             try:
                 response = requests.post(url, data=data, timeout=15)
-                response.raise_for_status()  # اگر کد وضعیت غیر 200 بود خطا بده
-                
+                response.raise_for_status()
                 posted_count += 1
                 print(f"✅ پست شد: {trans_title[:50]}...")
             except Exception as e:
-                print(f"❌ خطا در ارسال پیام: {e}")
-                print(f"پاسخ سرور: {response.text if 'response' in locals() else 'هیچ پاسخی دریافت نشد'}")
+                print(f"❌ خطا در ارسال: {e}")
             
-            time.sleep(4)  # کمی بیشتر صبر می‌کنیم تا از rate limit تلگرام جلوگیری شود
+            time.sleep(4)
     
     print(f"🎉 {posted_count} خبر امروز پست شد!")
+    
+    # این خط مهم‌ترین تغییر است ↓
+    return context.res.empty() if context else "Done"   # یا هر چیزی
 
 
 if __name__ == "__main__":
