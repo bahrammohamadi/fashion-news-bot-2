@@ -1,35 +1,38 @@
 import os
 import asyncio
 import feedparser
-import requests
 from datetime import datetime, timedelta, timezone
 from telegram import Bot
 from appwrite.client import Client
 from appwrite.services.databases import Databases
 from appwrite.exception import AppwriteException
 from appwrite.query import Query
+import google.generativeai as genai
 
 async def main(event=None, context=None):
+    # گرفتن متغیرهای محیطی
     token = os.environ.get('TELEGRAM_BOT_TOKEN')
     chat_id = os.environ.get('TELEGRAM_CHANNEL_ID')
     appwrite_endpoint = os.environ.get('APPWRITE_ENDPOINT', 'https://cloud.appwrite.io/v1')
     appwrite_project = os.environ.get('APPWRITE_PROJECT_ID')
     appwrite_key = os.environ.get('APPWRITE_API_KEY')
     database_id = os.environ.get('APPWRITE_DATABASE_ID')
-    collection_id = 'history'
+    collection_id = 'history'  # نام کالکشن تاریخچه پست‌ها
 
     if not all([token, chat_id, appwrite_project, appwrite_key, database_id]):
-        print("متغیرهای محیطی ناقص!")
-        return {"status": "error"}
+        print("یکی یا چند متغیر محیطی تنظیم نشده است")
+        return {"status": "error", "message": "متغیرهای محیطی ناقص"}
 
     bot = Bot(token=token)
 
+    # اتصال به Appwrite
     aw_client = Client()
     aw_client.set_endpoint(appwrite_endpoint)
     aw_client.set_project(appwrite_project)
     aw_client.set_key(appwrite_key)
     databases = Databases(aw_client)
 
+    # لیست فیدهای RSS (ترکیبی فارسی و انگلیسی)
     rss_feeds = [
         "https://www.vogue.com/feed/rss",
         "https://wwd.com/feed/",
@@ -54,17 +57,19 @@ async def main(event=None, context=None):
 
     posted_count = 0
     now = datetime.now(timezone.utc)
-    time_threshold = now - timedelta(hours=24)
+    time_threshold = now - timedelta(hours=24)  # فقط اخبار ۲۴ ساعت اخیر
 
     for feed_url in rss_feeds:
         try:
             feed = feedparser.parse(feed_url)
             if not feed.entries:
+                print(f"فید خالی: {feed_url}")
                 continue
 
-            is_persian = any(x in feed_url.lower() for x in ['.ir', 'khabaronline', 'isna', 'tasnim', 'hamshahrionline', 'fararu', 'beytoote', 'digikala', 'zoomit', 'medopia'])
+            is_persian_feed = any(x in feed_url.lower() for x in ['.ir', 'khabaronline', 'isna', 'tasnim', 'hamshahrionline', 'fararu', 'beytoote', 'digikala', 'zoomit', 'medopia'])
 
-            for entry in feed.entries[:4]:
+            for entry in feed.entries[:4]:  # حداکثر ۴ پست از هر فید در هر اجرا
+                # تاریخ انتشار
                 published = entry.get('published_parsed') or entry.get('updated_parsed')
                 if not published:
                     continue
@@ -75,6 +80,7 @@ async def main(event=None, context=None):
                 title = entry.title.strip()
                 link = entry.link.strip()
 
+                # چک تکراری بودن در دیتابیس
                 try:
                     existing = databases.list_documents(
                         database_id=database_id,
@@ -82,30 +88,50 @@ async def main(event=None, context=None):
                         queries=[Query.equal("link", link)]
                     )
                     if existing['total'] > 0:
-                        print(f"تکراری رد شد: {title[:60]}")
+                        print(f"پست تکراری رد شد: {title[:60]}...")
                         continue
-                except AppwriteException as e:
-                    print(f"خطا چک DB: {str(e)}")
+                except AppwriteException as db_err:
+                    print(f"خطا در چک کردن دیتابیس: {str(db_err)}")
 
-                summary = (entry.get('summary') or entry.get('description') or '').strip()[:400]
+                # خلاصه
+                summary = (entry.get('summary') or entry.get('description') or '').strip()[:500]
 
-                if is_persian:
+                # گرفتن عکس از RSS (اولویت اول)
+                image_url = get_image_from_rss(entry)
+
+                # پردازش محتوا
+                if is_persian_feed:
                     content = f"{title}\n\n{summary}"
-                    image_url = get_image_from_rss(entry)
                 else:
-                    content, image_url = await process_with_puter_gemini(title, summary)
+                    content, gemini_image = await process_with_gemini(title, summary)
+                    # اگر Gemini عکس ساخت، استفاده کن (در حال حاضر None است)
+                    if gemini_image:
+                        image_url = gemini_image
 
-                final_text = f"{content}\n\n#مد #استایل #ترند #فشن_ایرانی #مهرجامه"
+                final_text = f"{content}\n\n🔗 {link}\n#مد #استایل #ترند #فشن_ایرانی #مهرجامه"
 
+                # ارسال پست
                 try:
                     if image_url:
-                        await bot.send_photo(chat_id=chat_id, photo=image_url, caption=final_text, parse_mode='HTML', disable_notification=True)
+                        await bot.send_photo(
+                            chat_id=chat_id,
+                            photo=image_url,
+                            caption=final_text,
+                            parse_mode='HTML',
+                            disable_notification=True
+                        )
                     else:
-                        await bot.send_message(chat_id=chat_id, text=final_text, disable_web_page_preview=True, disable_notification=True)
+                        await bot.send_message(
+                            chat_id=chat_id,
+                            text=final_text,
+                            disable_web_page_preview=True,
+                            disable_notification=True
+                        )
 
                     posted_count += 1
-                    print(f"پست موفق: {title[:60]}")
+                    print(f"پست موفق: {title[:60]}...")
 
+                    # ذخیره در دیتابیس
                     try:
                         databases.create_document(
                             database_id=database_id,
@@ -115,83 +141,65 @@ async def main(event=None, context=None):
                                 'link': link,
                                 'title': title,
                                 'published_at': now.isoformat(),
-                                'feed_url': feed_url
+                                'feed_url': feed_url,
+                                'created_at': now.isoformat()
                             }
                         )
-                        print("ذخیره در DB موفق")
+                        print("ذخیره در دیتابیس موفق")
                     except AppwriteException as save_err:
-                        print(f"خطا ذخیره DB: {str(save_err)}")
+                        print(f"خطا در ذخیره دیتابیس: {str(save_err)}")
 
                 except Exception as send_err:
-                    print(f"خطا ارسال: {str(send_err)}")
+                    print(f"خطا در ارسال پست: {str(send_err)}")
 
         except Exception as feed_err:
-            print(f"خطا فید {feed_url}: {str(feed_err)}")
+            print(f"خطا در پردازش فید {feed_url}: {str(feed_err)}")
 
-    print(f"این اجرا: {posted_count} پست")
+    print(f"اجرای این دور: {posted_count} پست ارسال شد")
     return {"status": "success", "posted": posted_count}
 
 
-async def process_with_puter_gemini(title_en, summary_en):
-    prompt = f"""این خبر مد انگلیسی را به فارسی طبیعی، روان و جذاب برای خانم‌های ایرانی بازنویسی کن.
+async def process_with_gemini(title_en, summary_en):
+    try:
+        api_key = os.environ.get('GEMINI_API_KEY')
+        if not api_key:
+            raise ValueError("GEMINI_API_KEY پیدا نشد")
+
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel('gemini-1.5-flash')
+
+        prompt = f"""این خبر مد انگلیسی را به فارسی طبیعی، روان و جذاب برای خانم‌های ایرانی بازنویسی کن.
 ابتدا یک تیتر کوتاه و گیرا بنویس.
 بعد متن اصلی را در ۱ تا ۲ پاراگراف کوتاه بنویس:
 - با تنش واقعی زندگی شروع کن (سردرگمی خرید، تکراری شدن کمد لباس، فشار انتخاب استایل مناسب و ...).
 - ترند جدید را به عنوان راه‌حل یا ایده جالب معرفی کن.
 - لحن دوستانه، گفتگویی و نزدیک به زبان روزمره باشه.
-- بدون تبلیغ مستقیم، بدون قیمت، بدون لینک، بدون برچسب اضافی مثل "پاراگراف اول" یا "متن خبر".
-
+- بدون تبلیغ مستقیم، بدون قیمت، بدون لینک.
 خروجی دقیقاً این شکل باشه (فقط متن خام):
 تیتر جذاب
 متن کامل (۱ یا ۲ پاراگراف)
 
-در انتها یک پرامپت دقیق و حرفه‌ای برای ساخت عکس مرتبط بنویس (برای txt2img): پرامپت تصویر:
-
 عنوان انگلیسی: {title_en}
 خلاصه انگلیسی: {summary_en}"""
 
-    try:
-        # درخواست chat به Puter (Gemini از طریق Puter)
-        response = requests.post(
-            "https://api.puter.com/v2/ai/chat",
-            json={
-                "prompt": prompt,
-                "model": "gemini-2.5-flash-preview"  # سریع و خوب برای متن فارسی
-            },
-            headers={"Content-Type": "application/json"}
-        ).json()
+        response = model.generate_content(prompt)
+        full_text = response.text.strip()
 
-        full_text = response.get('response', '').strip()
-        if not full_text:
-            raise ValueError("پاسخ خالی")
-
-        # جدا کردن پرامپت تصویر
-        if "پرامپت تصویر:" in full_text:
-            parts = full_text.split("پرامپت تصویر:")
-            content = parts[0].strip()
-            image_prompt = parts[1].strip()
+        # جدا کردن تیتر و متن
+        if '\n' in full_text:
+            title_fa, content_fa = full_text.split('\n', 1)
+            title_fa = title_fa.strip()
+            content_fa = content_fa.strip()
         else:
-            content = full_text
-            image_prompt = f"تصویر استایل مد ایرانی شیک و جذاب برای خانم‌ها بر اساس ترند: {title_en}، با رنگ‌های هماهنگ، لباس روزمره، فضای مدرن ایرانی"
+            title_fa = title_en
+            content_fa = full_text
 
-        print(f"Puter متن موفق: {content[:80]}...")
+        return f"{title_fa}\n\n{content_fa}", None  # فعلاً تصویر از Gemini نمی‌گیریم
 
-        # ساخت تصویر با Nano Banana (Gemini Image از طریق Puter)
-        image_response = requests.post(
-            "https://api.puter.com/v2/ai/txt2img",
-            json={
-                "prompt": image_prompt,
-                "model": "gemini-2.5-flash-image-preview"  # سریع و باکیفیت
-            },
-            headers={"Content-Type": "application/json"}
-        ).json()
-
-        image_url = image_response.get('image_url')
-
-        return content, image_url
     except Exception as e:
-        print(f"Puter خطا: {str(e)}")
-        return f"📰 {title_en}\n{summary_en[:200]}...", None
+        print(f"خطا در Gemini: {str(e)}")
+        # fallback
+        return f"📰 {title_en}\n{summary_en[:300]}...", None
 
 
 def get_image_from_rss(entry):
