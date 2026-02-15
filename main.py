@@ -7,27 +7,27 @@ from openai import AsyncOpenAI
 from appwrite.client import Client
 from appwrite.services.databases import Databases
 from appwrite.exception import AppwriteException
-from appwrite.query import Query  # این رو اضافه کن
+from appwrite.query import Query
 
 async def main(event=None, context=None):
     token = os.environ.get('TELEGRAM_BOT_TOKEN')
     chat_id = os.environ.get('TELEGRAM_CHANNEL_ID')
-    deepseek_key = os.environ.get('DEEPSEEK_API_KEY')
+    groq_key = os.environ.get('GROQ_API_KEY')
     appwrite_endpoint = os.environ.get('APPWRITE_ENDPOINT', 'https://cloud.appwrite.io/v1')
     appwrite_project = os.environ.get('APPWRITE_PROJECT_ID')
     appwrite_key = os.environ.get('APPWRITE_API_KEY')
     database_id = os.environ.get('APPWRITE_DATABASE_ID')
     collection_id = 'history'
 
-    if not all([token, chat_id, deepseek_key, appwrite_project, appwrite_key, database_id]):
+    if not all([token, chat_id, groq_key, appwrite_project, appwrite_key, database_id]):
         print("متغیرهای محیطی ناقص!")
         return {"status": "error"}
 
     bot = Bot(token=token)
 
-    deepseek_client = AsyncOpenAI(
-        api_key=deepseek_key,
-        base_url="https://api.deepseek.com/v1"
+    groq_client = AsyncOpenAI(
+        api_key=groq_key,
+        base_url="https://api.groq.com/openai/v1"
     )
 
     aw_client = Client()
@@ -81,7 +81,6 @@ async def main(event=None, context=None):
                 title = entry.title.strip()
                 link = entry.link.strip()
 
-                # چک تکراری با Query درست
                 try:
                     existing = databases.list_documents(
                         database_id=database_id,
@@ -92,14 +91,14 @@ async def main(event=None, context=None):
                         print(f"تکراری رد شد: {title[:60]}")
                         continue
                 except AppwriteException as e:
-                    print(f"خطا چک DB: {str(e)} - پست ارسال می‌شود")
+                    print(f"خطا چک DB: {str(e)}")
 
                 summary = (entry.get('summary') or entry.get('description') or '').strip()[:400]
 
                 if is_persian:
                     content = f"{title}\n\n{summary}"
                 else:
-                    content = await rewrite_with_deepseek(deepseek_client, title, summary)
+                    content = await rewrite_with_groq(groq_client, title, summary)
 
                 final_text = f"{content}\n\n#مد #استایل #ترند #فشن_ایرانی #مهرجامه"
 
@@ -121,7 +120,6 @@ async def main(event=None, context=None):
                     posted_count += 1
                     print(f"پست موفق: {title[:60]}")
 
-                    # ذخیره در DB
                     try:
                         databases.create_document(
                             database_id=database_id,
@@ -148,36 +146,36 @@ async def main(event=None, context=None):
     return {"status": "success", "posted": posted_count}
 
 
-async def rewrite_with_deepseek(client, title_en, summary_en):
-    prompt = f"""این خبر مد را به فارسی طبیعی و جذاب برای خانم‌های ایرانی بازنویسی کن.
-ابتدا یک تیتر کوتاه و گیرا بنویس (۱ خط).
-بعد متن اصلی را بنویس (طول رندوم: ۱ یا ۲ پاراگراف کوتاه، حداکثر ۱۵۰–۲۰۰ کلمه).
-- با موقعیت واقعی شروع کن (سردرگمی خرید، تکراری شدن لباس‌ها، فشار انتخاب استایل).
-- ترند را به عنوان راه‌حل معرفی کن.
-- لحن دوستانه و گفتگویی باشه.
-- بدون تبلیغ، قیمت، لینک، برچسب اضافی.
+async def rewrite_with_groq(client, title_en, summary_en):
+    prompt = f"""این خبر مد را به فارسی طبیعی، روان و جذاب برای خانم‌های ایرانی بازنویسی کن.
+ابتدا یک تیتر کوتاه و گیرا بنویس (۱ خط، بدون برچسب).
+بعد متن اصلی را بنویس (طول رندوم: گاهی ۱ پاراگراف کوتاه، گاهی ۱ پاراگراف + جمله اضافی، گاهی ۲ پاراگراف کوتاه – حداکثر ۱۵۰–۲۰۰ کلمه).
+- با یک موقعیت واقعی و احساسی شروع کن (مثل سردرگمی خرید، تکراری شدن لباس‌ها، فشار انتخاب استایل مناسب و ...).
+- ترند جدید را به عنوان راه‌حل یا ایده جالب معرفی کن.
+- لحن دوستانه، گفتگویی و نزدیک به زبان روزمره باشه.
+- بدون تبلیغ مستقیم، بدون قیمت، بدون لینک، بدون برچسب اضافی مثل "پاراگراف اول" یا "متن خبر".
 
-خروجی فقط:
+خروجی دقیقاً این شکل باشه (فقط متن خام):
 تیتر جذاب
-متن کامل
+متن کامل (۱ یا ۲ پاراگراف)
 
 عنوان انگلیسی: {title_en}
 خلاصه انگلیسی: {summary_en}"""
 
     try:
         response = await client.chat.completions.create(
-            model="deepseek-chat",
+            model="llama-3.1-70b-versatile",
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=250,
+            max_tokens=300,
             temperature=0.7
         )
         text = response.choices[0].message.content.strip()
-        if not text:
-            raise ValueError("پاسخ خالی")
-        print(f"DeepSeek موفق: {text[:80]}...")
+        if not text or len(text) < 50:
+            raise ValueError("پاسخ نامناسب")
+        print(f"Groq موفق: {text[:80]}...")
         return text
     except Exception as e:
-        print(f"DeepSeek خطا: {str(e)}")
+        print(f"Groq خطا: {str(e)}")
         return f"📰 {title_en}\n{summary_en[:200]}..."
 
 
