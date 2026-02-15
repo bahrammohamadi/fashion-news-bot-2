@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 from telegram import Bot
 import google.generativeai as genai
 
-# Appwrite imports
+# Appwrite
 from appwrite.client import Client
 from appwrite.services.databases import Databases
 from appwrite.exception import AppwriteException
@@ -17,8 +17,8 @@ async def main(event=None, context=None):
     appwrite_endpoint = os.environ.get('APPWRITE_ENDPOINT', 'https://cloud.appwrite.io/v1')
     appwrite_project = os.environ.get('APPWRITE_PROJECT_ID')
     appwrite_key = os.environ.get('APPWRITE_API_KEY')
-    database_id = os.environ.get('APPWRITE_DATABASE_ID')  # ID دیتابیس fashion_db
-    collection_id = 'history'  # نام کالکشن
+    database_id = os.environ.get('APPWRITE_DATABASE_ID')
+    collection_id = 'history'
 
     if not all([token, chat_id, gemini_key, appwrite_project, appwrite_key, database_id]):
         print("متغیرهای محیطی ناقص!")
@@ -28,7 +28,6 @@ async def main(event=None, context=None):
     genai.configure(api_key=gemini_key)
     model = genai.GenerativeModel('gemini-2.5-flash')
 
-    # اتصال به Appwrite
     client = Client()
     client.set_endpoint(appwrite_endpoint)
     client.set_project(appwrite_project)
@@ -36,7 +35,7 @@ async def main(event=None, context=None):
     databases = Databases(client)
 
     rss_feeds = [
-        # خارجی - ترجمه می‌شوند
+        # خارجی
         "https://www.vogue.com/feed/rss",
         "https://wwd.com/feed/",
         "https://www.harpersbazaar.com/rss/fashion.xml",
@@ -47,9 +46,8 @@ async def main(event=None, context=None):
         "https://www.thecut.com/feed",
         "https://www.whowhatwear.com/rss",
         "https://feeds.feedburner.com/fibre2fashion/fashion-news",
-        "https://www.instyle.com/rss",  # اضافه جدید
-
-        # فارسی/ایرانی - مستقیم پست
+        "https://www.instyle.com/rss",
+        # فارسی/ایرانی
         "https://medopia.ir/feed/",
         "https://www.digikala.com/mag/feed/?category=مد",
         "https://www.khabaronline.ir/rss/category/مد-زیبایی",
@@ -59,7 +57,6 @@ async def main(event=None, context=None):
         "https://fararu.com/rss/category/مد-زیبایی",
         "https://www.beytoote.com/rss/fashion",
         "https://www.zoomit.ir/feed/category/fashion-beauty/",
-        # اگر فیدهای بیشتری پیدا کردی اضافه کن
     ]
 
     posted_count = 0
@@ -83,9 +80,9 @@ async def main(event=None, context=None):
                     continue
 
                 title = entry.title.strip()
-                link = entry.link.strip()  # کلیدی برای چک تکراری
+                link = entry.link.strip()
 
-                # چک تکراری در DB
+                # چک تکراری
                 try:
                     existing = databases.list_documents(
                         database_id=database_id,
@@ -93,11 +90,10 @@ async def main(event=None, context=None):
                         queries=[f'equal("link", ["{link}"])']
                     )
                     if existing['total'] > 0:
-                        print(f"تکراری: {title[:60]}... رد شد")
+                        print(f"تکراری رد شد: {title[:60]}")
                         continue
-                except AppwriteException as db_err:
-                    print(f"خطا چک DB: {str(db_err)} - پست ارسال می‌شود (fallback)")
-                    # اگر DB مشکل داشت، پست می‌فرستیم ولی ذخیره نمی‌کنیم
+                except AppwriteException as e:
+                    print(f"خطا چک DB: {str(e)}")
 
                 summary = (entry.get('summary') or entry.get('description') or '').strip()[:400]
 
@@ -109,7 +105,7 @@ async def main(event=None, context=None):
                 final_text = f"{content}\n\n#مد #استایل #ترند #فشن_ایرانی #مهرجامه"
 
                 photo_url = None
-                if 'enclosure' in entry and entry.enclosure.get('type', '').startswith('image/'):
+                if 'enclosure' in entry and entry.enclosure and entry.enclosure.get('type', '').startswith('image/'):
                     photo_url = entry.enclosure.href
                 elif 'media_content' in entry:
                     for media in entry.media_content:
@@ -124,7 +120,7 @@ async def main(event=None, context=None):
                         await bot.send_message(chat_id=chat_id, text=final_text, disable_web_page_preview=True, disable_notification=True)
 
                     posted_count += 1
-                    print(f"پست موفق: {title[:60]}...")
+                    print(f"پست موفق: {title[:60]}")
 
                     # ذخیره در DB
                     try:
@@ -139,7 +135,6 @@ async def main(event=None, context=None):
                                 'feed_url': feed_url
                             }
                         )
-                        print("ذخیره در DB موفق")
                     except AppwriteException as save_err:
                         print(f"خطا ذخیره DB: {str(save_err)}")
 
@@ -149,22 +144,22 @@ async def main(event=None, context=None):
         except Exception as feed_err:
             print(f"خطا فید {feed_url}: {str(feed_err)}")
 
-    print(f"اجرای این دور: {posted_count} پست")
+    print(f"این اجرا: {posted_count} پست")
     return {"status": "success", "posted": posted_count}
 
 
 async def rewrite_with_gemini(model, title_en, summary_en):
     prompt = f"""این خبر مد را به فارسی طبیعی و جذاب برای خانم‌های ایرانی بازنویسی کن.
-ابتدا یک تیتر کوتاه و گیرا بنویس.
-بعد متن را در ۱ تا ۲ پاراگراف (حداکثر ۸-۱۰ جمله) بنویس:
-- با تنش واقعی شروع کن (سردرگمی خرید، تکراری شدن استایل و ...).
-- ترند را به عنوان راه‌حل معرفی کن.
-- لحن دوستانه و روزمره.
+ابتدا یک تیتر کوتاه و گیرا بنویس (۱ خط، بدون هیچ برچسب).
+بعد متن اصلی را بنویس (طول رندوم: گاهی ۱ پاراگراف کوتاه، گاهی ۱ پاراگراف + جمله اضافی، گاهی ۲ پاراگراف کوتاه – حداکثر ۱۵۰–۲۰۰ کلمه).
+- با موقعیت واقعی و احساسی شروع کن (سردرگمی خرید، تکراری شدن کمد، فشار انتخاب استایل و ...).
+- ترند را به عنوان راه‌حل یا ایده جالب معرفی کن.
+- لحن دوستانه و گفتگویی باشه.
+- بدون تبلیغ، قیمت، لینک، برچسب مثل "پاراگراف اول" یا "متن خبر".
 
-خروجی:
+خروجی فقط این دو بخش باشه (بدون هیچ چیز اضافی):
 تیتر جذاب
-پاراگراف اول
-پاراگراف دوم (اختیاری)
+متن کامل (۱ یا ۲ پاراگراف)
 
 عنوان انگلیسی: {title_en}
 خلاصه انگلیسی: {summary_en}"""
@@ -172,8 +167,8 @@ async def rewrite_with_gemini(model, title_en, summary_en):
     try:
         response = await asyncio.to_thread(model.generate_content, prompt)
         text = response.text.strip()
-        if not text:
-            raise ValueError("پاسخ خالی")
+        if not text or len(text) < 30:
+            raise ValueError("پاسخ نامناسب")
         print(f"Gemini موفق: {text[:80]}...")
         return text
     except Exception as e:
