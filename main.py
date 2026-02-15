@@ -4,7 +4,6 @@ import random
 import requests
 import feedparser
 
-
 def main(context=None):
     bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
     channel_id = os.getenv("TELEGRAM_CHANNEL_ID")
@@ -17,7 +16,6 @@ def main(context=None):
         "https://news.google.com/rss/search?q=مد+فشن+استایل&hl=fa&gl=IR&ceid=IR:fa",
         "https://www.vogue.com/feed/rss",
         "https://wwd.com/feed/",
-        "https://feeds.feedburner.com/fibre2fashion/fashion-news",
     ]
 
     posted = 0
@@ -42,7 +40,6 @@ def main(context=None):
             if not title or not link:
                 continue
 
-            # بدون ترجمه سنگین – فقط کمی ایرانیزه
             message = f"""
 📰 <b>خبر روز مد و فشن</b>
 
@@ -52,7 +49,7 @@ def main(context=None):
 
 🔗 <a href="{link}">ادامه خبر</a>
 
-#مد #فشن #استایل_ایرانی #ترند #ایران_مد
+#مد #فشن #استایل_ایرانی
             """.strip()
 
             url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
@@ -71,11 +68,10 @@ def main(context=None):
             except Exception as e:
                 print(f"Telegram error: {e}")
 
-            time.sleep(random.uniform(2.5, 4.5))
+            time.sleep(random.uniform(2, 4))
 
     result = {"status": "ok", "posted": posted}
     return context.res.json(result) if context else result
-
 
 if __name__ == "__main__":
     main()
