@@ -6,47 +6,60 @@ from telegram import Bot
 import google.generativeai as genai
 
 async def main(event=None, context=None):
-    # گرفتن متغیرهای محیطی
     token = os.environ.get('TELEGRAM_BOT_TOKEN')
     chat_id = os.environ.get('TELEGRAM_CHANNEL_ID')
     gemini_key = os.environ.get('GEMINI_API_KEY')
 
     if not token or not chat_id or not gemini_key:
-        print("یکی از متغیرهای محیطی تنظیم نشده است!")
-        return {"status": "error", "message": "متغیرهای لازم موجود نیستند"}
+        print("یکی از متغیرهای محیطی تنظیم نشده!")
+        return {"status": "error"}
 
-    # تنظیم بات تلگرام
     bot = Bot(token=token)
-
-    # تنظیم Gemini با مدل جدید
     genai.configure(api_key=gemini_key)
-    model = genai.GenerativeModel('gemini-2.5-flash')  # مدل جدید و سریع برای 2026 - اگر خطا داد به 'gemini-3-flash-preview' تغییر بده
+    model = genai.GenerativeModel('gemini-2.5-flash')  # یا gemini-2.5-flash-latest اگر خطا داد
 
-    # لیست فیدهای RSS (خارجی‌ها برای ترجمه، می‌تونی فارسی اضافه کنی مثل https://medopia.ir/feed/)
+    # لیست فیدها – ۱۰ خارجی + ۱۰ فارسی/ایرانی
     rss_feeds = [
+        # خارجی (ترجمه می‌شوند)
         "https://www.vogue.com/feed/rss",
         "https://wwd.com/feed/",
         "https://www.harpersbazaar.com/rss/fashion.xml",
         "https://fashionista.com/feed",
-        "https://feeds.feedburner.com/fibre2fashion/fashion-news",
         "https://www.businessoffashion.com/feed/",
+        "https://www.elle.com/rss/fashion.xml",
+        "https://www.refinery29.com/rss.xml",
+        "https://www.thecut.com/feed",
+        "https://www.whowhatwear.com/rss",
+        "https://feeds.feedburner.com/fibre2fashion/fashion-news",
+        
+        # فارسی/ایرانی (مستقیم پست می‌شوند – بدون ترجمه)
+        "https://medopia.ir/feed/",
+        "https://www.digikala.com/mag/feed/?category=مد",
+        "https://www.khabaronline.ir/rss/category/مد-زیبایی",
+        "https://www.isna.ir/rss/category/فرهنگ-هنر",
+        "https://www.tasnimnews.com/fa/rss/feed/0/0/0/سبک-زندگی",
+        "https://www.hamshahrionline.ir/rss/category/مد",
+        "https://fararu.com/rss/category/مد-زیبایی",
+        "https://www.beytoote.com/rss/fashion",
+        # اگر فیدهای بیشتری داری اضافه کن
+        "https://www.voguearabia.com/feed",  # اگر فارسی داشته باشه
+        "https://www.zoomit.ir/feed/category/fashion-beauty/"  # زومیت بخش زیبایی
     ]
 
     posted_count = 0
     now = datetime.now(timezone.utc)
-    time_threshold = now - timedelta(hours=24)  # فقط اخبار ۲۴ ساعت اخیر
+    time_threshold = now - timedelta(hours=24)
 
     for feed_url in rss_feeds:
         try:
             feed = feedparser.parse(feed_url)
             if not feed.entries:
-                print(f"فید خالی: {feed_url}")
                 continue
 
-            print(f"پردازش فید: {feed_url} — {len(feed.entries)} مورد")
+            # تشخیص اینکه فید فارسی است یا خارجی (برای ترجمه یا مستقیم)
+            is_persian = any(x in feed_url.lower() for x in ['.ir', 'khabaronline', 'isna', 'tasnim', 'hamshahrionline', 'fararu', 'beytoote', 'digikala', 'zoomit'])
 
-            for entry in feed.entries[:5]:  # حداکثر ۵ تا از هر فید
-                # چک تاریخ
+            for entry in feed.entries[:4]:  # حداکثر ۴ تا از هر فید برای کنترل حجم
                 published = entry.get('published_parsed') or entry.get('updated_parsed')
                 if not published:
                     continue
@@ -54,22 +67,19 @@ async def main(event=None, context=None):
                 if pub_date < time_threshold:
                     continue
 
-                title_en = entry.title.strip()
-                link = entry.link
-                summary_en = (entry.get('summary') or entry.get('description') or '').strip()[:350]
-                if summary_en:
-                    summary_en += '...'
+                title = entry.title.strip()
+                link = entry.link  # فقط برای لاگ
+                summary = (entry.get('summary') or entry.get('description') or '').strip()[:400]
 
-                # فارسی‌سازی با Gemini (تیتر جذاب + متن)
-                farsi_content = await rewrite_with_gemini(model, title_en, summary_en)
+                # اگر فید فارسی باشد → مستقیم استفاده کن
+                if is_persian:
+                    content = f"{title}\n\n{summary}"
+                else:
+                    # ترجمه و بازنویسی با Gemini
+                    content = await rewrite_with_gemini(model, title, summary)
 
-                final_text = (
-                    f"{farsi_content}\n\n"
-                    f"🔗 {link}\n"
-                    f"#مد #استایل #ترند #فشن_ایرانی #مهرجامه"
-                )
+                final_text = f"{content}\n\n#مد #استایل #ترند #فشن_ایرانی #مهرجامه"
 
-                # پیدا کردن عکس (اگر وجود داشت)
                 photo_url = None
                 if 'enclosure' in entry and entry.enclosure.get('type', '').startswith('image/'):
                     photo_url = entry.enclosure.href
@@ -79,7 +89,6 @@ async def main(event=None, context=None):
                             photo_url = media.get('url')
                             break
 
-                # ارسال پست: اول عکس اگر بود، با caption تیتر+متن
                 try:
                     if photo_url:
                         await bot.send_photo(
@@ -93,44 +102,48 @@ async def main(event=None, context=None):
                         await bot.send_message(
                             chat_id=chat_id,
                             text=final_text,
-                            disable_web_page_preview=False,
+                            disable_web_page_preview=True,
                             disable_notification=True
                         )
                     posted_count += 1
-                    print(f"پست موفق: {title_en[:60]}...")
-                except Exception as send_err:
-                    print(f"خطا در ارسال پست '{title_en[:40]}...': {str(send_err)}")
+                    print(f"پست موفق: {title[:60]}...")
+                except Exception as e:
+                    print(f"خطا ارسال: {str(e)}")
 
-        except Exception as feed_err:
-            print(f"خطا در پردازش فید {feed_url}: {str(feed_err)}")
+        except Exception as e:
+            print(f"خطا فید {feed_url}: {str(e)}")
 
-    print(f"اجرای این دور: {posted_count} پست ارسال شد")
-    return {"status": "success", "posted_count": posted_count}
+    print(f"این اجرا: {posted_count} پست ارسال شد")
+    return {"status": "success", "posted": posted_count}
 
 
 async def rewrite_with_gemini(model, title_en, summary_en):
-    prompt = f"""این خبر مد را به فارسی طبیعی و جذاب برای خانم‌های ایرانی بازنویسی کن.
-ابتدا یک تیتر جذاب و فارسی بنویس (کوتاه و گیرا، مثل یک جمله واقعی زندگی).
-بعد متن اصلی خبر را در ۳ تا ۵ جمله کوتاه بنویس: با تنش واقعی شروع کن (مثل سردرگمی خرید لباس، تکراری شدن استایل، یا فشار انتخاب مناسب).
-بعد ترند را به عنوان راه‌حل معرفی کن.
-بدون تبلیغ مستقیم، بدون قیمت، بدون لینک فروش.
-فقط خروجی: تیتر در خط اول، سپس متن در خطوط بعدی (بدون برچسب اضافی).
+    prompt = f"""این خبر مد را به فارسی طبیعی و روان برای مخاطب ایرانی بازنویسی کن.
+ابتدا یک تیتر جذاب و کوتاه فارسی بنویس.
+بعد متن خبر را در ۱ تا ۲ پاراگراف (حداکثر ۸-۱۰ جمله کوتاه) بنویس:
+- با یک موقعیت واقعی و احساسی شروع کن (سردرگمی خرید، تکراری شدن لباس‌ها، فشار انتخاب استایل و ...).
+- ترند جدید را به عنوان راه‌حل یا ایده جالب معرفی کن.
+- لحن دوستانه و نزدیک به گفتگوی روزمره باشد.
+- بدون تبلیغ مستقیم، بدون قیمت، بدون لینک.
+
+خروجی دقیقاً این شکل:
+تیتر جذاب
+پاراگراف اول
+پاراگراف دوم (اگر لازم بود)
 
 عنوان انگلیسی: {title_en}
-خلاصه انگلیسی: {summary_en}
-"""
+خلاصه انگلیسی: {summary_en}"""
 
     try:
-        response = await asyncio.to_thread(model.generate_content, prompt)  # async wrapper برای sync call
+        response = await asyncio.to_thread(model.generate_content, prompt)
         text = response.text.strip()
-        if not text:
-            raise ValueError("پاسخ خالی از Gemini")
-        print(f"Gemini موفق تولید کرد: {text[:60]}...")
+        if not text or len(text) < 30:
+            raise ValueError("پاسخ نامناسب")
+        print(f"Gemini موفق: {text[:80]}...")
         return text
     except Exception as e:
-        error_msg = str(e)
-        print(f"Gemini خطا داد: {error_msg}")
-        raise  # حالا execution fail می‌شه تا لاگ واضح بشه - بدون fallback
+        print(f"Gemini خطا: {str(e)}")
+        raise
 
 
 if __name__ == "__main__":
