@@ -5,10 +5,10 @@ import uuid
 import requests
 import feedparser
 from bs4 import BeautifulSoup
-import google.generativeai as genai   # ← اصلاح مهم
+import google.generativeai as genai
 
 # ──────────────── تنظیمات ────────────────
-GEMINI_KEY = os.getenv("GEMINI_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")          # ← با نام Appwrite همخوانی دارد
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")
 
@@ -18,8 +18,8 @@ COLLECTION_ID = "history"
 APPWRITE_API_KEY = os.getenv("APPWRITE_API_KEY")
 
 # تنظیم Gemini
-genai.configure(api_key=GEMINI_KEY)
-model = genai.GenerativeModel("gemini-2.0-flash")  # یا gemini-1.5-flash-002 اگر در دسترس بود
+genai.configure(api_key=GEMINI_API_KEY)
+model = genai.GenerativeModel("gemini-1.5-flash")  # مدل پایدارتر و سریع‌تر
 
 # ──────────────── توابع کمکی ────────────────
 def safe_generate_content(prompt, max_retries=3):
@@ -29,10 +29,12 @@ def safe_generate_content(prompt, max_retries=3):
             return response.text.strip()
         except Exception as e:
             print(f"Gemini retry {attempt+1}/{max_retries}: {e}")
-            time.sleep(2 ** attempt)
-    return None
+            time.sleep(2 ** attempt + 1)
+    return "خلاصه‌ای در دسترس نیست"
 
 def is_duplicate(link):
+    if not all([PROJECT_ID, DATABASE_ID, APPWRITE_API_KEY]):
+        return False
     url = f"https://cloud.appwrite.io/v1/databases/{DATABASE_ID}/collections/{COLLECTION_ID}/documents"
     headers = {
         "X-Appwrite-Project": PROJECT_ID,
@@ -48,6 +50,8 @@ def is_duplicate(link):
         return False
 
 def save_to_db(link, title):
+    if not all([PROJECT_ID, DATABASE_ID, APPWRITE_API_KEY]):
+        return
     url = f"https://cloud.appwrite.io/v1/databases/{DATABASE_ID}/collections/{COLLECTION_ID}/documents"
     headers = {
         "X-Appwrite-Project": PROJECT_ID,
@@ -69,20 +73,22 @@ def save_to_db(link, title):
 
 def fetch_image(query):
     try:
-        url = f"https://www.google.com/search?q={query}+fashion+style&tbm=isch"
-        headers = {"User-Agent": "Mozilla/5.0"}
-        res = requests.get(url, headers=headers, timeout=8)
-        soup = BeautifulSoup(res.text, "html.parser")
-        img = soup.find("img", {"class": "YQ4ga"})
-        if img and "src" in img.attrs:
-            return img["src"]
+        url = f"https://source.unsplash.com/random/512x512/?fashion,{query.replace(' ', ',')}"
+        return url  # Unsplash مستقیم لینک می‌دهد (بدون نیاز به parse)
     except:
-        pass
-    return None
+        return "https://via.placeholder.com/512?text=Fashion+News"
+
+def escape_markdown(text):
+    """تلگرام MarkdownV2 نیاز به escape دارد"""
+    chars = r'_*[]()~`>#+-=|{}.!'
+    for c in chars:
+        text = text.replace(c, f'\\{c}')
+    return text
 
 # ──────────────── تابع اصلی ────────────────
 def main(context=None):
-    if not all([GEMINI_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL_ID]):
+    required = [GEMINI_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL_ID]
+    if not all(required):
         print("Missing required env variables")
         return context.res.json({"error": "Missing env vars"}) if context else None
 
@@ -95,14 +101,18 @@ def main(context=None):
 
     random.shuffle(feeds)
     posted = 0
-    MAX_POSTS = 3  # برای جلوگیری از سوءاستفاده
+    MAX_POSTS = 3
 
     for feed_url in feeds:
         if posted >= MAX_POSTS:
             break
 
-        feed = feedparser.parse(feed_url)
-        if feed.bozo:
+        try:
+            feed = feedparser.parse(feed_url, sanitize_html=True)
+            if feed.bozo:
+                continue
+        except Exception as e:
+            print(f"Feed error {feed_url}: {e}")
             continue
 
         for entry in feed.entries[:6]:
@@ -113,42 +123,49 @@ def main(context=None):
             if not link or is_duplicate(link):
                 continue
 
-            title = entry.get("title", "")
-            summary = entry.get("summary") or entry.get("description") or ""
-            content = f"{title}\n{summary[:600]}"
+            title = entry.get("title", "بدون عنوان").strip()
+            summary = (entry.get("summary") or entry.get("description") or "").strip()[:600]
 
-            ai_text = safe_generate_content(
-                f"تو یک استایلیست حرفه‌ای ایرانی هستی. "
-                f"این متن را کوتاه، جذاب و تلگرامی خلاصه کن. "
-                f"نکات ست کردن با پوشش ایرانی اضافه کن. ایموجی استفاده کن:\n\n{content}"
+            ai_prompt = (
+                "تو یک استایلیست حرفه‌ای ایرانی هستی. "
+                "این متن را کوتاه، جذاب و مناسب تلگرام خلاصه کن. "
+                "نکات ست کردن با پوشش ایرانی اضافه کن. ایموجی استفاده کن:\n\n"
+                f"عنوان: {title}\n{summary}"
             )
 
+            ai_text = safe_generate_content(ai_prompt)
             if not ai_text:
-                continue
+                ai_text = f"خبر جدید: {title}\n{summary[:200]}..."
 
-            image_url = fetch_image(title or "fashion style")
-            caption = f"{ai_text}\n\n✨ @irfashionnews\n#مد #استایل #فشن"
+            image_url = fetch_image(title)
+            caption = escape_markdown(
+                f"{ai_text}\n\n✨ @irfashionnews\n#مد #استایل #فشن"
+            )
 
             telegram_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
             payload = {
                 "chat_id": TELEGRAM_CHANNEL_ID,
-                "photo": image_url or "https://via.placeholder.com/512?text=Fashion",  # fallback
+                "photo": image_url,
                 "caption": caption[:1024],
-                "parse_mode": "Markdown"
+                "parse_mode": "MarkdownV2"
             }
 
-            try:
-                r = requests.post(telegram_url, data=payload, timeout=12)
-                r.raise_for_status()
-                save_to_db(link, title)
-                posted += 1
-                print(f"Posted: {title[:60]}")
-            except Exception as e:
-                print(f"Telegram error: {e}")
+            for attempt in range(3):
+                try:
+                    r = requests.post(telegram_url, data=payload, timeout=12)
+                    r.raise_for_status()
+                    save_to_db(link, title)
+                    posted += 1
+                    print(f"Posted: {title[:60]}")
+                    break
+                except Exception as e:
+                    print(f"Telegram retry {attempt+1}: {e}")
+                    time.sleep(2 ** attempt + 2)
 
-            time.sleep(random.uniform(4.5, 7.2))  # طبیعی‌تر
+            time.sleep(random.uniform(3.8, 6.5))
 
-    return context.res.json({"status": "ok", "posted": posted}) if context else {"posted": posted}
+    result = {"status": "ok", "posted": posted}
+    return context.res.json(result) if context else result
 
 
 if __name__ == "__main__":
