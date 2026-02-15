@@ -4,11 +4,10 @@ import feedparser
 from datetime import datetime, timedelta, timezone
 from telegram import Bot
 from openai import AsyncOpenAI
-
-# Appwrite
 from appwrite.client import Client
 from appwrite.services.databases import Databases
 from appwrite.exception import AppwriteException
+from appwrite.query import Query  # این رو اضافه کن
 
 async def main(event=None, context=None):
     token = os.environ.get('TELEGRAM_BOT_TOKEN')
@@ -26,12 +25,11 @@ async def main(event=None, context=None):
 
     bot = Bot(token=token)
 
-    client = AsyncOpenAI(
+    deepseek_client = AsyncOpenAI(
         api_key=deepseek_key,
         base_url="https://api.deepseek.com/v1"
     )
 
-    # Appwrite client
     aw_client = Client()
     aw_client.set_endpoint(appwrite_endpoint)
     aw_client.set_project(appwrite_project)
@@ -39,7 +37,6 @@ async def main(event=None, context=None):
     databases = Databases(aw_client)
 
     rss_feeds = [
-        # خارجی
         "https://www.vogue.com/feed/rss",
         "https://wwd.com/feed/",
         "https://www.harpersbazaar.com/rss/fashion.xml",
@@ -50,7 +47,6 @@ async def main(event=None, context=None):
         "https://www.thecut.com/feed",
         "https://www.whowhatwear.com/rss",
         "https://feeds.feedburner.com/fibre2fashion/fashion-news",
-        # فارسی
         "https://medopia.ir/feed/",
         "https://www.digikala.com/mag/feed/?category=مد",
         "https://www.khabaronline.ir/rss/category/مد-زیبایی",
@@ -85,25 +81,25 @@ async def main(event=None, context=None):
                 title = entry.title.strip()
                 link = entry.link.strip()
 
-                # چک تکراری
+                # چک تکراری با Query درست
                 try:
                     existing = databases.list_documents(
                         database_id=database_id,
                         collection_id=collection_id,
-                        queries=[f'equal("link", ["{link}"])']
+                        queries=[Query.equal("link", link)]
                     )
                     if existing['total'] > 0:
                         print(f"تکراری رد شد: {title[:60]}")
                         continue
                 except AppwriteException as e:
-                    print(f"خطا چک DB: {str(e)}")
+                    print(f"خطا چک DB: {str(e)} - پست ارسال می‌شود")
 
                 summary = (entry.get('summary') or entry.get('description') or '').strip()[:400]
 
                 if is_persian:
                     content = f"{title}\n\n{summary}"
                 else:
-                    content = await rewrite_with_deepseek(client, title, summary)
+                    content = await rewrite_with_deepseek(deepseek_client, title, summary)
 
                 final_text = f"{content}\n\n#مد #استایل #ترند #فشن_ایرانی #مهرجامه"
 
