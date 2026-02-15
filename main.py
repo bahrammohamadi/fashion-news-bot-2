@@ -1,9 +1,9 @@
 import os
 import asyncio
 import feedparser
+import requests
 from datetime import datetime, timedelta, timezone
 from telegram import Bot
-from openai import AsyncOpenAI
 from appwrite.client import Client
 from appwrite.services.databases import Databases
 from appwrite.exception import AppwriteException
@@ -12,23 +12,17 @@ from appwrite.query import Query
 async def main(event=None, context=None):
     token = os.environ.get('TELEGRAM_BOT_TOKEN')
     chat_id = os.environ.get('TELEGRAM_CHANNEL_ID')
-    groq_key = os.environ.get('GROQ_API_KEY')
     appwrite_endpoint = os.environ.get('APPWRITE_ENDPOINT', 'https://cloud.appwrite.io/v1')
     appwrite_project = os.environ.get('APPWRITE_PROJECT_ID')
     appwrite_key = os.environ.get('APPWRITE_API_KEY')
     database_id = os.environ.get('APPWRITE_DATABASE_ID')
     collection_id = 'history'
 
-    if not all([token, chat_id, groq_key, appwrite_project, appwrite_key, database_id]):
+    if not all([token, chat_id, appwrite_project, appwrite_key, database_id]):
         print("متغیرهای محیطی ناقص!")
         return {"status": "error"}
 
     bot = Bot(token=token)
-
-    groq_client = AsyncOpenAI(
-        api_key=groq_key,
-        base_url="https://api.groq.com/openai/v1"
-    )
 
     aw_client = Client()
     aw_client.set_endpoint(appwrite_endpoint)
@@ -97,23 +91,15 @@ async def main(event=None, context=None):
 
                 if is_persian:
                     content = f"{title}\n\n{summary}"
+                    image_url = get_image_from_rss(entry)
                 else:
-                    content = await rewrite_with_groq(groq_client, title, summary)
+                    content, image_url = await process_with_puter_gemini(title, summary)
 
                 final_text = f"{content}\n\n#مد #استایل #ترند #فشن_ایرانی #مهرجامه"
 
-                photo_url = None
-                if 'enclosure' in entry and entry.enclosure and entry.enclosure.get('type', '').startswith('image/'):
-                    photo_url = entry.enclosure.href
-                elif 'media_content' in entry:
-                    for media in entry.media_content:
-                        if media.get('medium') == 'image' and media.get('url'):
-                            photo_url = media.get('url')
-                            break
-
                 try:
-                    if photo_url:
-                        await bot.send_photo(chat_id=chat_id, photo=photo_url, caption=final_text, parse_mode='HTML', disable_notification=True)
+                    if image_url:
+                        await bot.send_photo(chat_id=chat_id, photo=image_url, caption=final_text, parse_mode='HTML', disable_notification=True)
                     else:
                         await bot.send_message(chat_id=chat_id, text=final_text, disable_web_page_preview=True, disable_notification=True)
 
@@ -146,11 +132,11 @@ async def main(event=None, context=None):
     return {"status": "success", "posted": posted_count}
 
 
-async def rewrite_with_groq(client, title_en, summary_en):
-    prompt = f"""این خبر مد را به فارسی طبیعی، روان و جذاب برای خانم‌های ایرانی بازنویسی کن.
-ابتدا یک تیتر کوتاه و گیرا بنویس (۱ خط، بدون برچسب).
-بعد متن اصلی را بنویس (طول رندوم: گاهی ۱ پاراگراف کوتاه، گاهی ۱ پاراگراف + جمله اضافی، گاهی ۲ پاراگراف کوتاه – حداکثر ۱۵۰–۲۰۰ کلمه).
-- با یک موقعیت واقعی و احساسی شروع کن (مثل سردرگمی خرید، تکراری شدن لباس‌ها، فشار انتخاب استایل مناسب و ...).
+async def process_with_puter_gemini(title_en, summary_en):
+    prompt = f"""این خبر مد انگلیسی را به فارسی طبیعی، روان و جذاب برای خانم‌های ایرانی بازنویسی کن.
+ابتدا یک تیتر کوتاه و گیرا بنویس.
+بعد متن اصلی را در ۱ تا ۲ پاراگراف کوتاه بنویس:
+- با تنش واقعی زندگی شروع کن (سردرگمی خرید، تکراری شدن کمد لباس، فشار انتخاب استایل مناسب و ...).
 - ترند جدید را به عنوان راه‌حل یا ایده جالب معرفی کن.
 - لحن دوستانه، گفتگویی و نزدیک به زبان روزمره باشه.
 - بدون تبلیغ مستقیم، بدون قیمت، بدون لینک، بدون برچسب اضافی مثل "پاراگراف اول" یا "متن خبر".
@@ -159,24 +145,63 @@ async def rewrite_with_groq(client, title_en, summary_en):
 تیتر جذاب
 متن کامل (۱ یا ۲ پاراگراف)
 
+در انتها یک پرامپت دقیق و حرفه‌ای برای ساخت عکس مرتبط بنویس (برای txt2img): پرامپت تصویر:
+
 عنوان انگلیسی: {title_en}
 خلاصه انگلیسی: {summary_en}"""
 
     try:
-        response = await client.chat.completions.create(
-            model="llama-3.1-70b-versatile",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=300,
-            temperature=0.7
-        )
-        text = response.choices[0].message.content.strip()
-        if not text or len(text) < 50:
-            raise ValueError("پاسخ نامناسب")
-        print(f"Groq موفق: {text[:80]}...")
-        return text
+        # درخواست chat به Puter (Gemini از طریق Puter)
+        response = requests.post(
+            "https://api.puter.com/v2/ai/chat",
+            json={
+                "prompt": prompt,
+                "model": "gemini-2.5-flash-preview"  # سریع و خوب برای متن فارسی
+            },
+            headers={"Content-Type": "application/json"}
+        ).json()
+
+        full_text = response.get('response', '').strip()
+        if not full_text:
+            raise ValueError("پاسخ خالی")
+
+        # جدا کردن پرامپت تصویر
+        if "پرامپت تصویر:" in full_text:
+            parts = full_text.split("پرامپت تصویر:")
+            content = parts[0].strip()
+            image_prompt = parts[1].strip()
+        else:
+            content = full_text
+            image_prompt = f"تصویر استایل مد ایرانی شیک و جذاب برای خانم‌ها بر اساس ترند: {title_en}، با رنگ‌های هماهنگ، لباس روزمره، فضای مدرن ایرانی"
+
+        print(f"Puter متن موفق: {content[:80]}...")
+
+        # ساخت تصویر با Nano Banana (Gemini Image از طریق Puter)
+        image_response = requests.post(
+            "https://api.puter.com/v2/ai/txt2img",
+            json={
+                "prompt": image_prompt,
+                "model": "gemini-2.5-flash-image-preview"  # سریع و باکیفیت
+            },
+            headers={"Content-Type": "application/json"}
+        ).json()
+
+        image_url = image_response.get('image_url')
+
+        return content, image_url
     except Exception as e:
-        print(f"Groq خطا: {str(e)}")
-        return f"📰 {title_en}\n{summary_en[:200]}..."
+        print(f"Puter خطا: {str(e)}")
+        return f"📰 {title_en}\n{summary_en[:200]}...", None
+
+
+def get_image_from_rss(entry):
+    if 'enclosure' in entry and entry.enclosure.get('type', '').startswith('image/'):
+        return entry.enclosure.href
+    if 'media_content' in entry:
+        for media in entry.media_content:
+            if media.get('medium') == 'image' and media.get('url'):
+                return media.get('url')
+    return None
 
 
 if __name__ == "__main__":
