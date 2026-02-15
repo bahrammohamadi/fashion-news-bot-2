@@ -4,7 +4,7 @@ import random
 import uuid
 import requests
 import feedparser
-import google.generativeai as genai
+from google import genai
 from bs4 import BeautifulSoup
 
 
@@ -20,22 +20,25 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")
 
 
-# ========= GEMINI =========
+# ========= GEMINI (NEW SDK) =========
 
 def ask_gemini(text):
     try:
-        genai.configure(api_key=GEMINI_KEY)
-        model = genai.GenerativeModel("gemini-1.5-flash")
+        client = genai.Client(api_key=GEMINI_KEY)
 
         prompt = (
             "تو یک استایلیست حرفه‌ای ایرانی هستی. "
-            "این متن را کوتاه، جذاب و مناسب تلگرام خلاصه کن. "
-            "نکته‌هایی برای ست کردن با پوشش ایرانی اضافه کن. "
+            "این متن را کوتاه، جذاب و تلگرامی خلاصه کن. "
+            "نکات ست کردن با پوشش ایرانی اضافه کن. "
             "از ایموجی استفاده کن:\n\n"
             + text
         )
 
-        response = model.generate_content(prompt)
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=prompt
+        )
+
         return response.text
 
     except Exception as e:
