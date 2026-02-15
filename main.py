@@ -3,7 +3,7 @@ import asyncio
 import feedparser
 from datetime import datetime, timedelta, timezone
 from telegram import Bot
-import google.generativeai as genai
+from openai import AsyncOpenAI
 
 # Appwrite
 from appwrite.client import Client
@@ -13,26 +13,30 @@ from appwrite.exception import AppwriteException
 async def main(event=None, context=None):
     token = os.environ.get('TELEGRAM_BOT_TOKEN')
     chat_id = os.environ.get('TELEGRAM_CHANNEL_ID')
-    gemini_key = os.environ.get('GEMINI_API_KEY')
+    deepseek_key = os.environ.get('DEEPSEEK_API_KEY')
     appwrite_endpoint = os.environ.get('APPWRITE_ENDPOINT', 'https://cloud.appwrite.io/v1')
     appwrite_project = os.environ.get('APPWRITE_PROJECT_ID')
     appwrite_key = os.environ.get('APPWRITE_API_KEY')
     database_id = os.environ.get('APPWRITE_DATABASE_ID')
     collection_id = 'history'
 
-    if not all([token, chat_id, gemini_key, appwrite_project, appwrite_key, database_id]):
+    if not all([token, chat_id, deepseek_key, appwrite_project, appwrite_key, database_id]):
         print("متغیرهای محیطی ناقص!")
         return {"status": "error"}
 
     bot = Bot(token=token)
-    genai.configure(api_key=gemini_key)
-    model = genai.GenerativeModel('gemini-2.5-flash')
 
-    client = Client()
-    client.set_endpoint(appwrite_endpoint)
-    client.set_project(appwrite_project)
-    client.set_key(appwrite_key)
-    databases = Databases(client)
+    client = AsyncOpenAI(
+        api_key=deepseek_key,
+        base_url="https://api.deepseek.com/v1"
+    )
+
+    # Appwrite client
+    aw_client = Client()
+    aw_client.set_endpoint(appwrite_endpoint)
+    aw_client.set_project(appwrite_project)
+    aw_client.set_key(appwrite_key)
+    databases = Databases(aw_client)
 
     rss_feeds = [
         # خارجی
@@ -46,8 +50,7 @@ async def main(event=None, context=None):
         "https://www.thecut.com/feed",
         "https://www.whowhatwear.com/rss",
         "https://feeds.feedburner.com/fibre2fashion/fashion-news",
-        "https://www.instyle.com/rss",
-        # فارسی/ایرانی
+        # فارسی
         "https://medopia.ir/feed/",
         "https://www.digikala.com/mag/feed/?category=مد",
         "https://www.khabaronline.ir/rss/category/مد-زیبایی",
@@ -100,7 +103,7 @@ async def main(event=None, context=None):
                 if is_persian:
                     content = f"{title}\n\n{summary}"
                 else:
-                    content = await rewrite_with_gemini(model, title, summary)
+                    content = await rewrite_with_deepseek(client, title, summary)
 
                 final_text = f"{content}\n\n#مد #استایل #ترند #فشن_ایرانی #مهرجامه"
 
@@ -135,6 +138,7 @@ async def main(event=None, context=None):
                                 'feed_url': feed_url
                             }
                         )
+                        print("ذخیره در DB موفق")
                     except AppwriteException as save_err:
                         print(f"خطا ذخیره DB: {str(save_err)}")
 
@@ -148,32 +152,37 @@ async def main(event=None, context=None):
     return {"status": "success", "posted": posted_count}
 
 
-async def rewrite_with_gemini(model, title_en, summary_en):
+async def rewrite_with_deepseek(client, title_en, summary_en):
     prompt = f"""این خبر مد را به فارسی طبیعی و جذاب برای خانم‌های ایرانی بازنویسی کن.
-ابتدا یک تیتر کوتاه و گیرا بنویس (۱ خط، بدون هیچ برچسب).
-بعد متن اصلی را بنویس (طول رندوم: گاهی ۱ پاراگراف کوتاه، گاهی ۱ پاراگراف + جمله اضافی، گاهی ۲ پاراگراف کوتاه – حداکثر ۱۵۰–۲۰۰ کلمه).
-- با موقعیت واقعی و احساسی شروع کن (سردرگمی خرید، تکراری شدن کمد، فشار انتخاب استایل و ...).
-- ترند را به عنوان راه‌حل یا ایده جالب معرفی کن.
+ابتدا یک تیتر کوتاه و گیرا بنویس (۱ خط).
+بعد متن اصلی را بنویس (طول رندوم: ۱ یا ۲ پاراگراف کوتاه، حداکثر ۱۵۰–۲۰۰ کلمه).
+- با موقعیت واقعی شروع کن (سردرگمی خرید، تکراری شدن لباس‌ها، فشار انتخاب استایل).
+- ترند را به عنوان راه‌حل معرفی کن.
 - لحن دوستانه و گفتگویی باشه.
-- بدون تبلیغ، قیمت، لینک، برچسب مثل "پاراگراف اول" یا "متن خبر".
+- بدون تبلیغ، قیمت، لینک، برچسب اضافی.
 
-خروجی فقط این دو بخش باشه (بدون هیچ چیز اضافی):
+خروجی فقط:
 تیتر جذاب
-متن کامل (۱ یا ۲ پاراگراف)
+متن کامل
 
 عنوان انگلیسی: {title_en}
 خلاصه انگلیسی: {summary_en}"""
 
     try:
-        response = await asyncio.to_thread(model.generate_content, prompt)
-        text = response.text.strip()
-        if not text or len(text) < 30:
-            raise ValueError("پاسخ نامناسب")
-        print(f"Gemini موفق: {text[:80]}...")
+        response = await client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=250,
+            temperature=0.7
+        )
+        text = response.choices[0].message.content.strip()
+        if not text:
+            raise ValueError("پاسخ خالی")
+        print(f"DeepSeek موفق: {text[:80]}...")
         return text
     except Exception as e:
-        print(f"Gemini خطا: {str(e)}")
-        raise
+        print(f"DeepSeek خطا: {str(e)}")
+        return f"📰 {title_en}\n{summary_en[:200]}..."
 
 
 if __name__ == "__main__":
