@@ -1,4 +1,4 @@
 feedparser
 python-telegram-bot==20.8
-openai>=1.0.0
+openai>=1.0.0  # برای Groq لازمه
 appwrite>=1.5.0
