@@ -18,11 +18,11 @@ async def main(event=None, context=None):
     # تنظیم بات تلگرام
     bot = Bot(token=token)
 
-    # تنظیم Gemini
+    # تنظیم Gemini با مدل جدید
     genai.configure(api_key=gemini_key)
-    model = genai.GenerativeModel('gemini-1.5-flash')  # یا gemini-1.5-flash-8b-latest اگر موجود بود
+    model = genai.GenerativeModel('gemini-2.5-flash')  # مدل جدید و سریع برای 2026 - اگر خطا داد به 'gemini-3-flash-preview' تغییر بده
 
-    # لیست فیدهای RSS (می‌تونی اضافه/کم کنی)
+    # لیست فیدهای RSS (خارجی‌ها برای ترجمه، می‌تونی فارسی اضافه کنی مثل https://medopia.ir/feed/)
     rss_feeds = [
         "https://www.vogue.com/feed/rss",
         "https://wwd.com/feed/",
@@ -54,14 +54,14 @@ async def main(event=None, context=None):
                 if pub_date < time_threshold:
                     continue
 
-                title = entry.title.strip()
+                title_en = entry.title.strip()
                 link = entry.link
-                summary = (entry.get('summary') or entry.get('description') or '').strip()[:350]
-                if summary:
-                    summary += '...'
+                summary_en = (entry.get('summary') or entry.get('description') or '').strip()[:350]
+                if summary_en:
+                    summary_en += '...'
 
-                # فارسی‌سازی با Gemini
-                farsi_content = await rewrite_with_gemini(model, title, summary)
+                # فارسی‌سازی با Gemini (تیتر جذاب + متن)
+                farsi_content = await rewrite_with_gemini(model, title_en, summary_en)
 
                 final_text = (
                     f"{farsi_content}\n\n"
@@ -79,7 +79,7 @@ async def main(event=None, context=None):
                             photo_url = media.get('url')
                             break
 
-                # ارسال پست
+                # ارسال پست: اول عکس اگر بود، با caption تیتر+متن
                 try:
                     if photo_url:
                         await bot.send_photo(
@@ -97,9 +97,9 @@ async def main(event=None, context=None):
                             disable_notification=True
                         )
                     posted_count += 1
-                    print(f"پست موفق: {title[:60]}...")
+                    print(f"پست موفق: {title_en[:60]}...")
                 except Exception as send_err:
-                    print(f"خطا در ارسال پست '{title[:40]}...': {str(send_err)}")
+                    print(f"خطا در ارسال پست '{title_en[:40]}...': {str(send_err)}")
 
         except Exception as feed_err:
             print(f"خطا در پردازش فید {feed_url}: {str(feed_err)}")
@@ -109,20 +109,19 @@ async def main(event=None, context=None):
 
 
 async def rewrite_with_gemini(model, title_en, summary_en):
-    prompt = f"""این خبر مد را به فارسی طبیعی، جذاب و نزدیک به زبان روزمره خانم‌های ایرانی بازنویسی کن.
-با یک جمله واقعی و احساسی شروع کن (مثلاً حس سردرگمی خرید لباس، تکراری شدن کمد، یا فشار انتخاب استایل مناسب).
-بعد ترند را به عنوان راه‌حل یا ایده جالب معرفی کن.
-۳ تا ۵ جمله کوتاه کافی است.
+    prompt = f"""این خبر مد را به فارسی طبیعی و جذاب برای خانم‌های ایرانی بازنویسی کن.
+ابتدا یک تیتر جذاب و فارسی بنویس (کوتاه و گیرا، مثل یک جمله واقعی زندگی).
+بعد متن اصلی خبر را در ۳ تا ۵ جمله کوتاه بنویس: با تنش واقعی شروع کن (مثل سردرگمی خرید لباس، تکراری شدن استایل، یا فشار انتخاب مناسب).
+بعد ترند را به عنوان راه‌حل معرفی کن.
 بدون تبلیغ مستقیم، بدون قیمت، بدون لینک فروش.
-فقط متن فارسی خالص بنویس.
+فقط خروجی: تیتر در خط اول، سپس متن در خطوط بعدی (بدون برچسب اضافی).
 
 عنوان انگلیسی: {title_en}
 خلاصه انگلیسی: {summary_en}
-
-خروجی فقط متن فارسی:"""
+"""
 
     try:
-        response = model.generate_content(prompt)
+        response = await asyncio.to_thread(model.generate_content, prompt)  # async wrapper برای sync call
         text = response.text.strip()
         if not text:
             raise ValueError("پاسخ خالی از Gemini")
@@ -131,8 +130,7 @@ async def rewrite_with_gemini(model, title_en, summary_en):
     except Exception as e:
         error_msg = str(e)
         print(f"Gemini خطا داد: {error_msg}")
-        # fallback خیلی ساده
-        return f"📰 {title_en}\n\n{summary_en[:250]}...\n(ترجمه موقت)"
+        raise  # حالا execution fail می‌شه تا لاگ واضح بشه - بدون fallback
 
 
 if __name__ == "__main__":
