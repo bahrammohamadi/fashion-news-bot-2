@@ -1,13 +1,13 @@
 import os
 import asyncio
 import feedparser
+import requests
 from datetime import datetime, timedelta, timezone
-from telegram import Bot, LinkPreviewOptions
+from telegram import Bot
 from appwrite.client import Client
 from appwrite.services.databases import Databases
 from appwrite.exception import AppwriteException
 from appwrite.query import Query
-from openai import AsyncOpenAI
 
 async def main(event=None, context=None):
     print("[INFO] اجرای تابع main شروع شد")
@@ -32,12 +32,6 @@ async def main(event=None, context=None):
     aw_client.set_key(appwrite_key)
     databases = Databases(aw_client)
 
-    openrouter_client = AsyncOpenAI(
-        api_key=os.environ.get('OPENROUTER_API_KEY'),
-        base_url="https://openrouter.ai/api/v1"
-    )
-
-    # لیست فیدها (فارسی + خارجی قوی)
     rss_feeds = [
         "https://medopia.ir/feed/",
         "https://www.khabaronline.ir/rss/category/مد-زیبایی",
@@ -52,10 +46,10 @@ async def main(event=None, context=None):
     ]
 
     now = datetime.now(timezone.utc)
-    time_threshold = now - timedelta(hours=72)  # برای تست ۷۲ ساعت (بعد به ۲۴ برگردون)
+    time_threshold = now - timedelta(days=30)  # برای تست – بعداً به 1 روز برگردون
 
     posted_count = 0
-    max_posts_per_run = 5  # برای تست بیشتر
+    max_posts_per_run = 5  # برای تست
 
     for feed_url in rss_feeds:
         if posted_count >= max_posts_per_run:
@@ -82,10 +76,9 @@ async def main(event=None, context=None):
 
                 title = entry.title.strip()
                 link = entry.link.strip()
-                description = (entry.get('summary') or entry.get('description') or '').strip()
-                content_raw = description[:800]
+                description = (entry.get('summary') or entry.get('description') or '').strip()[:800]
 
-                # چک تکراری با API جدید (جایگزین list_documents)
+                # چک تکراری
                 try:
                     existing = databases.list_rows(
                         database_id=database_id,
@@ -98,47 +91,15 @@ async def main(event=None, context=None):
                 except Exception as db_err:
                     print(f"[WARN] خطا DB: {str(db_err)} - ادامه بدون چک")
 
-                prompt = f"""You are a senior Persian fashion editor.
-
-Write a magazine-quality Persian fashion news article.
-
-Input:
-Title: {title}
-Summary: {description}
-Content: {content_raw}
-Source URL: {feed_url}
-Publish Date: {pub_date.strftime('%Y-%m-%d')}
-
-Instructions:
-1. Detect language: Translate English to fluent Persian. Keep Persian as is.
-2. Do NOT translate proper nouns.
-3. Structure naturally (no labels).
-4. Headline: 8–14 words.
-5. Lead: 1–2 sentences.
-6. Body: 2–4 paragraphs.
-7. End with 2–3 sentences industry analysis (neutral, objective).
-8. Tone: formal, journalistic.
-9. Length: 220–350 words.
-10. Use only input information.
-
-Output:
-[تیتر فارسی]
-
-[لید]
-
-[بدنه]
-
-[تحلیل]
-
-منبع: {feed_url}
-"""
-
-                content = await translate_with_openrouter(openrouter_client, prompt, feed_url)
+                if is_persian:
+                    content = f"{title}\n\n{description}"
+                    image_url = get_image_from_rss(entry)
+                else:
+                    content, image_url = await process_with_puter(title, description, feed_url)
 
                 final_text = f"{content}\n\n🔗 {link}"
 
                 try:
-                    image_url = get_image_from_rss(entry)
                     if image_url:
                         await bot.send_photo(
                             chat_id=chat_id,
@@ -185,20 +146,66 @@ Output:
     return {"status": "success", "posted": posted_count}
 
 
-async def translate_with_openrouter(client, prompt, feed_url):
+async def process_with_puter(title_en, summary_en, feed_url):
+    prompt = f"""این خبر مد انگلیسی را به فارسی طبیعی، روان و جذاب برای خانم‌های ایرانی بازنویسی کن.
+ابتدا یک تیتر کوتاه و گیرا بنویس.
+بعد متن اصلی را در ۱ تا ۲ پاراگراف کوتاه بنویس:
+- با تنش واقعی زندگی شروع کن (سردرگمی خرید، تکراری شدن کمد لباس، فشار انتخاب استایل مناسب و ...).
+- ترند جدید را به عنوان راه‌حل یا ایده جالب معرفی کن.
+- لحن دوستانه، گفتگویی و نزدیک به زبان روزمره باشه.
+- بدون تبلیغ مستقیم، بدون قیمت، بدون لینک، بدون برچسب اضافی.
+
+خروجی دقیقاً این شکل باشه (فقط متن خام):
+تیتر جذاب
+متن کامل (۱ یا ۲ پاراگراف)
+
+در انتها یک پرامپت دقیق و حرفه‌ای برای ساخت عکس مرتبط بنویس (برای txt2img): پرامپت تصویر:
+
+عنوان انگلیسی: {title_en}
+خلاصه انگلیسی: {summary_en}"""
+
     try:
-        response = await client.chat.completions.create(
-            model="nousresearch/hermes-3-llama-3.1-405b:free",  # مدل قوی‌تر و بدون محدودیت شدید
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.6,
-            max_tokens=700
-        )
+        # درخواست chat به Puter (Gemini یا Grok از طریق Puter)
+        response = requests.post(
+            "https://api.puter.com/v2/ai/chat",
+            json={
+                "prompt": prompt,
+                "model": "gemini-2.5-flash-preview"  # یا "x-ai/grok-4-1-fast" برای Grok
+            },
+            headers={"Content-Type": "application/json"}
+        ).json()
 
-        return response.choices[0].message.content.strip()
+        full_text = response.get('response', '').strip()
+        if not full_text:
+            raise ValueError("پاسخ خالی")
 
+        # جدا کردن پرامپت تصویر
+        if "پرامپت تصویر:" in full_text:
+            parts = full_text.split("پرامپت تصویر:")
+            content = parts[0].strip()
+            image_prompt = parts[1].strip()
+        else:
+            content = full_text
+            image_prompt = f"تصویر استایل مد ایرانی شیک و جذاب برای خانم‌ها بر اساس ترند: {title_en}، فضای مدرن، رنگ‌های هماهنگ"
+
+        print(f"Puter متن موفق: {content[:80]}...")
+
+        # ساخت تصویر با Nano Banana یا Grok Image
+        image_response = requests.post(
+            "https://api.puter.com/v2/ai/txt2img",
+            json={
+                "prompt": image_prompt,
+                "model": "gemini-2.5-flash-image-preview"  # یا "grok-2-image"
+            },
+            headers={"Content-Type": "application/json"}
+        ).json()
+
+        image_url = image_response.get('image_url')
+
+        return content, image_url
     except Exception as e:
-        print(f"[ERROR] خطا در ترجمه: {str(e)}")
-        return f"خبر جدید مد\n\n{description[:400]}...\n(ترجمه موقت - خطا رخ داد)\nمنبع: {feed_url}"
+        print(f"Puter خطا: {str(e)}")
+        return f"📰 {title_en}\n{summary_en[:200]}...\nمنبع: {feed_url}", None
 
 
 def get_image_from_rss(entry):
