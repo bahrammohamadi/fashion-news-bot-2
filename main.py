@@ -1,4 +1,4 @@
-# main_fashion_v5.py - فقط خارجی، ترجمه با OpenRouter، ۱-۲ پست، با عکس، بدون تکراری
+# main_fashion_gapgpt.py - با GapGPT (بدون OpenRouter)
 
 import os
 import asyncio
@@ -16,7 +16,7 @@ from appwrite.query import Query
 # ====================== تنظیمات ======================
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHANNEL_ID = os.environ.get('TELEGRAM_CHANNEL_ID')
-OPENROUTER_API_KEY = os.environ.get('OPENROUTER_API_KEY')
+GAPGPT_API_KEY = os.environ.get('GAPGPT_API_KEY')  # کلید جدیدت اینجا
 APPWRITE_ENDPOINT = os.environ.get('APPWRITE_ENDPOINT', 'https://cloud.appwrite.io/v1')
 APPWRITE_PROJECT_ID = os.environ.get('APPWRITE_PROJECT_ID')
 APPWRITE_API_KEY = os.environ.get('APPWRITE_API_KEY')
@@ -51,6 +51,57 @@ RSS_FEEDS = [
     "https://www.papermag.com/rss",
 ]
 
+# ====================== ترجمه و فرمت با GapGPT ======================
+async def translate_and_format(client, title, raw_text):
+    # مرحله ۱: ترجمه دقیق به فارسی
+    translate_prompt = f"""
+عنوان خبر: {title}
+متن: {raw_text[:1200]}
+
+به فارسی روان، حرفه‌ای و مناسب مجله مد ترجمه کن.
+فقط متن فارسی نهایی رو بده، بدون توضیح اضافی.
+"""
+
+    try:
+        resp = await client.chat.completions.create(
+            model="gpt-4o-mini",  # مدل قوی و ارزان در GapGPT
+            messages=[{"role": "user", "content": translate_prompt}],
+            temperature=0.6,
+            max_tokens=800
+        )
+        persian_text = resp.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"[TRANSLATE ERROR] {str(e)[:100]}")
+        persian_text = raw_text[:500] + "... (ترجمه موقت)"
+
+    # مرحله ۲: تبدیل به پست استاندارد فشن
+    format_prompt = f"""
+عنوان: {title}
+متن فارسی: {persian_text}
+
+به عنوان سردبیر مجله مد، این را به یک پست کوتاه و شیک تبدیل کن:
+- تیتر جذاب (اگر لازم بود کمی تغییر بده)
+- متن ۳-۵ خطی روان و حرفه‌ای
+- فقط محتوای اصلی خبر
+- بدون جمله اضافه، بدون تبلیغ، بدون ایموجی، بدون لینک
+
+خروجی فقط متن پست باشه.
+"""
+
+    try:
+        resp = await client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": format_prompt}],
+            temperature=0.7,
+            max_tokens=400
+        )
+        final_content = resp.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"[FORMAT ERROR] {str(e)[:100]}")
+        final_content = f"**{title}**\n\n{persian_text[:380]}..."
+
+    return final_content
+
 # ====================== توابع کمکی ======================
 def clean_html(html):
     soup = BeautifulSoup(html, 'html.parser')
@@ -79,56 +130,6 @@ async def extract_og_image(url):
     except:
         return None
 
-async def translate_and_format(client, title, raw_text):
-    # مرحله ۱: ترجمه دقیق به فارسی
-    translate_prompt = f"""
-عنوان: {title}
-متن: {raw_text[:1200]}
-
-به فارسی روان، حرفه‌ای و مناسب مجله مد ترجمه کن.
-فقط متن فارسی نهایی رو بده، بدون توضیح اضافی.
-"""
-
-    try:
-        resp = await client.chat.completions.create(
-            model="meta-llama/llama-3.3-70b-instruct:free",
-            messages=[{"role": "user", "content": translate_prompt}],
-            temperature=0.6,
-            max_tokens=800
-        )
-        persian_text = resp.choices[0].message.content.strip()
-    except Exception as e:
-        print(f"[TRANSLATE ERROR] {e}")
-        persian_text = raw_text[:500] + "... (ترجمه موقت)"
-
-    # مرحله ۲: تبدیل به پست فشن استاندارد
-    format_prompt = f"""
-عنوان: {title}
-متن فارسی: {persian_text}
-
-به عنوان سردبیر مجله مد، این را به یک پست کوتاه و شیک تبدیل کن:
-- تیتر جذاب (اگر لازم بود کمی تغییر بده)
-- متن ۳-۵ خطی روان و حرفه‌ای
-- فقط محتوای اصلی خبر
-- بدون جمله اضافه، بدون تبلیغ، بدون ایموجی، بدون لینک
-
-خروجی فقط متن پست باشه.
-"""
-
-    try:
-        resp = await client.chat.completions.create(
-            model="meta-llama/llama-3.3-70b-instruct:free",
-            messages=[{"role": "user", "content": format_prompt}],
-            temperature=0.7,
-            max_tokens=400
-        )
-        final_content = resp.choices[0].message.content.strip()
-    except Exception as e:
-        print(f"[FORMAT ERROR] {e}")
-        final_content = f"**{title}**\n\n{persian_text[:380]}..."
-
-    return final_content
-
 # ====================== تابع اصلی ======================
 async def main(event=None, context=None):
     print("[INFO] شروع اجرا")
@@ -139,9 +140,9 @@ async def main(event=None, context=None):
 
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
 
-    openrouter_client = AsyncOpenAI(
+    gapgpt_client = AsyncOpenAI(
         api_key=OPENROUTER_API_KEY,
-        base_url="https://openrouter.ai/api/v1"
+        base_url="https://api.gapgpt.app/v1"  # endpoint GapGPT
     )
 
     aw_client = Client()
@@ -194,8 +195,8 @@ async def main(event=None, context=None):
                 except Exception as e:
                     print(f"[DB WARN] {e}")
 
-                # ترجمه و فرمت با OpenRouter
-                final_text = await translate_and_format(openrouter_client, title, clean_text)
+                # ترجمه و فرمت با GapGPT
+                final_text = await translate_and_format(gapgpt_client, title, clean_text)
 
                 image_url = get_image_from_rss(entry)
                 if not image_url:
@@ -244,6 +245,57 @@ async def main(event=None, context=None):
 
     print(f"[INFO] پایان اجرا - پست شده: {posted_count}")
     return {"status": "ok", "posted": posted_count}
+
+
+async def translate_and_format(client, title, raw_text):
+    # مرحله ۱: ترجمه دقیق به فارسی
+    translate_prompt = f"""
+عنوان خبر: {title}
+متن: {raw_text[:1200]}
+
+به فارسی روان، حرفه‌ای و مناسب مجله مد ترجمه کن.
+فقط متن فارسی نهایی رو بده، بدون توضیح اضافی.
+"""
+
+    try:
+        resp = await client.chat.completions.create(
+            model="gpt-4o-mini",  # مدل قوی و ارزان در GapGPT
+            messages=[{"role": "user", "content": translate_prompt}],
+            temperature=0.6,
+            max_tokens=800
+        )
+        persian_text = resp.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"[TRANSLATE FALLBACK] {str(e)[:100]}")
+        persian_text = raw_text[:500] + "... (ترجمه موقت)"
+
+    # مرحله ۲: تبدیل به پست استاندارد فشن
+    format_prompt = f"""
+عنوان: {title}
+متن فارسی: {persian_text}
+
+به عنوان سردبیر مجله مد، این را به یک پست کوتاه و شیک تبدیل کن:
+- تیتر جذاب (اگر لازم بود کمی تغییر بده)
+- متن ۳-۵ خطی روان و حرفه‌ای
+- فقط محتوای اصلی خبر
+- بدون جمله اضافه، بدون تبلیغ، بدون ایموجی، بدون لینک
+
+خروجی فقط متن پست باشه.
+"""
+
+    try:
+        resp = await client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": format_prompt}],
+            temperature=0.7,
+            max_tokens=400
+        )
+        final_content = resp.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"[FORMAT FALLBACK] {str(e)[:100]}")
+        final_content = f"**{title}**\n\n{persian_text[:380]}..."
+
+    return final_content
 
 
 if __name__ == "__main__":
