@@ -38,10 +38,10 @@ async def main(event=None, context=None):
     )
 
     rss_feeds = [
+        "https://medopia.ir/feed/",                     # اول فارسی
         "https://www.vogue.com/feed/rss",
         "https://wwd.com/feed/",
         "https://fashionista.com/feed",
-        "https://medopia.ir/feed/",
         "https://www.khabaronline.ir/rss/category/مد-زیبایی",
     ]
 
@@ -78,7 +78,7 @@ async def main(event=None, context=None):
                 description = (entry.get('summary') or entry.get('description') or '').strip()
                 content_raw = description[:800]
 
-                # چک تکراری
+                # چک تکراری (اینجا کلید موفقیت است)
                 try:
                     existing = databases.list_documents(
                         database_id=database_id,
@@ -88,69 +88,43 @@ async def main(event=None, context=None):
                     if existing['total'] > 0:
                         print(f"[INFO] تکراری رد شد: {title[:60]}")
                         continue
-                except Exception as db_err:
-                    print(f"[WARN] خطا در چک دیتابیس (ادامه بدون چک): {str(db_err)}")
+                except AppwriteException as db_err:
+                    print(f"[WARN] خطا در چک دیتابیس: {str(db_err)} - ادامه بدون چک تکراری")
 
-                # پرامپت جدید و حرفه‌ای (دقیقاً همون که دادی)
-                prompt = f"""
-You are a senior fashion journalist with 15+ years of experience writing for Vogue, Harper's Bazaar, and Elle in Persian market.
+                # پرامپت حرفه‌ای
+                prompt = f"""You are a senior Persian fashion editor writing for a professional fashion publication.
 
-Objective:
-Produce a magazine-quality Persian fashion news article that is analytically strong, professionally written, yet accessible to informed general audiences.
+Write a magazine-quality Persian fashion news article.
 
 Input:
-Title: {title}
-Summary: {description}
-Content: {content_raw}
-Source URL: {feed_url}
-Publish Date: {pub_date.strftime('%Y-%m-%d')}
+- Title: {title}
+- Summary: {description}
+- Content: {content_raw}
+- Source URL: {feed_url}
+- Publish Date: {pub_date.strftime('%Y-%m-%d')}
 
-Execution Instructions:
-1) Language:
-- If the content is in English → translate into fluent, refined Persian.
-- If already Persian → professionally edit and elevate.
-- Keep all brand names, designer names, fashion houses, event names, and locations in original language.
-- Do NOT translate proper nouns.
-2) Accuracy Rules:
-- Use only information present in the input.
-- No speculation.
-- No added facts.
-- No invented quotes.
-- No exaggeration.
-3) Tone:
-- Professional, analytical, and composed.
-- Accessible but not simplistic.
-- Use correct fashion terminology when relevant.
-- Avoid marketing language.
-- Avoid emotional or dramatic adjectives.
-4) Structure (strict):
-Headline:
-- 8–14 words
-- Clear and informative
-- No sensationalism
-Lead:
-- 1–2 sentences
-- Answer who, what, where, when, and why it matters.
-Body:
-- 2–4 structured paragraphs
-- Expand on key details
-- Maintain logical flow
-- Avoid repetition
-Industry Perspective:
-- 2–3 sentences
-- Briefly explain why this matters for designers, buyers, retailers, or the broader fashion market.
-Length:
-- 220–350 words
-Output Format:
-Headline:
-[Persian headline]
-Lead:
-[Lead paragraph]
-Body:
-[Main article]
-Industry Perspective:
-[Analytical closing]
-Source: {feed_url}
+Instructions:
+1. Detect language: Translate English to fluent Persian. Keep Persian as is.
+2. Do NOT translate proper nouns.
+3. Structure naturally (no labels like Headline, Lead, etc.).
+4. Start with a strong headline (8–14 words).
+5. Follow with lead paragraph (1–2 sentences).
+6. Write 2–4 body paragraphs.
+7. End with 2–3 sentences industry analysis (neutral, objective).
+8. Tone: formal, engaging, journalistic.
+9. Length: 220–350 words.
+10. Use only input information.
+
+Output ONLY the article:
+[تیتر به فارسی]
+
+[لید]
+
+[بدنه]
+
+[تحلیل کوتاه]
+
+منبع: {feed_url}
 """
 
                 content = await translate_with_openrouter(openrouter_client, prompt)
@@ -178,6 +152,7 @@ Source: {feed_url}
                     posted = True
                     print(f"[SUCCESS] پست موفق ارسال شد: {title[:60]}")
 
+                    # ذخیره در دیتابیس (اینجا باید کار کنه اگر ID درست باشه)
                     try:
                         databases.create_document(
                             database_id=database_id,
