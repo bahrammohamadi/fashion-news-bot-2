@@ -18,10 +18,9 @@ async def main(event=None, context=None):
     database_id = os.environ.get('APPWRITE_DATABASE_ID')
     collection_id = 'history'
 
-    # چک اولیه متغیرها
     if not all([token, chat_id, appwrite_project, appwrite_key, database_id]):
-        print("خطا: متغیرهای محیطی ناقص! APPWRITE_PROJECT_ID یا DATABASE_ID را چک کنید.")
-        return {"status": "error", "message": "متغیرهای محیطی ناقص"}
+        print("متغیرهای محیطی ناقص!")
+        return {"status": "error"}
 
     bot = Bot(token=token)
 
@@ -42,25 +41,23 @@ async def main(event=None, context=None):
         "https://fashionista.com/feed",
         "https://medopia.ir/feed/",
         "https://www.khabaronline.ir/rss/category/مد-زیبایی",
-        "https://fararu.com/rss/category/مد-زیبایی",
-        "https://www.beytoote.com/rss/fashion",
     ]
 
     now = datetime.now(timezone.utc)
     time_threshold = now - timedelta(hours=24)
 
-    posted = False  # فقط یک پست در هر اجرا
+    posted = False
 
     for feed_url in rss_feeds:
         if posted:
-            break  # اگر یک پست ارسال شد، دیگه ادامه نده
+            break
 
         try:
             feed = feedparser.parse(feed_url)
             if not feed.entries:
                 continue
 
-            is_persian = any(x in feed_url.lower() for x in ['.ir', 'khabaronline', 'medopia', 'beytoote', 'fararu'])
+            is_persian = any(x in feed_url.lower() for x in ['.ir', 'khabaronline', 'medopia'])
 
             for entry in feed.entries:
                 if posted:
@@ -75,6 +72,8 @@ async def main(event=None, context=None):
 
                 title = entry.title.strip()
                 link = entry.link.strip()
+                description = (entry.get('summary') or entry.get('description') or '').strip()
+                content = description[:800]  # برای جلوگیری از ورودی خیلی طولانی
 
                 # چک تکراری
                 try:
@@ -86,19 +85,57 @@ async def main(event=None, context=None):
                     if existing['total'] > 0:
                         continue
                 except Exception as db_err:
-                    print(f"خطا چک دیتابیس (ادامه بدون چک تکراری): {str(db_err)}")
+                    print(f"خطا DB: {str(db_err)} - ادامه بدون چک تکراری")
 
-                summary = (entry.get('summary') or entry.get('description') or '').strip()[:500]
-                image_url = get_image_from_rss(entry)
+                # آماده‌سازی پرامپت جدید
+                prompt = f"""You are a professional fashion news editor.
+Input:
+- Title: {title}
+- Description: {description}
+- Full Content: {content}
+- Source: {feed_url}
+- Publish Date: {pub_date.strftime('%Y-%m-%d')}
+
+Tasks:
+1) Detect the language of the content.
+2) If the text is in English, translate it accurately into fluent Persian.
+3) If the text is already Persian, do NOT translate it.
+4) Rewrite the final Persian text into a professional, journalistic fashion news article.
+Strict Guidelines:
+- Use a formal but engaging news tone.
+- Start with a strong lead paragraph that summarizes the key news (Who, What, Where, When, Why).
+- Keep the structure journalistic and logical.
+- Avoid exaggerated marketing tone.
+- No emojis.
+- No hashtags.
+- No casual or conversational style.
+- Keep brand names, designer names, fashion houses, and locations unchanged.
+- Add context if necessary to clarify the importance of the news in the fashion industry.
+- Keep it concise but complete.
+- Do not invent facts.
+- Do not speculate.
+- Only use information from the input.
+Output format:
+Headline:
+[Professional news headline in Persian]
+Body:
+[Well-structured news article in Persian]
+Additionally:
+- Add a short analytical paragraph at the end explaining the potential impact of this news on the fashion industry or market.
+- Maintain objectivity.
+- Avoid personal opinions.
+- Write in a tone suitable for a professional fashion news website.
+If information is missing, do not fill gaps with assumptions."""
 
                 if is_persian:
-                    content = f"{title}\n\n{summary}"
+                    final_content = f"{title}\n\n{description}"
                 else:
-                    content = await translate_with_openrouter(openrouter_client, title, summary)
+                    final_content = await translate_with_openrouter(openrouter_client, prompt)
 
-                final_text = f"{content}\n\n🔗 {link}\n#مد #استایل #ترند #فشن_ایرانی #مهرجامه"
+                final_text = f"{final_content}\n\n🔗 {link}"
 
                 try:
+                    image_url = get_image_from_rss(entry)
                     if image_url:
                         await bot.send_photo(
                             chat_id=chat_id,
@@ -116,10 +153,8 @@ async def main(event=None, context=None):
                         )
 
                     posted = True
-                    posted_count = 1
-                    print(f"پست موفق ارسال شد: {title[:60]}...")
+                    print(f"پست موفق: {title[:60]}")
 
-                    # ذخیره در دیتابیس
                     try:
                         databases.create_document(
                             database_id=database_id,
@@ -129,66 +164,37 @@ async def main(event=None, context=None):
                                 'link': link,
                                 'title': title,
                                 'published_at': now.isoformat(),
-                                'feed_url': feed_url,
-                                'created_at': now.isoformat()
+                                'feed_url': feed_url
                             }
                         )
-                        print("ذخیره در دیتابیس موفق")
+                        print("ذخیره DB موفق")
                     except Exception as save_err:
-                        print(f"خطا در ذخیره دیتابیس: {str(save_err)}")
+                        print(f"خطا ذخیره DB: {str(save_err)}")
 
                 except Exception as send_err:
-                    print(f"خطا در ارسال پست: {str(send_err)}")
+                    print(f"خطا ارسال: {str(send_err)}")
 
         except Exception as feed_err:
-            print(f"خطا در پردازش فید {feed_url}: {str(feed_err)}")
+            print(f"خطا فید {feed_url}: {str(feed_err)}")
 
-    if posted:
-        print("اجرای این دور: ۱ پست ارسال شد")
-    else:
-        print("اجرای این دور: هیچ پست جدیدی یافت نشد")
-
-    return {"status": "success", "posted": 1 if posted else 0}
+    print(f"پایان اجرا - پست ارسال شد: {posted}")
+    return {"status": "success", "posted": posted}
 
 
-async def translate_with_openrouter(client, title_en, summary_en):
+async def translate_with_openrouter(client, prompt):
     try:
-        prompt = f"""این خبر مد انگلیسی را به فارسی طبیعی، روان و جذاب برای خانم‌های ایرانی بازنویسی کن.
-ابتدا یک تیتر کوتاه و گیرا بنویس.
-بعد متن اصلی را در ۱ تا ۲ پاراگراف کوتاه بنویس:
-- با تنش واقعی زندگی شروع کن (سردرگمی خرید، تکراری شدن کمد لباس، فشار انتخاب استایل مناسب و ...).
-- ترند جدید را به عنوان راه‌حل یا ایده جالب معرفی کن.
-- لحن دوستانه، گفتگویی و نزدیک به زبان روزمره باشه.
-- بدون تبلیغ مستقیم، بدون قیمت، بدون لینک.
-خروجی دقیقاً این شکل باشه (فقط متن خام):
-تیتر جذاب
-متن کامل (۱ یا ۲ پاراگراف)
-
-عنوان انگلیسی: {title_en}
-خلاصه انگلیسی: {summary_en}"""
-
         response = await client.chat.completions.create(
-            model="deepseek/deepseek-r1-0528:free",
+            model="meta-llama/llama-3.1-8b-instruct:free",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.7,
-            max_tokens=600
+            max_tokens=700
         )
 
-        full_text = response.choices[0].message.content.strip()
-
-        if '\n' in full_text:
-            title_fa, content_fa = full_text.split('\n', 1)
-            title_fa = title_fa.strip()
-            content_fa = content_fa.strip()
-        else:
-            title_fa = title_en
-            content_fa = full_text
-
-        return f"{title_fa}\n\n{content_fa}"
+        return response.choices[0].message.content.strip()
 
     except Exception as e:
-        print(f"خطا در ترجمه: {str(e)}")
-        return f"📰 {title_en}\n\n{summary_en[:400]}...\n(ترجمه موقت)"
+        print(f"خطا ترجمه: {str(e)}")
+        return "(ترجمه موقت - خطا رخ داد)\n\nلینک خبر اصلی را ببینید."
 
 
 def get_image_from_rss(entry):
