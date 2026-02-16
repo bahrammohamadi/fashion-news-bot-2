@@ -21,7 +21,7 @@ async def main(event=None, context=None):
     collection_id = 'history'
 
     if not all([token, chat_id, appwrite_project, appwrite_key, database_id]):
-        print("[ERROR] متغیرهای محیطی ناقص! APPWRITE_PROJECT_ID را چک کنید.")
+        print("[ERROR] متغیرهای محیطی ناقص!")
         return {"status": "error"}
 
     bot = Bot(token=token)
@@ -38,7 +38,7 @@ async def main(event=None, context=None):
     )
 
     rss_feeds = [
-        "https://medopia.ir/feed/",                     # اول فارسی
+        "https://medopia.ir/feed/",
         "https://www.vogue.com/feed/rss",
         "https://wwd.com/feed/",
         "https://fashionista.com/feed",
@@ -78,7 +78,6 @@ async def main(event=None, context=None):
                 description = (entry.get('summary') or entry.get('description') or '').strip()
                 content_raw = description[:800]
 
-                # چک تکراری (اینجا کلید موفقیت است)
                 try:
                     existing = databases.list_documents(
                         database_id=database_id,
@@ -88,11 +87,10 @@ async def main(event=None, context=None):
                     if existing['total'] > 0:
                         print(f"[INFO] تکراری رد شد: {title[:60]}")
                         continue
-                except AppwriteException as db_err:
-                    print(f"[WARN] خطا در چک دیتابیس: {str(db_err)} - ادامه بدون چک تکراری")
+                except Exception as db_err:
+                    print(f"[WARN] خطا DB: {str(db_err)} - ادامه بدون چک")
 
-                # پرامپت حرفه‌ای
-                prompt = f"""You are a senior Persian fashion editor writing for a professional fashion publication.
+                prompt = f"""You are a senior Persian fashion editor.
 
 Write a magazine-quality Persian fashion news article.
 
@@ -127,7 +125,7 @@ Output ONLY the article:
 منبع: {feed_url}
 """
 
-                content = await translate_with_openrouter(openrouter_client, prompt)
+                content = await translate_with_openrouter(openrouter_client, prompt, title, description)
 
                 final_text = f"{content}\n\n🔗 {link}"
 
@@ -152,7 +150,6 @@ Output ONLY the article:
                     posted = True
                     print(f"[SUCCESS] پست موفق ارسال شد: {title[:60]}")
 
-                    # ذخیره در دیتابیس (اینجا باید کار کنه اگر ID درست باشه)
                     try:
                         databases.create_document(
                             database_id=database_id,
@@ -180,7 +177,7 @@ Output ONLY the article:
     return {"status": "success", "posted": posted}
 
 
-async def translate_with_openrouter(client, prompt):
+async def translate_with_openrouter(client, prompt, title, description):
     try:
         response = await client.chat.completions.create(
             model="deepseek/deepseek-r1-0528:free",
@@ -192,8 +189,8 @@ async def translate_with_openrouter(client, prompt):
         return response.choices[0].message.content.strip()
 
     except Exception as e:
-        print(f"[ERROR] خطا در ترجمه با DeepSeek R1: {str(e)}")
-        return f"خبر: {title}\n\n{description[:400]}...\n(ترجمه موقت - خطا رخ داد)\nمنبع: {feed_url}"
+        print(f"[ERROR] خطا در ترجمه: {str(e)}")
+        return f"خبر: {title}\n\n{description[:400]}...\n(ترجمه موقت - خطا رخ داد)\nمنبع: لینک اصلی"
 
 
 def get_image_from_rss(entry):
