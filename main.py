@@ -1,9 +1,10 @@
-# main_fashion_gapgpt_v9.py - فیکس rate limit + ۱ پست + ترجمه ترکیبی + fallback قوی
+# main_fashion_final_rnd_v2.py - پست‌های رندوم (خبر یا نکته استایل) + RSS کانال‌های تلگرام
 
 import os
 import asyncio
 import feedparser
 import requests
+import random
 from datetime import datetime, timedelta, timezone
 from telegram import Bot
 from bs4 import BeautifulSoup
@@ -12,26 +13,24 @@ from appwrite.client import Client
 from appwrite.services.databases import Databases
 from appwrite.exception import AppwriteException
 from appwrite.query import Query
-import random
 
 # ====================== تنظیمات ======================
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHANNEL_ID = os.environ.get('TELEGRAM_CHANNEL_ID')
-GAPGPT_API_KEY = os.environ.get('GAPGPT_API_KEY')  # کلید GapGPT/OpenRouter
+GAPGPT_API_KEY = os.environ.get('GAPGPT_API_KEY')
 APPWRITE_ENDPOINT = os.environ.get('APPWRITE_ENDPOINT', 'https://cloud.appwrite.io/v1')
 APPWRITE_PROJECT_ID = os.environ.get('APPWRITE_PROJECT_ID')
 APPWRITE_API_KEY = os.environ.get('APPWRITE_API_KEY')
 APPWRITE_DATABASE_ID = os.environ.get('APPWRITE_DATABASE_ID')
 COLLECTION_ID = 'history'
 
-MAX_POSTS_PER_RUN = 1  # فقط ۱ پست در هر اجرا (برای جلوگیری از rate limit)
+MAX_POSTS_PER_RUN = 2
 CHECK_DAYS = 4
 MAX_RAW_TEXT_LENGTH = 1200
 MAX_FINAL_TEXT_LENGTH = 420
-HTTP_TIMEOUT = 10
 
-# ====================== فیدهای خارجی مد و فشن ======================
-RSS_FEEDS = [
+# ====================== فیدهای خبری (خارجی مد و فشن) ======================
+NEWS_FEEDS = [
     "https://www.vogue.com/feed/rss",
     "https://wwd.com/feed/",
     "https://www.harpersbazaar.com/rss/fashion.xml",
@@ -54,39 +53,38 @@ RSS_FEEDS = [
     "https://www.papermag.com/rss",
 ]
 
-# ====================== نکات استایل فارسی (تصادفی اضافه می‌شه) ======================
-STYLE_TIPS = [
-    "این ترند رو با مانتو بلند و شال ساده ترکیب کنید تا استایل ایرانی شیک‌تری داشته باشید.",
-    "رنگ‌های زنده امسال رو با اکسسوری طلایی یا نقره‌ای ست کنید تا جلوه مجلسی‌تری بگیره.",
-    "لایه‌بندی با کت کوتاه روی مانتو بلند، ترند اداری و حرفه‌ای امساله.",
-    "شلوارهای بالونی رو با مانتو اورسایز و کفش کتانی ست کنید؛ راحتی + مد!",
-    "پارچه‌های طبیعی (نخی، لینن) رو اولویت بدید؛ هم خنک هستن هم با آب و هوای ایران هماهنگ.",
-    "رنگ فیروزه‌ای سال ۲۰۲۶ رو با بژ یا خاکستری ترکیب کنید؛ مینیمال و جذاب.",
-    "کیف کوچک روی کمربند (Bag-on-belt) رو به مانتو اضافه کنید؛ ترند خیابانی داغ!",
-    "روسری ساتن براق با مانتو ساده و جواهرات حجیم برای مهمانی عالی می‌شه.",
-    "جزئیات کوچک مثل کمربند باریک یا آستین پف‌دار، استایل رو خیلی خاص می‌کنن.",
-    "استایل بوهو رو با مانتو بلند و شال طرح‌دار امتحان کنید؛ حس آزادی و زیبایی می‌ده."
+# ====================== فیدهای نکات استایل (از کانال‌های تلگرام و سایت‌های ایرانی) ======================
+STYLE_FEEDS = [
+    "https://www.chibepoosham.com/feed/",           # چی بپوشم - بهترین منبع نکات استایل
+    "https://www.digistyle.com/mag/feed/",          # دیجی‌استایل - نکات مد
+    "https://medopia.ir/feed/",                     # مدوپیا - ترند و استایل
+    "https://www.tarahanelebas.com/feed/",          # طراحان لباس - نکات طراحی
+    "https://www.persianpood.com/feed/",            # پرشین پود - استایل ایرانی
+    "https://www.jument.style/feed/",               # ژومنت - نکات زیبایی و مد
+    "https://www.zibamoon.com/feed/",               # زیبامون - استایل و زیبایی
+    "https://www.modetstyle.com/feed/",             # مودت استایل - نکات روزمره
+    "https://www.namnak.com/rss/fashion",           # نامنک - فشن و استایل
+    "https://www.beytoote.com/rss/fashion",         # بیتوته - نکات مد
 ]
 
-# ====================== ترجمه و بازنویسی با GapGPT ======================
+# ====================== ترجمه و فرمت با GapGPT ======================
 async def translate_and_format(client, title, raw_text):
     prompt = f"""
 عنوان خبر: {title}
 متن انگلیسی: {raw_text[:1200]}
 
 به فارسی روان، حرفه‌ای و جذاب برای کانال مد ترجمه و بازنویسی کن.
-- تیتر را جذاب و کوتاه نگه دار
-- متن را ۳-۶ خطی، شیک و خلاصه بنویس
-- فقط محتوای اصلی خبر را نگه دار
+- تیتر جذاب و کوتاه
+- متن ۳-۶ خطی، شیک و خلاصه
+- فقط محتوای اصلی خبر
 - بدون جمله اضافه، تبلیغ، ایموجی یا لینک
-- اگر خبر به استایل یا ترند لباس مربوط بود، یک نکته کوتاه استایل ایرانی اضافه کن
 
-خروجی فقط متن پست نهایی باشه (تیتر + متن + نکته استایل اختیاری).
+خروجی فقط متن پست نهایی باشه (تیتر + متن).
 """
 
     try:
         resp = await client.chat.completions.create(
-            model="gpt-4o-mini",  # مدل سریع و ارزان GapGPT
+            model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.7,
             max_tokens=600
@@ -100,21 +98,16 @@ async def translate_and_format(client, title, raw_text):
         clean_fallback = clean_html(raw_text)
         if len(clean_fallback) > MAX_FINAL_TEXT_LENGTH:
             clean_fallback = clean_fallback[:MAX_FINAL_TEXT_LENGTH] + "..."
-        tip = random.choice(STYLE_TIPS) if random.random() < 0.5 else ""
-        fallback_text = f"**{title}**\n\n{clean_fallback}"
-        if tip:
-            fallback_text += f"\n\n💡 نکته استایل: {tip}"
-        return fallback_text
+        return f"**{title}**\n\n{clean_fallback}"
 
 # ====================== توابع کمکی ======================
 def clean_html(html):
     soup = BeautifulSoup(html, 'html.parser')
-    text = soup.get_text(separator=' ', strip=True)
-    return ' '.join(text.split())
+    return soup.get_text(separator=' ', strip=True)
 
 def get_image_from_rss(entry):
     if 'enclosure' in entry and entry.enclosure.get('type', '').startswith('image/'):
-        return entry.enclosure.get('href')
+        return entry.enclosure.href
     if 'media_content' in entry:
         for media in entry.media_content:
             if media.get('medium') == 'image' and media.get('url'):
@@ -132,8 +125,7 @@ async def extract_og_image(url):
         if og and og.get('content'):
             return og['content']
         return None
-    except Exception as e:
-        print(f"[OG IMAGE ERROR] {str(e)[:100]}")
+    except:
         return None
 
 # ====================== تابع اصلی ======================
@@ -148,7 +140,7 @@ async def main(event=None, context=None):
 
     gapgpt_client = AsyncOpenAI(
         api_key=GAPGPT_API_KEY,
-        base_url="https://api.gapgpt.app/v1"  # GapGPT endpoint
+        base_url="https://api.gapgpt.app/v1"
     )
 
     aw_client = Client()
@@ -162,92 +154,133 @@ async def main(event=None, context=None):
 
     posted_count = 0
 
-    for feed_url in RSS_FEEDS:
-        if posted_count >= MAX_POSTS_PER_RUN:
-            break
+    # تصمیم‌گیری رندوم: خبر یا نکته استایل
+    is_style_post = random.random() < 0.5  # ۵۰٪ احتمال پست نکته استایل
 
-        try:
-            feed = feedparser.parse(feed_url)
-            if not feed.entries:
-                continue
+    if is_style_post:
+        # پست نکته استایل از STYLE_FEEDS
+        for feed_url in STYLE_FEEDS:
+            if posted_count >= MAX_POSTS_PER_RUN:
+                break
 
-            for entry in feed.entries:
-                if posted_count >= MAX_POSTS_PER_RUN:
-                    break
-
-                published = entry.get('published_parsed') or entry.get('updated_parsed')
-                if not published:
+            try:
+                feed = feedparser.parse(feed_url)
+                if not feed.entries:
                     continue
-                pub_date = datetime(*published[:6], tzinfo=timezone.utc)
-                if pub_date < time_threshold:
-                    continue
+
+                entry = random.choice(feed.entries)
 
                 title = entry.title.strip()
                 link = entry.link.strip()
-                raw_content = (entry.get('summary') or entry.get('description') or '')[:MAX_RAW_TEXT_LENGTH]
+                raw_content = (entry.get('summary') or entry.get('description') or '')[:800]
 
                 soup = BeautifulSoup(raw_content, 'html.parser')
                 clean_text = soup.get_text(separator=' ').strip()
 
-                # چک تکراری
-                try:
-                    existing = databases.list_documents(
-                        database_id=APPWRITE_DATABASE_ID,
-                        collection_id=COLLECTION_ID,
-                        queries=[Query.equal("link", link)]
-                    )
-                    if existing['total'] > 0:
-                        continue
-                except Exception as e:
-                    print(f"[DB WARN] {e}")
-
-                # ترجمه و فرمت با GapGPT
-                final_text = await translate_and_format(gapgpt_client, title, clean_text)
+                final_text = f"**{title}**\n\n{clean_text}\n\n#مد #استایل #ترند #فشن_ایرانی #مهرجامه"
 
                 image_url = get_image_from_rss(entry)
                 if not image_url:
                     image_url = await extract_og_image(link)
 
-                try:
-                    if image_url:
-                        await bot.send_photo(
-                            chat_id=TELEGRAM_CHANNEL_ID,
-                            photo=image_url,
-                            caption=final_text,
-                            parse_mode='HTML',
-                            disable_notification=True
-                        )
-                    else:
-                        await bot.send_message(
-                            chat_id=TELEGRAM_CHANNEL_ID,
-                            text=final_text,
-                            parse_mode='HTML',
-                            disable_notification=True
-                        )
+                if image_url:
+                    await bot.send_photo(chat_id=TELEGRAM_CHANNEL_ID, photo=image_url, caption=final_text, parse_mode='HTML', disable_notification=True)
+                else:
+                    await bot.send_message(chat_id=TELEGRAM_CHANNEL_ID, text=final_text, parse_mode='HTML', disable_notification=True)
 
-                    posted_count += 1
-                    print(f"[SUCCESS] پست شد: {title[:60]}")
+                posted_count += 1
+                print(f"[SUCCESS] پست نکته استایل ارسال شد: {title[:60]}")
 
+            except Exception as e:
+                print(f"[STYLE FEED ERROR] {e}")
+
+    else:
+        # پست خبر از NEWS_FEEDS
+        for feed_url in NEWS_FEEDS:
+            if posted_count >= MAX_POSTS_PER_RUN:
+                break
+
+            try:
+                feed = feedparser.parse(feed_url)
+                if not feed.entries:
+                    continue
+
+                for entry in feed.entries:
+                    if posted_count >= MAX_POSTS_PER_RUN:
+                        break
+
+                    published = entry.get('published_parsed') or entry.get('updated_parsed')
+                    if not published:
+                        continue
+                    pub_date = datetime(*published[:6], tzinfo=timezone.utc)
+                    if pub_date < time_threshold:
+                        continue
+
+                    title = entry.title.strip()
+                    link = entry.link.strip()
+                    raw_content = (entry.get('summary') or entry.get('description') or '')[:MAX_RAW_TEXT_LENGTH]
+
+                    soup = BeautifulSoup(raw_content, 'html.parser')
+                    clean_text = soup.get_text(separator=' ').strip()
+
+                    # چک تکراری
                     try:
-                        databases.create_document(
+                        existing = databases.list_documents(
                             database_id=APPWRITE_DATABASE_ID,
                             collection_id=COLLECTION_ID,
-                            document_id='unique()',
-                            data={
-                                'link': link,
-                                'title': title[:250],
-                                'published_at': now.isoformat(),
-                                'feed_url': feed_url
-                            }
+                            queries=[Query.equal("link", link)]
                         )
-                    except Exception as save_err:
-                        print(f"[DB SAVE WARN] {save_err}")
+                        if existing['total'] > 0:
+                            continue
+                    except Exception as e:
+                        print(f"[DB WARN] {e}")
 
-                except Exception as send_err:
-                    print(f"[SEND ERROR] {send_err}")
+                    final_text = await translate_and_format(gapgpt_client, title, clean_text)
 
-        except Exception as feed_err:
-            print(f"[FEED ERROR] {feed_url}: {feed_err}")
+                    image_url = get_image_from_rss(entry)
+                    if not image_url:
+                        image_url = await extract_og_image(link)
+
+                    try:
+                        if image_url:
+                            await bot.send_photo(
+                                chat_id=TELEGRAM_CHANNEL_ID,
+                                photo=image_url,
+                                caption=final_text,
+                                parse_mode='HTML',
+                                disable_notification=True
+                            )
+                        else:
+                            await bot.send_message(
+                                chat_id=TELEGRAM_CHANNEL_ID,
+                                text=final_text,
+                                parse_mode='HTML',
+                                disable_notification=True
+                            )
+
+                        posted_count += 1
+                        print(f"[SUCCESS] پست خبر ارسال شد: {title[:60]}")
+
+                        try:
+                            databases.create_document(
+                                database_id=APPWRITE_DATABASE_ID,
+                                collection_id=COLLECTION_ID,
+                                document_id='unique()',
+                                data={
+                                    'link': link,
+                                    'title': title[:250],
+                                    'published_at': now.isoformat(),
+                                    'feed_url': feed_url
+                                }
+                            )
+                        except Exception as save_err:
+                            print(f"[DB SAVE WARN] {save_err}")
+
+                    except Exception as send_err:
+                        print(f"[SEND ERROR] {send_err}")
+
+            except Exception as feed_err:
+                print(f"[FEED ERROR] {feed_url}: {feed_err}")
 
     print(f"[INFO] پایان اجرا - پست شده: {posted_count}")
     return {"status": "ok", "posted": posted_count}
