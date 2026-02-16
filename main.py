@@ -9,13 +9,9 @@ from appwrite.exception import AppwriteException
 from appwrite.query import Query
 from openai import AsyncOpenAI
 
-# ---------------------------------------------------------------------------
-# MAIN FUNCTION
-# ---------------------------------------------------------------------------
 async def main(event=None, context=None):
     print("[INFO] اجرای تابع main شروع شد")
 
-    # خواندن متغیرهای محیطی
     token = os.environ.get('TELEGRAM_BOT_TOKEN')
     chat_id = os.environ.get('TELEGRAM_CHANNEL_ID')
     appwrite_endpoint = os.environ.get('APPWRITE_ENDPOINT', 'https://cloud.appwrite.io/v1')
@@ -24,27 +20,23 @@ async def main(event=None, context=None):
     database_id = os.environ.get('APPWRITE_DATABASE_ID')
     collection_id = 'history'
 
-    # اعتبارسنجی اولیه
     if not all([token, chat_id, appwrite_project, appwrite_key, database_id]):
-        print("[ERROR] متغیرهای محیطی ناقص هستند. APPWRITE_PROJECT_ID را چک کنید.")
-        return {"status": "error", "message": "Missing environment variables"}
+        print("[ERROR] متغیرهای محیطی ناقص! APPWRITE_PROJECT_ID را چک کنید.")
+        return {"status": "error"}
 
     bot = Bot(token=token)
 
-    # اتصال به Appwrite
     aw_client = Client()
     aw_client.set_endpoint(appwrite_endpoint)
     aw_client.set_project(appwrite_project)
     aw_client.set_key(appwrite_key)
     databases = Databases(aw_client)
 
-    # اتصال به OpenRouter
     openrouter_client = AsyncOpenAI(
         api_key=os.environ.get('OPENROUTER_API_KEY'),
         base_url="https://openrouter.ai/api/v1"
     )
 
-    # لیست فیدها (۵ تا برای سرعت)
     rss_feeds = [
         "https://www.vogue.com/feed/rss",
         "https://wwd.com/feed/",
@@ -56,7 +48,7 @@ async def main(event=None, context=None):
     now = datetime.now(timezone.utc)
     time_threshold = now - timedelta(hours=24)
 
-    posted = False  # فقط یک پست در هر اجرا
+    posted = False
 
     for feed_url in rss_feeds:
         if posted:
@@ -86,7 +78,7 @@ async def main(event=None, context=None):
                 description = (entry.get('summary') or entry.get('description') or '').strip()
                 content_raw = description[:800]
 
-                # چک تکراری (اگر DB مشکل داشت، رد نمی‌شود)
+                # چک تکراری
                 try:
                     existing = databases.list_documents(
                         database_id=database_id,
@@ -97,51 +89,67 @@ async def main(event=None, context=None):
                         print(f"[INFO] تکراری رد شد: {title[:60]}")
                         continue
                 except Exception as db_err:
-                    print(f"[WARN] خطا در چک دیتابیس (ادامه بدون چک تکراری): {str(db_err)}")
+                    print(f"[WARN] خطا در چک دیتابیس (ادامه بدون چک): {str(db_err)}")
 
-                # پرامپت حرفه‌ای و دقیق
-                prompt = f"""You are a senior fashion journalist with 15+ years of experience writing for Vogue, Harper's Bazaar, and Elle in Persian market.
+                # پرامپت جدید و حرفه‌ای (دقیقاً همون که دادی)
+                prompt = f"""
+You are a senior fashion journalist with 15+ years of experience writing for Vogue, Harper's Bazaar, and Elle in Persian market.
 
-Your task is to transform raw fashion news into a polished, professional Persian article suitable for a high-end Iranian fashion channel.
+Objective:
+Produce a magazine-quality Persian fashion news article that is analytically strong, professionally written, yet accessible to informed general audiences.
 
-Input data:
-- Title (original): {title}
-- Description/Summary: {description}
-- Full available content: {content_raw}
-- Source URL: {feed_url}
-- Publish date: {pub_date.strftime('%Y-%m-%d')}
+Input:
+Title: {title}
+Summary: {description}
+Content: {content_raw}
+Source URL: {feed_url}
+Publish Date: {pub_date.strftime('%Y-%m-%d')}
 
-Step-by-step instructions:
-
-1. Language detection:
-   - If the input text is primarily in Persian → keep it as is, only refine.
-   - If the input text is primarily in English → translate accurately and naturally to fluent, modern Persian (use contemporary Iranian fashion terminology).
-
-2. Rewrite rules:
-   - Tone: Formal, sophisticated, engaging, journalistic (not chatty, not promotional).
-   - Structure:
-     - Headline: Short, powerful, news-style headline in Persian (max 12 words)
-     - Lead paragraph: 1–2 sentences summarizing the most important facts (who, what, when, where, why, impact).
-     - Body: 2–4 short paragraphs with logical flow, key details, quotes if available.
-     - Analysis (short): 2–3 sentences at the end explaining potential industry/market impact in Iran or globally (neutral, objective).
-   - Never add facts, quotes, or speculation not present in input.
-   - Keep designer names, brand names, event names, locations unchanged (in English or original form).
-   - No emojis, no hashtags, no casual phrases like "دوست عزیز" or "به نظرم".
-   - Length: Headline 8–15 words, full body 150–350 words.
-
-Output format (exactly, nothing else):
+Execution Instructions:
+1) Language:
+- If the content is in English → translate into fluent, refined Persian.
+- If already Persian → professionally edit and elevate.
+- Keep all brand names, designer names, fashion houses, event names, and locations in original language.
+- Do NOT translate proper nouns.
+2) Accuracy Rules:
+- Use only information present in the input.
+- No speculation.
+- No added facts.
+- No invented quotes.
+- No exaggeration.
+3) Tone:
+- Professional, analytical, and composed.
+- Accessible but not simplistic.
+- Use correct fashion terminology when relevant.
+- Avoid marketing language.
+- Avoid emotional or dramatic adjectives.
+4) Structure (strict):
 Headline:
-[تیتر حرفه‌ای به فارسی]
-
+- 8–14 words
+- Clear and informative
+- No sensationalism
 Lead:
-[پاراگراف اول - خلاصه قوی]
-
+- 1–2 sentences
+- Answer who, what, where, when, and why it matters.
 Body:
-[متن اصلی خبر - ۲ تا ۴ پاراگراف]
-
-Impact Analysis:
-[پاراگراف کوتاه تحلیلی - تأثیر بر صنعت مد]
-
+- 2–4 structured paragraphs
+- Expand on key details
+- Maintain logical flow
+- Avoid repetition
+Industry Perspective:
+- 2–3 sentences
+- Briefly explain why this matters for designers, buyers, retailers, or the broader fashion market.
+Length:
+- 220–350 words
+Output Format:
+Headline:
+[Persian headline]
+Lead:
+[Lead paragraph]
+Body:
+[Main article]
+Industry Perspective:
+[Analytical closing]
 Source: {feed_url}
 """
 
@@ -210,7 +218,7 @@ async def translate_with_openrouter(client, prompt):
 
     except Exception as e:
         print(f"[ERROR] خطا در ترجمه با DeepSeek R1: {str(e)}")
-        return "(ترجمه موقت - خطا رخ داد)\n\nلینک خبر اصلی را ببینید."
+        return f"خبر: {title}\n\n{description[:400]}...\n(ترجمه موقت - خطا رخ داد)\nمنبع: {feed_url}"
 
 
 def get_image_from_rss(entry):
