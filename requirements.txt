@@ -1,5 +1,6 @@
 feedparser
-python-telegram-bot==20.8
-appwrite>=1.5.0
-beautifulsoup4
 requests
+beautifulsoup4
+google-genai
+python-telegram-bot
+appwrite
