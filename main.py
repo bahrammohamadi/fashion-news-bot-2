@@ -3,6 +3,7 @@ import asyncio
 import feedparser
 from datetime import datetime, timedelta, timezone
 from telegram import Bot
+from bs4 import BeautifulSoup
 from appwrite.client import Client
 from appwrite.services.databases import Databases
 from appwrite.exception import AppwriteException
@@ -31,23 +32,23 @@ async def main(event=None, context=None):
     aw_client.set_key(appwrite_key)
     databases = Databases(aw_client)
 
-    # ۲۰ فید ایرانی فعال و بروز (بهترین‌ها)
+    # ۲۰ فید ایرانی فعال و بروز مد/فشن/زیبایی/ترند
     rss_feeds = [
         "https://medopia.ir/feed/",
         "https://www.digikala.com/mag/feed/?category=مد-و-زیبایی",
         "https://www.digistyle.com/mag/feed/",
+        "https://www.zoomit.ir/feed/category/fashion-beauty/",
         "https://www.khabaronline.ir/rss/category/مد-زیبایی",
         "https://fararu.com/rss/category/مد-زیبایی",
         "https://www.beytoote.com/rss/fashion",
-        "https://www.zoomit.ir/feed/category/fashion-beauty/",
-        "https://www.elsana.com/feed/",
         "https://www.namnak.com/rss/fashion",
-        "https://www.tarahanelebas.com/feed/",
         "https://www.chibepoosham.com/feed/",
+        "https://www.tarahanelebas.com/feed/",
         "https://www.persianpood.com/feed/",
         "https://www.jument.style/feed/",
         "https://www.zibamoon.com/feed/",
         "https://www.sarak-co.com/feed/",
+        "https://www.elsana.com/feed/",
         "https://www.pattonjameh.com/feed/",
         "https://www.tonikaco.com/feed/",
         "https://www.rnsfashion.com/feed/",
@@ -59,7 +60,7 @@ async def main(event=None, context=None):
     time_threshold = now - timedelta(days=4)   # ۴ روز اخیر
 
     posted_count = 0
-    max_posts_per_run = 8   # حداکثر ۸ پست در هر اجرا (برای جلوگیری از اسپم)
+    max_posts_per_run = 6   # حداکثر ۶ پست در هر اجرا
 
     for feed_url in rss_feeds:
         if posted_count >= max_posts_per_run:
@@ -84,7 +85,13 @@ async def main(event=None, context=None):
 
                 title = entry.title.strip()
                 link = entry.link.strip()
-                description = (entry.get('summary') or entry.get('description') or '').strip()
+                raw_html = entry.get('summary') or entry.get('description') or ''
+
+                # پاک کردن HTML و تمیز کردن متن
+                soup = BeautifulSoup(raw_html, 'html.parser')
+                clean_text = soup.get_text(separator=' ').strip()
+                if len(clean_text) > 400:
+                    clean_text = clean_text[:400] + "..."
 
                 # چک تکراری
                 try:
@@ -99,8 +106,12 @@ async def main(event=None, context=None):
                 except Exception as db_err:
                     print(f"[WARN] خطا DB: {str(db_err)}")
 
-                # تبدیل به پست حرفه‌ای فشن (بدون AI خارجی)
-                content = create_fashion_post(title, description)
+                # پست شسته‌رفته و حرفه‌ای
+                content = f"""**{title}**
+
+{clean_text}
+
+#مد #استایل #ترند #فشن_ایرانی #مهرجامه"""
 
                 final_text = f"{content}\n\n🔗 {link}"
 
@@ -148,24 +159,6 @@ async def main(event=None, context=None):
 
     print(f"[INFO] پایان اجرا - تعداد پست ارسال‌شده: {posted_count}")
     return {"status": "success", "posted": posted_count}
-
-
-def create_fashion_post(title, description):
-    """تبدیل متن خام به پست حرفه‌ای فشن"""
-    # تمیز کردن و ساختاردهی ساده
-    clean_desc = description.replace('\n', ' ').strip()
-    if len(clean_desc) > 300:
-        clean_desc = clean_desc[:300] + "..."
-
-    post = f"""**{title}**
-
-{clean_desc}
-
-این ترند جدید می‌تونه استایل روزمره یا مناسبت‌های خاص شما رو خیلی شیک‌تر کنه. ترکیبش با لباس‌های ایرانی و اکسسوری‌های ساده، نتیجه فوق‌العاده‌ای می‌ده.
-
-#مد #استایل #ترند #فشن_ایرانی #مهرجامه"""
-
-    return post
 
 
 def get_image_from_rss(entry):
