@@ -1,4 +1,4 @@
-# main.py - Version 1: Simple & Efficient (Recommended for GitHub)
+# main_v2.py - Version 2: With Better Error Handling & Limits (For Production)
 import os
 import asyncio
 import feedparser
@@ -9,6 +9,10 @@ from appwrite.client import Client
 from appwrite.services.databases import Databases
 from appwrite.query import Query
 from bs4 import BeautifulSoup
+import time
+
+MAX_POSTS_PER_RUN = 1
+SLEEP_BETWEEN_MODELS = 3  # Seconds
 
 async def main(event=None, context=None):
     # Environment variables
@@ -39,14 +43,22 @@ async def main(event=None, context=None):
     posted_count = 0
     
     for feed_url in rss_feeds:
-        if posted_count >= 1:  # Limit to 1 post per run
+        if posted_count >= MAX_POSTS_PER_RUN:
             break
 
-        feed = feedparser.parse(feed_url)
-        for entry in feed.entries[:5]:  # Check first 5 entries
+        try:
+            feed = feedparser.parse(feed_url)
+        except Exception as e:
+            print(f"Feed parse error for {feed_url}: {e}")
+            continue
+
+        for entry in feed.entries[:6]:  # Slightly more entries for better chance
+            if posted_count >= MAX_POSTS_PER_RUN:
+                break
+
             link = entry.link.strip()
             
-            # Check for duplicates in database
+            # Check for duplicates
             try:
                 existing = databases.list_documents(
                     database_id=database_id, 
@@ -56,16 +68,17 @@ async def main(event=None, context=None):
                 if existing['total'] > 0: 
                     continue
             except Exception as e:
-                print(f"Database check error: {e}")
-                continue
+                print(f"Database error: {e}")
+                # Continue anyway, but log
 
-            # Translation with OpenRouter
+            # Translation
             title = entry.title
-            summary = (entry.get('summary', '') or entry.get('description', ''))[:800]
+            summary = (entry.get('summary', '') or entry.get('description', ''))[:750]
             
-            final_content = await translate_with_openrouter(title, summary)
+            final_content = await translate_with_openrouter_v2(title, summary)
             
             if not final_content:
+                time.sleep(SLEEP_BETWEEN_MODELS)  # Pause if translation fails
                 continue
 
             # Send to Telegram
@@ -78,13 +91,15 @@ async def main(event=None, context=None):
                         chat_id=chat_id, 
                         photo=image_url, 
                         caption=caption, 
-                        parse_mode='HTML'
+                        parse_mode='HTML',
+                        disable_notification=True
                     )
                 else:
                     await bot.send_message(
                         chat_id=chat_id, 
                         text=caption, 
-                        parse_mode='HTML'
+                        parse_mode='HTML',
+                        disable_notification=True
                     )
 
                 # Save to database
@@ -95,19 +110,22 @@ async def main(event=None, context=None):
                     data={
                         'link': link, 
                         'title': title[:250], 
-                        'published_at': datetime.now().isoformat()
+                        'published_at': datetime.now().isoformat(),
+                        'translated_content': final_content[:500]  # Store snippet
                     }
                 )
                 
                 posted_count += 1
+                print(f"Posted successfully: {title[:50]}...")
+                await asyncio.sleep(5)  # Short pause after post
                 break 
             except Exception as e:
-                print(f"Error sending/posting: {e}")
+                print(f"Send/Save error: {e}")
 
-    return {"status": "done", "posted": posted_count}
+    return {"status": "completed", "posted": posted_count}
 
-async def translate_with_openrouter(title, text):
-    """Translate using OpenRouter free models with fallback"""
+async def translate_with_openrouter_v2(title, text):
+    """Enhanced translation with more retries and logging"""
     client = AsyncOpenAI(
         api_key=os.environ.get('OPENROUTER_API_KEY'),
         base_url="https://openrouter.ai/api/v1",
@@ -116,9 +134,9 @@ async def translate_with_openrouter(title, text):
     prompt = f"""عنوان خبر: {title}
 متن: {text}
 
-به عنوان یک سردبیر مجله مد، این خبر را به فارسی جذاب ترجمه کن. 
-نکات ست کردن با استایل ایرانی را اضافه کن و از ایموجی استفاده کن. 
-فقط متن فارسی را برگردان."""
+به عنوان سردبیر مجله مد ایرانی، این را به فارسی شیک و جذاب ترجمه کن. 
+نکات استایل ایرانی (مانتو، شال، اکسسوری) اضافه کن. ایموجی بگذار. 
+فقط فارسی نهایی."""
 
     models = [
         "qwen/qwen3-next-80b-a3b-instruct:free",
@@ -127,36 +145,38 @@ async def translate_with_openrouter(title, text):
         "z-ai/glm-4.5-air:free"
     ]
     
-    for model in models:
+    for i, model in enumerate(models):
         try:
             response = await client.chat.completions.create(
                 model=model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.7,
-                max_tokens=800
+                max_tokens=850
             )
             content = response.choices[0].message.content.strip()
-            if content and len(content) > 50:
-                print(f"Translation successful with {model}")
+            if content and len(content) > 60 and len(content) < 1200:  # Quality check
+                print(f"✓ Translation OK with {model}")
                 return content
         except Exception as e:
-            print(f"Model {model} failed: {e}")
-            await asyncio.sleep(2)
+            print(f"✗ Model {model} (attempt {i+1}) failed: {str(e)[:100]}")
+            if i < len(models) - 1:
+                await asyncio.sleep(SLEEP_BETWEEN_MODELS)
     
+    print("All models failed - skipping")
     return None
 
 def get_image(entry):
-    """Extract best image from RSS entry"""
-    if 'media_thumbnail' in entry:
+    """Improved image extraction"""
+    if 'media_thumbnail' in entry and entry.media_thumbnail:
         return entry.media_thumbnail[0].get('url')
-    if 'media_content' in entry:
+    if 'media_content' in entry and entry.media_content:
         return entry.media_content[0].get('url') or entry.media_content[0].get('href')
     if 'enclosure' in entry:
         return entry.enclosure.get('href')
-    if 'description' in entry:
+    if entry.get('description'):
         soup = BeautifulSoup(entry.description, 'html.parser')
-        img = soup.find('img')
-        if img and img.get('src'):
+        img = soup.find('img', src=True)
+        if img:
             return img['src']
     return None
 
