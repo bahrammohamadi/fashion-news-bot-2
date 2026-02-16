@@ -33,37 +33,38 @@ async def main(event=None, context=None):
     aw_client.set_key(appwrite_key)
     databases = Databases(aw_client)
 
+    # فقط فیدهای تخصصی مد و فشن
     rss_feeds = [
-        "https://www.vogue.com/feed/rss",
-        "https://wwd.com/feed/",
-        "https://www.harpersbazaar.com/rss/fashion.xml",
-        "https://fashionista.com/feed",
-        "https://www.businessoffashion.com/feed/",
-        "https://www.elle.com/rss/fashion.xml",
-        "https://www.refinery29.com/rss.xml",
-        "https://www.thecut.com/feed",
-        "https://www.whowhatwear.com/rss",
-        "https://www.instyle.com/rss",
-        "https://www.marieclaire.com/rss/fashion/",
-        "https://www.glamour.com/rss/fashion",
-        "https://www.allure.com/rss",
-        "https://nylon.com/feed",
-        "https://www.papermag.com/rss",
-        "https://www.highsnobiety.com/feed/",
-        "https://hypebeast.com/feed",
-        "https://www.ssense.com/en-us/editorial/rss",
-        "https://www.dazeddigital.com/rss",
-        "https://i-d.vice.com/en/rss",
+        "https://medopia.ir/feed/",
+        "https://www.digistyle.com/mag/feed/",
+        "https://www.chibepoosham.com/feed/",
+        "https://www.tarahanelebas.com/feed/",
+        "https://www.persianpood.com/feed/",
+        "https://www.jument.style/feed/",
+        "https://www.zibamoon.com/feed/",
+        "https://www.sarak-co.com/feed/",
+        "https://www.elsana.com/feed/",
+        "https://www.beytoote.com/rss/fashion",
+        "https://www.namnak.com/rss/fashion",
+        "https://www.modetstyle.com/feed/",
+        "https://www.antikstyle.com/feed/",
+        "https://www.rnsfashion.com/feed/",
+        "https://www.pattonjameh.com/feed/",
+        "https://www.tonikaco.com/feed/",
+        "https://www.zoomit.ir/feed/category/fashion-beauty/",
+        "https://www.khabaronline.ir/rss/category/مد-زیبایی",
+        "https://fararu.com/rss/category/مد-زیبایی",
+        "https://www.digikala.com/mag/feed/?category=مد-و-زیبایی",
     ]
 
     now = datetime.now(timezone.utc)
-    time_threshold = now - timedelta(days=1)   # ۲۴ ساعت اخیر
+    time_threshold = now - timedelta(days=4)
 
-    posted_count = 0
-    max_posts_per_run = 4   # حداکثر ۴ پست در هر اجرا
+    # فقط ۱ پست در هر اجرا
+    max_posts_per_run = 1
 
     for feed_url in rss_feeds:
-        if posted_count >= max_posts_per_run:
+        if max_posts_per_run <= 0:
             break
 
         try:
@@ -72,7 +73,7 @@ async def main(event=None, context=None):
                 continue
 
             for entry in feed.entries:
-                if posted_count >= max_posts_per_run:
+                if max_posts_per_run <= 0:
                     break
 
                 published = entry.get('published_parsed') or entry.get('updated_parsed')
@@ -85,26 +86,57 @@ async def main(event=None, context=None):
                 title = entry.title.strip()
                 link = entry.link.strip()
                 raw_html = entry.get('summary') or entry.get('description') or ''
+
                 soup = BeautifulSoup(raw_html, 'html.parser')
-                content_raw = soup.get_text(separator=' ').strip()
+                clean_text = soup.get_text(separator=' ').strip()
+                if len(clean_text) > 380:
+                    clean_text = clean_text[:380] + "..."
 
-                # مرحله ۱: ترجمه دقیق با پرامپت ثابت
-                translated = translate_to_persian(title, content_raw)
+                # چک تکراری
+                try:
+                    existing = databases.list_documents(
+                        database_id=database_id,
+                        collection_id=collection_id,
+                        queries=[Query.equal("link", link)]
+                    )
+                    if existing['total'] > 0:
+                        print(f"[INFO] تکراری رد شد: {title[:60]}")
+                        continue
+                except Exception as db_err:
+                    print(f"[WARN] خطا DB: {str(db_err)}")
 
-                # مرحله ۲: تبدیل به مقاله فشن حرفه‌ای با پرامپت دوم
-                final_content = convert_to_fashion_article(translated, title, link, pub_date)
+                # پست تمیز بدون جمله تکراری
+                final_text = f"""**{title}**
 
-                final_text = f"{final_content}\n\n🔗 {link}"
+{clean_text}
+
+#مد #استایل #ترند #فشن_ایرانی #مهرجامه
+
+🔗 {link}"""
+
+                image_url = get_image_from_rss(entry)
+                if not image_url:
+                    image_url = await extract_image_from_page(link)
 
                 try:
-                    image_url = get_image_from_rss(entry)
                     if image_url:
-                        await bot.send_photo(chat_id=chat_id, photo=image_url, caption=final_text, parse_mode='HTML', disable_notification=True)
+                        await bot.send_photo(
+                            chat_id=chat_id,
+                            photo=image_url,
+                            caption=final_text,
+                            parse_mode='HTML',
+                            disable_notification=True
+                        )
                     else:
-                        await bot.send_message(chat_id=chat_id, text=final_text, disable_web_page_preview=True, disable_notification=True)
+                        await bot.send_message(
+                            chat_id=chat_id,
+                            text=final_text,
+                            disable_web_page_preview=True,
+                            disable_notification=True
+                        )
 
-                    posted_count += 1
-                    print(f"[SUCCESS] پست موفق: {title[:60]}")
+                    max_posts_per_run -= 1
+                    print(f"[SUCCESS] پست موفق ارسال شد: {title[:60]}")
 
                     try:
                         databases.create_document(
@@ -127,25 +159,36 @@ async def main(event=None, context=None):
         except Exception as feed_err:
             print(f"[ERROR] خطا فید {feed_url}: {str(feed_err)}")
 
-    print(f"[INFO] پایان اجرا - تعداد پست ارسال‌شده: {posted_count}")
-    return {"status": "success", "posted": posted_count}
+    print("[INFO] پایان اجرا")
+    return {"status": "success"}
 
 
-def translate_to_persian(title, content_raw):
-    """پرامپت ثابت ترجمه دقیق"""
-    # اینجا فقط تمیز کردن و شبیه‌سازی ترجمه (چون بدون LLM واقعی هستیم)
-    return f"{title}\n\n{content_raw[:450]}..."
+async def extract_image_from_page(url):
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+        response = requests.get(url, timeout=8, headers=headers)
+        if response.status_code != 200:
+            return None
 
+        soup = BeautifulSoup(response.text, 'html.parser')
 
-def convert_to_fashion_article(translated, title, link, pub_date):
-    """پرامپت دوم - تبدیل به مقاله فشن حرفه‌ای"""
-    return f"""**{title}**
+        og = soup.find('meta', property='og:image')
+        if og and og.get('content'):
+            return og['content']
 
-{translated}
-
-این ترند یا خبر جدید می‌تواند ایده‌های ارزشمندی برای استایل روزمره یا انتخاب‌های هوشمندانه در فصل جاری به همراه داشته باشد.
-
-#مد #استایل #ترند #فشن_ایرانی #مهرجامه"""
+        for img in soup.find_all('img'):
+            src = img.get('src') or img.get('data-src') or img.get('data-lazy')
+            if src and len(src) > 15:
+                if any(bad in src.lower() for bad in ['logo', 'icon', 'banner', 'advert']):
+                    continue
+                if src.startswith('//'):
+                    return 'https:' + src
+                if src.startswith('/'):
+                    return 'https://' + url.split('/')[2] + src
+                return src
+        return None
+    except:
+        return None
 
 
 def get_image_from_rss(entry):
