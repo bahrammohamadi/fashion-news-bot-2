@@ -1,4 +1,4 @@
-# main_fashion_final_v12.py - فیکس کامل ترجمه + حذف "نکته استایل ایرانی:" + ۱ پست در هر اجرا
+# main_fashion_openrouter_final.py - نهایی، بدون ترجمه مستقیم، فقط استنباط + نکته استایل، ۱ پست، با عکس‌ها
 
 import os
 import asyncio
@@ -16,7 +16,7 @@ from appwrite.query import Query
 # ====================== تنظیمات ======================
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHANNEL_ID = os.environ.get('TELEGRAM_CHANNEL_ID')
-OPENROUTER_API_KEY = os.environ.get('OPENROUTER_API_KEY')  # کلید جدیدت
+OPENROUTER_API_KEY = os.environ.get('OPENROUTER_API_KEY')
 APPWRITE_ENDPOINT = os.environ.get('APPWRITE_ENDPOINT', 'https://cloud.appwrite.io/v1')
 APPWRITE_PROJECT_ID = os.environ.get('APPWRITE_PROJECT_ID')
 APPWRITE_API_KEY = os.environ.get('APPWRITE_API_KEY')
@@ -52,7 +52,7 @@ RSS_FEEDS = [
     "https://www.papermag.com/rss",
 ]
 
-# ====================== استخراج استنباط + نکته استایل ======================
+# ====================== تولید استنباط + نکته استایل ======================
 async def extract_insight_and_style(client, title, raw_text):
     prompt = f"""
 از این خبر مد و فشن فقط برآیند و استنباط اصلی رو استخراج کن:
@@ -73,7 +73,7 @@ async def extract_insight_and_style(client, title, raw_text):
 
     try:
         resp = await client.chat.completions.create(
-            model="qwen/qwen2.5-72b-instruct",   # مدل قوی فارسی، rate limit بهتر
+            model="qwen/qwen2.5-coder-32b-instruct",  # مدل قوی فارسی، بدون لیمیت سخت
             messages=[{"role": "user", "content": prompt}],
             temperature=0.75,
             max_tokens=500
@@ -83,7 +83,7 @@ async def extract_insight_and_style(client, title, raw_text):
             raise Exception("پاسخ نامعتبر")
         return content
     except Exception as e:
-        print(f"[GAPGPT ERROR] {str(e)[:100]} - fallback")
+        print(f"[OPENROUTER ERROR] {str(e)[:100]} - fallback")
         clean_fallback = clean_html(raw_text)
         if len(clean_fallback) > MAX_FINAL_TEXT_LENGTH:
             clean_fallback = clean_fallback[:MAX_FINAL_TEXT_LENGTH] + "..."
