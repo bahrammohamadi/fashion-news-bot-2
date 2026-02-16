@@ -37,42 +37,27 @@ async def main(event=None, context=None):
         base_url="https://openrouter.ai/api/v1"
     )
 
-    # لیست کامل ۲۵ فید (۱۵ فارسی + ۱۰ خارجی)
+    # لیست ۱۰ فید فعال (۵ فارسی + ۵ خارجی) برای جلوگیری از timeout
     rss_feeds = [
-        # فارسی (اول برای اولویت)
+        # فارسی فعال
         "https://medopia.ir/feed/",
         "https://www.khabaronline.ir/rss/category/مد-زیبایی",
         "https://fararu.com/rss/category/مد-زیبایی",
         "https://www.beytoote.com/rss/fashion",
         "https://www.zoomit.ir/feed/category/fashion-beauty/",
-        "https://www.digikala.com/mag/feed/?category=مد",
-        "https://www.hamshahrionline.ir/rss/category/مد",
-        "https://www.isna.ir/rss/category/فرهنگ-هنر",
-        "https://www.tasnimnews.com/fa/rss/feed/0/0/0/سبک-زندگی",
-        "https://www.yjc.ir/fa/rss/5/مد-زیبایی",
-        "https://www.tabnak.ir/rss/category/مد-زیبایی",
-        "https://www.mehrnews.com/rss/category/مد-زیبایی",
-        "https://www.irna.ir/rss/category/مد-زیبایی",
-        "https://www.fardanews.com/rss/category/مد-زیبایی",
-        "https://www.ettelaat.com/rss/category/مد-زیبایی",
-        # خارجی
+        # خارجی قوی
         "https://www.vogue.com/feed/rss",
         "https://wwd.com/feed/",
         "https://fashionista.com/feed",
         "https://www.harpersbazaar.com/rss/fashion.xml",
-        "https://www.elle.com/rss/all.xml",
         "https://www.businessoffashion.com/feed/",
-        "https://www.thecut.com/feed",
-        "https://www.refinery29.com/rss.xml",
-        "https://www.whowhatwear.com/rss",
-        "https://feeds.feedburner.com/fibre2fashion/fashion-news",
     ]
 
     now = datetime.now(timezone.utc)
     time_threshold = now - timedelta(hours=24)
 
     posted_count = 0
-    max_posts_per_run = 3  # حداکثر ۳ پست در هر اجرا (برای جلوگیری از timeout)
+    max_posts_per_run = 3  # حداکثر ۳ پست برای جلوگیری از timeout
 
     for feed_url in rss_feeds:
         if posted_count >= max_posts_per_run:
@@ -84,7 +69,7 @@ async def main(event=None, context=None):
                 print(f"[INFO] فید خالی: {feed_url}")
                 continue
 
-            is_persian = any(x in feed_url.lower() for x in ['.ir', 'khabaronline', 'fararu', 'beytoote', 'zoomit', 'digikala', 'hamshahrionline', 'isna', 'tasnim', 'yjc', 'tabnak', 'mehrnews', 'irna', 'fardanews', 'ettelaat', 'medopia'])
+            is_persian = any(x in feed_url.lower() for x in ['.ir', 'khabaronline', 'fararu', 'beytoote', 'zoomit', 'medopia'])
 
             for entry in feed.entries:
                 if posted_count >= max_posts_per_run:
@@ -115,7 +100,6 @@ async def main(event=None, context=None):
                 except Exception as db_err:
                     print(f"[WARN] خطا DB: {str(db_err)} - ادامه بدون چک")
 
-                # پرامپت حرفه‌ای
                 prompt = f"""You are a senior Persian fashion editor.
 
 Write a magazine-quality Persian fashion news article.
@@ -134,7 +118,7 @@ Instructions:
 4. Headline: 8–14 words.
 5. Lead: 1–2 sentences.
 6. Body: 2–4 paragraphs.
-7. End with 2–3 sentences analysis.
+7. End with 2–3 sentences industry analysis (neutral, objective).
 8. Tone: formal, journalistic.
 9. Length: 220–350 words.
 10. Use only input information.
@@ -151,7 +135,7 @@ Output:
 منبع: {feed_url}
 """
 
-                content = await translate_with_openrouter(openrouter_client, prompt)
+                content = await translate_with_openrouter(openrouter_client, prompt, title, description)
 
                 final_text = f"{content}\n\n🔗 {link}"
 
@@ -203,13 +187,13 @@ Output:
     return {"status": "success", "posted": posted_count}
 
 
-async def translate_with_openrouter(client, prompt):
+async def translate_with_openrouter(client, prompt, title, description):
     try:
         response = await client.chat.completions.create(
-            model="google/gemma-3n-4b:free",  # سریع و بدون rate limit شناخته‌شده
+            model="meta-llama/llama-3.2-3b-instruct:free",  # سریع، فارسی خوب، بدون rate limit شناخته‌شده
             messages=[{"role": "user", "content": prompt}],
             temperature=0.6,
-            max_tokens=700  # کوتاه‌تر برای سرعت
+            max_tokens=700
         )
 
         return response.choices[0].message.content.strip()
