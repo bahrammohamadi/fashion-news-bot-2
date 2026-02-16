@@ -2,7 +2,7 @@ import os
 import asyncio
 import feedparser
 from datetime import datetime, timedelta, timezone
-from telegram import Bot
+from telegram import Bot, LinkPreviewOptions
 from appwrite.client import Client
 from appwrite.services.databases import Databases
 from appwrite.exception import AppwriteException
@@ -10,6 +10,9 @@ from appwrite.query import Query
 from openai import AsyncOpenAI
 
 async def main(event=None, context=None):
+    # لاگ بهتر با context
+    context.log("اجرای تابع main شروع شد")
+
     token = os.environ.get('TELEGRAM_BOT_TOKEN')
     chat_id = os.environ.get('TELEGRAM_CHANNEL_ID')
     appwrite_endpoint = os.environ.get('APPWRITE_ENDPOINT', 'https://cloud.appwrite.io/v1')
@@ -19,8 +22,8 @@ async def main(event=None, context=None):
     collection_id = 'history'
 
     if not all([token, chat_id, appwrite_project, appwrite_key, database_id]):
-        print("خطا: متغیرهای محیطی ناقص! APPWRITE_PROJECT_ID را چک کنید.")
-        return {"status": "error"}
+        context.error("متغیرهای محیطی ناقص! APPWRITE_PROJECT_ID را چک کنید.")
+        return {"status": "error", "message": "متغیرهای محیطی ناقص"}
 
     bot = Bot(token=token)
 
@@ -55,6 +58,7 @@ async def main(event=None, context=None):
         try:
             feed = feedparser.parse(feed_url)
             if not feed.entries:
+                context.log(f"فید خالی: {feed_url}")
                 continue
 
             is_persian = any(x in feed_url.lower() for x in ['.ir', 'khabaronline', 'medopia'])
@@ -75,7 +79,7 @@ async def main(event=None, context=None):
                 description = (entry.get('summary') or entry.get('description') or '').strip()
                 content_raw = description[:1000]
 
-                # چک تکراری (اگر DB مشکل داشت، رد نمی‌شه)
+                # چک تکراری (اگر DB کار نکرد، رد نمی‌شه)
                 try:
                     existing = databases.list_documents(
                         database_id=database_id,
@@ -83,9 +87,10 @@ async def main(event=None, context=None):
                         queries=[Query.equal("link", link)]
                     )
                     if existing['total'] > 0:
+                        context.log(f"پست تکراری رد شد: {title[:60]}")
                         continue
                 except Exception as db_err:
-                    print(f"خطا DB: {str(db_err)} - ادامه بدون چک تکراری")
+                    context.error(f"خطا در چک دیتابیس (ادامه بدون چک تکراری): {str(db_err)}")
 
                 # پرامپت حرفه‌ای جدید
                 prompt = f"""You are a professional fashion news editor.
@@ -145,12 +150,12 @@ If information is missing, do not fill gaps with assumptions."""
                         await bot.send_message(
                             chat_id=chat_id,
                             text=final_text,
-                            disable_web_page_preview=True,
+                            link_preview_options=LinkPreviewOptions(is_disabled=True),
                             disable_notification=True
                         )
 
                     posted = True
-                    print(f"پست موفق: {title[:60]}")
+                    context.log(f"پست موفق ارسال شد: {title[:60]}")
 
                     try:
                         databases.create_document(
@@ -161,27 +166,28 @@ If information is missing, do not fill gaps with assumptions."""
                                 'link': link,
                                 'title': title,
                                 'published_at': now.isoformat(),
-                                'feed_url': feed_url
+                                'feed_url': feed_url,
+                                'created_at': now.isoformat()
                             }
                         )
-                        print("ذخیره DB موفق")
+                        context.log("ذخیره در دیتابیس موفق")
                     except Exception as save_err:
-                        print(f"خطا ذخیره DB: {str(save_err)}")
+                        context.error(f"خطا در ذخیره دیتابیس: {str(save_err)}")
 
                 except Exception as send_err:
-                    print(f"خطا ارسال: {str(send_err)}")
+                    context.error(f"خطا در ارسال پست: {str(send_err)}")
 
         except Exception as feed_err:
-            print(f"خطا فید {feed_url}: {str(feed_err)}")
+            context.error(f"خطا در پردازش فید {feed_url}: {str(feed_err)}")
 
-    print(f"پایان اجرا - پست ارسال شد: {posted}")
+    context.log(f"پایان اجرا - پست ارسال شد: {posted}")
     return {"status": "success", "posted": posted}
 
 
 async def translate_with_openrouter(client, prompt):
     try:
         response = await client.chat.completions.create(
-            model="meta-llama/llama-3.3-70b-instruct:free",  # مدل سریع و فعال
+            model="google/gemma-3n-4b:free",  # سریع‌ترین مدل رایگان فعال
             messages=[{"role": "user", "content": prompt}],
             temperature=0.7,
             max_tokens=800
@@ -190,7 +196,7 @@ async def translate_with_openrouter(client, prompt):
         return response.choices[0].message.content.strip()
 
     except Exception as e:
-        print(f"خطا ترجمه: {str(e)}")
+        context.error(f"خطا در ترجمه: {str(e)}")
         return "(ترجمه موقت - خطا رخ داد)\n\nلینک خبر اصلی را ببینید."
 
 
