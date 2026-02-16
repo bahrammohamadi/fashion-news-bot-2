@@ -10,7 +10,6 @@ from appwrite.query import Query
 from openai import AsyncOpenAI
 
 async def main(event=None, context=None):
-    # متغیرهای محیطی
     token = os.environ.get('TELEGRAM_BOT_TOKEN')
     chat_id = os.environ.get('TELEGRAM_CHANNEL_ID')
     appwrite_endpoint = os.environ.get('APPWRITE_ENDPOINT', 'https://cloud.appwrite.io/v1')
@@ -19,62 +18,54 @@ async def main(event=None, context=None):
     database_id = os.environ.get('APPWRITE_DATABASE_ID')
     collection_id = 'history'
 
+    # چک اولیه متغیرها
     if not all([token, chat_id, appwrite_project, appwrite_key, database_id]):
-        print("متغیرهای محیطی ناقص! لطفاً APPWRITE_PROJECT_ID، DATABASE_ID و بقیه را چک کنید.")
+        print("خطا: متغیرهای محیطی ناقص! APPWRITE_PROJECT_ID یا DATABASE_ID را چک کنید.")
         return {"status": "error", "message": "متغیرهای محیطی ناقص"}
 
     bot = Bot(token=token)
 
-    # اتصال به Appwrite
     aw_client = Client()
     aw_client.set_endpoint(appwrite_endpoint)
     aw_client.set_project(appwrite_project)
     aw_client.set_key(appwrite_key)
     databases = Databases(aw_client)
 
-    # کلاینت OpenRouter
     openrouter_client = AsyncOpenAI(
         api_key=os.environ.get('OPENROUTER_API_KEY'),
         base_url="https://openrouter.ai/api/v1"
     )
 
-    # لیست فیدهای RSS (می‌توانید تغییر دهید)
     rss_feeds = [
         "https://www.vogue.com/feed/rss",
         "https://wwd.com/feed/",
-        "https://www.harpersbazaar.com/rss/fashion.xml",
         "https://fashionista.com/feed",
-        "https://www.businessoffashion.com/feed/",
-        "https://www.elle.com/rss/fashion.xml",
-        "https://www.refinery29.com/rss.xml",
-        "https://www.thecut.com/feed",
-        "https://www.whowhatwear.com/rss",
-        "https://feeds.feedburner.com/fibre2fashion/fashion-news",
         "https://medopia.ir/feed/",
-        "https://www.digikala.com/mag/feed/?category=مد",
         "https://www.khabaronline.ir/rss/category/مد-زیبایی",
-        "https://www.isna.ir/rss/category/فرهنگ-هنر",
-        "https://www.tasnimnews.com/fa/rss/feed/0/0/0/سبک-زندگی",
-        "https://www.hamshahrionline.ir/rss/category/مد",
         "https://fararu.com/rss/category/مد-زیبایی",
         "https://www.beytoote.com/rss/fashion",
-        "https://www.zoomit.ir/feed/category/fashion-beauty/",
     ]
 
-    posted_count = 0
     now = datetime.now(timezone.utc)
-    time_threshold = now - timedelta(hours=24)  # فقط اخبار ۲۴ ساعت اخیر
+    time_threshold = now - timedelta(hours=24)
+
+    posted = False  # فقط یک پست در هر اجرا
 
     for feed_url in rss_feeds:
+        if posted:
+            break  # اگر یک پست ارسال شد، دیگه ادامه نده
+
         try:
             feed = feedparser.parse(feed_url)
             if not feed.entries:
-                print(f"فید خالی: {feed_url}")
                 continue
 
-            is_persian = any(x in feed_url.lower() for x in ['.ir', 'khabaronline', 'isna', 'tasnim', 'hamshahrionline', 'fararu', 'beytoote', 'digikala', 'zoomit', 'medopia'])
+            is_persian = any(x in feed_url.lower() for x in ['.ir', 'khabaronline', 'medopia', 'beytoote', 'fararu'])
 
-            for entry in feed.entries[:4]:
+            for entry in feed.entries:
+                if posted:
+                    break
+
                 published = entry.get('published_parsed') or entry.get('updated_parsed')
                 if not published:
                     continue
@@ -85,7 +76,7 @@ async def main(event=None, context=None):
                 title = entry.title.strip()
                 link = entry.link.strip()
 
-                # چک تکراری بودن (اگر DB مشکل داشت، رد نمی‌شه)
+                # چک تکراری
                 try:
                     existing = databases.list_documents(
                         database_id=database_id,
@@ -93,17 +84,13 @@ async def main(event=None, context=None):
                         queries=[Query.equal("link", link)]
                     )
                     if existing['total'] > 0:
-                        print(f"پست تکراری رد شد: {title[:60]}...")
                         continue
                 except Exception as db_err:
-                    print(f"خطا در چک دیتابیس (ادامه بدون چک تکراری): {str(db_err)}")
+                    print(f"خطا چک دیتابیس (ادامه بدون چک تکراری): {str(db_err)}")
 
                 summary = (entry.get('summary') or entry.get('description') or '').strip()[:500]
-
-                # گرفتن عکس از RSS
                 image_url = get_image_from_rss(entry)
 
-                # ترجمه یا بازنویسی
                 if is_persian:
                     content = f"{title}\n\n{summary}"
                 else:
@@ -128,10 +115,11 @@ async def main(event=None, context=None):
                             disable_notification=True
                         )
 
-                    posted_count += 1
+                    posted = True
+                    posted_count = 1
                     print(f"پست موفق ارسال شد: {title[:60]}...")
 
-                    # ذخیره در دیتابیس (اگر خطا داد، رد می‌شه)
+                    # ذخیره در دیتابیس
                     try:
                         databases.create_document(
                             database_id=database_id,
@@ -155,8 +143,12 @@ async def main(event=None, context=None):
         except Exception as feed_err:
             print(f"خطا در پردازش فید {feed_url}: {str(feed_err)}")
 
-    print(f"اجرای این دور تمام شد. تعداد پست‌های ارسال‌شده: {posted_count}")
-    return {"status": "success", "posted": posted_count}
+    if posted:
+        print("اجرای این دور: ۱ پست ارسال شد")
+    else:
+        print("اجرای این دور: هیچ پست جدیدی یافت نشد")
+
+    return {"status": "success", "posted": 1 if posted else 0}
 
 
 async def translate_with_openrouter(client, title_en, summary_en):
@@ -176,16 +168,14 @@ async def translate_with_openrouter(client, title_en, summary_en):
 خلاصه انگلیسی: {summary_en}"""
 
         response = await client.chat.completions.create(
-            model="deepseek/deepseek-r1-0528:free",  # قوی‌ترین مدل رایگان فعلی
+            model="deepseek/deepseek-r1-0528:free",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.7,
-            max_tokens=600,
-            top_p=0.9
+            max_tokens=600
         )
 
         full_text = response.choices[0].message.content.strip()
 
-        # جدا کردن تیتر و متن
         if '\n' in full_text:
             title_fa, content_fa = full_text.split('\n', 1)
             title_fa = title_fa.strip()
@@ -197,13 +187,11 @@ async def translate_with_openrouter(client, title_en, summary_en):
         return f"{title_fa}\n\n{content_fa}"
 
     except Exception as e:
-        print(f"خطا در ترجمه با DeepSeek R1: {str(e)}")
-        # fallback به متن انگلیسی خام
-        return f"📰 {title_en}\n\n{summary_en[:400]}...\n(ترجمه موقت - خطا رخ داد)"
+        print(f"خطا در ترجمه: {str(e)}")
+        return f"📰 {title_en}\n\n{summary_en[:400]}...\n(ترجمه موقت)"
 
 
 def get_image_from_rss(entry):
-    """گرفتن URL عکس از RSS اگر وجود داشته باشد"""
     if 'enclosure' in entry and entry.enclosure.get('type', '').startswith('image/'):
         return entry.enclosure.href
     if 'media_content' in entry:
