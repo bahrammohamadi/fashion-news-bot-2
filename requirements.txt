@@ -1,6 +1,8 @@
-feedparser
-python-telegram-bot==20.8
-appwrite>=1.5.0
-beautifulsoup4
-requests
-openai>=1.0.0
+# requirements.txt - برای بات فشن با OpenRouter و Appwrite
+
+feedparser>=6.0.11                  # خواندن فیدهای RSS
+python-telegram-bot==20.8           # نسخه پایدار تلگرام بات (جدیدتر گاهی مشکل داره)
+appwrite>=1.5.0                     # SDK رسمی Appwrite
+beautifulsoup4>=4.12.3              # پاک کردن HTML از description و summary
+requests>=2.31.0                    # درخواست HTTP برای استخراج عکس از صفحه
+openai>=1.0.0                       # کلاینت سازگار با OpenRouter (و GapGPT)
