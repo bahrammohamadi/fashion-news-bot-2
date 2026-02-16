@@ -1,184 +1,250 @@
-# main_v2.py - Version 2: With Better Error Handling & Limits (For Production)
+# main_fashion_v5.py - فقط خارجی، ترجمه با OpenRouter، ۱-۲ پست، با عکس، بدون تکراری
+
 import os
 import asyncio
 import feedparser
-from datetime import datetime
+import requests
+from datetime import datetime, timedelta, timezone
 from telegram import Bot
+from bs4 import BeautifulSoup
 from openai import AsyncOpenAI
 from appwrite.client import Client
 from appwrite.services.databases import Databases
+from appwrite.exception import AppwriteException
 from appwrite.query import Query
-from bs4 import BeautifulSoup
-import time
 
-MAX_POSTS_PER_RUN = 1
-SLEEP_BETWEEN_MODELS = 3  # Seconds
+# ====================== تنظیمات ======================
+TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
+TELEGRAM_CHANNEL_ID = os.environ.get('TELEGRAM_CHANNEL_ID')
+OPENROUTER_API_KEY = os.environ.get('OPENROUTER_API_KEY')
+APPWRITE_ENDPOINT = os.environ.get('APPWRITE_ENDPOINT', 'https://cloud.appwrite.io/v1')
+APPWRITE_PROJECT_ID = os.environ.get('APPWRITE_PROJECT_ID')
+APPWRITE_API_KEY = os.environ.get('APPWRITE_API_KEY')
+APPWRITE_DATABASE_ID = os.environ.get('APPWRITE_DATABASE_ID')
+COLLECTION_ID = 'history'
 
+MAX_POSTS_PER_RUN = 2
+CHECK_DAYS = 4
+MAX_TEXT_LENGTH = 420
+
+# ====================== فیدهای خارجی مد و فشن ======================
+RSS_FEEDS = [
+    "https://www.vogue.com/feed/rss",
+    "https://wwd.com/feed/",
+    "https://www.harpersbazaar.com/rss/fashion.xml",
+    "https://fashionista.com/feed",
+    "https://www.businessoffashion.com/feed/",
+    "https://www.elle.com/rss/fashion.xml",
+    "https://www.refinery29.com/rss.xml",
+    "https://www.thecut.com/feed",
+    "https://www.whowhatwear.com/rss",
+    "https://www.instyle.com/rss",
+    "https://www.marieclaire.com/rss/fashion/",
+    "https://www.glamour.com/rss/fashion",
+    "https://www.allure.com/rss",
+    "https://nylon.com/feed",
+    "https://www.highsnobiety.com/feed/",
+    "https://hypebeast.com/feed",
+    "https://www.ssense.com/en-us/editorial/rss",
+    "https://www.dazeddigital.com/rss",
+    "https://i-d.vice.com/en/rss",
+    "https://www.papermag.com/rss",
+]
+
+# ====================== توابع کمکی ======================
+def clean_html(html):
+    soup = BeautifulSoup(html, 'html.parser')
+    return soup.get_text(separator=' ').strip()
+
+def get_image_from_rss(entry):
+    if 'enclosure' in entry and entry.enclosure.get('type', '').startswith('image/'):
+        return entry.enclosure.href
+    if 'media_content' in entry:
+        for media in entry.media_content:
+            if media.get('medium') == 'image' and media.get('url'):
+                return media.get('url')
+    return None
+
+async def extract_og_image(url):
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        response = requests.get(url, timeout=8, headers=headers)
+        if response.status_code != 200:
+            return None
+        soup = BeautifulSoup(response.text, 'html.parser')
+        og = soup.find('meta', property='og:image')
+        if og and og.get('content'):
+            return og['content']
+        return None
+    except:
+        return None
+
+async def translate_and_format(client, title, raw_text):
+    # مرحله ۱: ترجمه دقیق به فارسی
+    translate_prompt = f"""
+عنوان: {title}
+متن: {raw_text[:1200]}
+
+به فارسی روان، حرفه‌ای و مناسب مجله مد ترجمه کن.
+فقط متن فارسی نهایی رو بده، بدون توضیح اضافی.
+"""
+
+    try:
+        resp = await client.chat.completions.create(
+            model="meta-llama/llama-3.3-70b-instruct:free",
+            messages=[{"role": "user", "content": translate_prompt}],
+            temperature=0.6,
+            max_tokens=800
+        )
+        persian_text = resp.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"[TRANSLATE ERROR] {e}")
+        persian_text = raw_text[:500] + "... (ترجمه موقت)"
+
+    # مرحله ۲: تبدیل به پست فشن استاندارد
+    format_prompt = f"""
+عنوان: {title}
+متن فارسی: {persian_text}
+
+به عنوان سردبیر مجله مد، این را به یک پست کوتاه و شیک تبدیل کن:
+- تیتر جذاب (اگر لازم بود کمی تغییر بده)
+- متن ۳-۵ خطی روان و حرفه‌ای
+- فقط محتوای اصلی خبر
+- بدون جمله اضافه، بدون تبلیغ، بدون ایموجی، بدون لینک
+
+خروجی فقط متن پست باشه.
+"""
+
+    try:
+        resp = await client.chat.completions.create(
+            model="meta-llama/llama-3.3-70b-instruct:free",
+            messages=[{"role": "user", "content": format_prompt}],
+            temperature=0.7,
+            max_tokens=400
+        )
+        final_content = resp.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"[FORMAT ERROR] {e}")
+        final_content = f"**{title}**\n\n{persian_text[:380]}..."
+
+    return final_content
+
+# ====================== تابع اصلی ======================
 async def main(event=None, context=None):
-    # Environment variables
-    token = os.environ.get('TELEGRAM_BOT_TOKEN')
-    chat_id = os.environ.get('TELEGRAM_CHANNEL_ID')
-    openrouter_key = os.environ.get('OPENROUTER_API_KEY')
-    appwrite_key = os.environ.get('APPWRITE_API_KEY')
-    project_id = '699039d4000e86c2f95e'
-    database_id = '6990a1310017aa6c5c0d'
-    collection_id = 'history'
+    print("[INFO] شروع اجرا")
 
-    if not all([token, chat_id, openrouter_key, appwrite_key]):
-        print("Missing environment variables!")
-        return {"status": "error", "message": "Missing env vars"}
+    if not all([TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL_ID, OPENROUTER_API_KEY, APPWRITE_PROJECT_ID, APPWRITE_API_KEY, APPWRITE_DATABASE_ID]):
+        print("[ERROR] متغیرهای محیطی ناقص")
+        return {"status": "error"}
 
-    bot = Bot(token=token)
-    
-    # Appwrite setup
+    bot = Bot(token=TELEGRAM_BOT_TOKEN)
+
+    openrouter_client = AsyncOpenAI(
+        api_key=OPENROUTER_API_KEY,
+        base_url="https://openrouter.ai/api/v1"
+    )
+
     aw_client = Client()
-    aw_client.set_endpoint("https://cloud.appwrite.io/v1")
-    aw_client.set_project(project_id)
-    aw_client.set_key(appwrite_key)
+    aw_client.set_endpoint(APPWRITE_ENDPOINT)
+    aw_client.set_project(APPWRITE_PROJECT_ID)
+    aw_client.set_key(APPWRITE_API_KEY)
     databases = Databases(aw_client)
 
-    # RSS feeds
-    rss_feeds = ["https://www.vogue.com/feed/rss", "https://wwd.com/feed/"]
-    
+    now = datetime.now(timezone.utc)
+    time_threshold = now - timedelta(days=CHECK_DAYS)
+
     posted_count = 0
-    
-    for feed_url in rss_feeds:
+
+    for feed_url in RSS_FEEDS:
         if posted_count >= MAX_POSTS_PER_RUN:
             break
 
         try:
             feed = feedparser.parse(feed_url)
-        except Exception as e:
-            print(f"Feed parse error for {feed_url}: {e}")
-            continue
-
-        for entry in feed.entries[:6]:  # Slightly more entries for better chance
-            if posted_count >= MAX_POSTS_PER_RUN:
-                break
-
-            link = entry.link.strip()
-            
-            # Check for duplicates
-            try:
-                existing = databases.list_documents(
-                    database_id=database_id, 
-                    collection_id=collection_id, 
-                    queries=[Query.equal("link", link)]
-                )
-                if existing['total'] > 0: 
-                    continue
-            except Exception as e:
-                print(f"Database error: {e}")
-                # Continue anyway, but log
-
-            # Translation
-            title = entry.title
-            summary = (entry.get('summary', '') or entry.get('description', ''))[:750]
-            
-            final_content = await translate_with_openrouter_v2(title, summary)
-            
-            if not final_content:
-                time.sleep(SLEEP_BETWEEN_MODELS)  # Pause if translation fails
+            if not feed.entries:
                 continue
 
-            # Send to Telegram
-            try:
-                image_url = get_image(entry)
-                caption = f"{final_content}\n\n✨ @irfashionnews\n🔗 {link}"
-                
-                if image_url:
-                    await bot.send_photo(
-                        chat_id=chat_id, 
-                        photo=image_url, 
-                        caption=caption, 
-                        parse_mode='HTML',
-                        disable_notification=True
+            for entry in feed.entries:
+                if posted_count >= MAX_POSTS_PER_RUN:
+                    break
+
+                published = entry.get('published_parsed') or entry.get('updated_parsed')
+                if not published:
+                    continue
+                pub_date = datetime(*published[:6], tzinfo=timezone.utc)
+                if pub_date < time_threshold:
+                    continue
+
+                title = entry.title.strip()
+                link = entry.link.strip()
+                raw_content = (entry.get('summary') or entry.get('description') or '')[:1200]
+
+                soup = BeautifulSoup(raw_content, 'html.parser')
+                clean_text = soup.get_text(separator=' ').strip()
+
+                # چک تکراری
+                try:
+                    existing = databases.list_documents(
+                        database_id=APPWRITE_DATABASE_ID,
+                        collection_id=COLLECTION_ID,
+                        queries=[Query.equal("link", link)]
                     )
-                else:
-                    await bot.send_message(
-                        chat_id=chat_id, 
-                        text=caption, 
-                        parse_mode='HTML',
-                        disable_notification=True
-                    )
+                    if existing['total'] > 0:
+                        continue
+                except Exception as e:
+                    print(f"[DB WARN] {e}")
 
-                # Save to database
-                databases.create_document(
-                    database_id=database_id, 
-                    collection_id=collection_id, 
-                    document_id='unique()', 
-                    data={
-                        'link': link, 
-                        'title': title[:250], 
-                        'published_at': datetime.now().isoformat(),
-                        'translated_content': final_content[:500]  # Store snippet
-                    }
-                )
-                
-                posted_count += 1
-                print(f"Posted successfully: {title[:50]}...")
-                await asyncio.sleep(5)  # Short pause after post
-                break 
-            except Exception as e:
-                print(f"Send/Save error: {e}")
+                # ترجمه و فرمت با OpenRouter
+                final_text = await translate_and_format(openrouter_client, title, clean_text)
 
-    return {"status": "completed", "posted": posted_count}
+                image_url = get_image_from_rss(entry)
+                if not image_url:
+                    image_url = await extract_og_image(link)
 
-async def translate_with_openrouter_v2(title, text):
-    """Enhanced translation with more retries and logging"""
-    client = AsyncOpenAI(
-        api_key=os.environ.get('OPENROUTER_API_KEY'),
-        base_url="https://openrouter.ai/api/v1",
-    )
-    
-    prompt = f"""عنوان خبر: {title}
-متن: {text}
+                try:
+                    if image_url:
+                        await bot.send_photo(
+                            chat_id=TELEGRAM_CHANNEL_ID,
+                            photo=image_url,
+                            caption=final_text,
+                            parse_mode='HTML',
+                            disable_notification=True
+                        )
+                    else:
+                        await bot.send_message(
+                            chat_id=TELEGRAM_CHANNEL_ID,
+                            text=final_text,
+                            parse_mode='HTML',
+                            disable_notification=True
+                        )
 
-به عنوان سردبیر مجله مد ایرانی، این را به فارسی شیک و جذاب ترجمه کن. 
-نکات استایل ایرانی (مانتو، شال، اکسسوری) اضافه کن. ایموجی بگذار. 
-فقط فارسی نهایی."""
+                    posted_count += 1
+                    print(f"[SUCCESS] پست شد: {title[:60]}")
 
-    models = [
-        "qwen/qwen3-next-80b-a3b-instruct:free",
-        "meta-llama/llama-3.3-70b-instruct:free",
-        "stepfun/step-3.5-flash:free",
-        "z-ai/glm-4.5-air:free"
-    ]
-    
-    for i, model in enumerate(models):
-        try:
-            response = await client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.7,
-                max_tokens=850
-            )
-            content = response.choices[0].message.content.strip()
-            if content and len(content) > 60 and len(content) < 1200:  # Quality check
-                print(f"✓ Translation OK with {model}")
-                return content
-        except Exception as e:
-            print(f"✗ Model {model} (attempt {i+1}) failed: {str(e)[:100]}")
-            if i < len(models) - 1:
-                await asyncio.sleep(SLEEP_BETWEEN_MODELS)
-    
-    print("All models failed - skipping")
-    return None
+                    try:
+                        databases.create_document(
+                            database_id=APPWRITE_DATABASE_ID,
+                            collection_id=COLLECTION_ID,
+                            document_id='unique()',
+                            data={
+                                'link': link,
+                                'title': title[:250],
+                                'published_at': now.isoformat(),
+                                'feed_url': feed_url
+                            }
+                        )
+                    except Exception as save_err:
+                        print(f"[DB SAVE WARN] {save_err}")
 
-def get_image(entry):
-    """Improved image extraction"""
-    if 'media_thumbnail' in entry and entry.media_thumbnail:
-        return entry.media_thumbnail[0].get('url')
-    if 'media_content' in entry and entry.media_content:
-        return entry.media_content[0].get('url') or entry.media_content[0].get('href')
-    if 'enclosure' in entry:
-        return entry.enclosure.get('href')
-    if entry.get('description'):
-        soup = BeautifulSoup(entry.description, 'html.parser')
-        img = soup.find('img', src=True)
-        if img:
-            return img['src']
-    return None
+                except Exception as send_err:
+                    print(f"[SEND ERROR] {send_err}")
+
+        except Exception as feed_err:
+            print(f"[FEED ERROR] {feed_url}: {feed_err}")
+
+    print(f"[INFO] پایان اجرا - پست شده: {posted_count}")
+    return {"status": "ok", "posted": posted_count}
+
 
 if __name__ == "__main__":
     asyncio.run(main())
