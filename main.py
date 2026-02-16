@@ -37,15 +37,13 @@ async def main(event=None, context=None):
         base_url="https://openrouter.ai/api/v1"
     )
 
-    # لیست ۱۰ فید فعال (۵ فارسی + ۵ خارجی) برای جلوگیری از timeout
+    # لیست فیدها (فارسی + خارجی قوی)
     rss_feeds = [
-        # فارسی فعال
         "https://medopia.ir/feed/",
         "https://www.khabaronline.ir/rss/category/مد-زیبایی",
         "https://fararu.com/rss/category/مد-زیبایی",
         "https://www.beytoote.com/rss/fashion",
         "https://www.zoomit.ir/feed/category/fashion-beauty/",
-        # خارجی قوی
         "https://www.vogue.com/feed/rss",
         "https://wwd.com/feed/",
         "https://fashionista.com/feed",
@@ -54,10 +52,10 @@ async def main(event=None, context=None):
     ]
 
     now = datetime.now(timezone.utc)
-    time_threshold = now - timedelta(hours=24)
+    time_threshold = now - timedelta(hours=72)  # برای تست ۷۲ ساعت (بعد به ۲۴ برگردون)
 
     posted_count = 0
-    max_posts_per_run = 3  # حداکثر ۳ پست برای جلوگیری از timeout
+    max_posts_per_run = 5  # برای تست بیشتر
 
     for feed_url in rss_feeds:
         if posted_count >= max_posts_per_run:
@@ -87,9 +85,9 @@ async def main(event=None, context=None):
                 description = (entry.get('summary') or entry.get('description') or '').strip()
                 content_raw = description[:800]
 
-                # چک تکراری
+                # چک تکراری با API جدید (جایگزین list_documents)
                 try:
-                    existing = databases.list_documents(
+                    existing = databases.list_rows(
                         database_id=database_id,
                         collection_id=collection_id,
                         queries=[Query.equal("link", link)]
@@ -135,7 +133,7 @@ Output:
 منبع: {feed_url}
 """
 
-                content = await translate_with_openrouter(openrouter_client, prompt, title, description)
+                content = await translate_with_openrouter(openrouter_client, prompt, feed_url)
 
                 final_text = f"{content}\n\n🔗 {link}"
 
@@ -187,10 +185,10 @@ Output:
     return {"status": "success", "posted": posted_count}
 
 
-async def translate_with_openrouter(client, prompt, title, description):
+async def translate_with_openrouter(client, prompt, feed_url):
     try:
         response = await client.chat.completions.create(
-            model="meta-llama/llama-3.2-3b-instruct:free",  # سریع، فارسی خوب، بدون rate limit شناخته‌شده
+            model="nousresearch/hermes-3-llama-3.1-405b:free",  # مدل قوی‌تر و بدون محدودیت شدید
             messages=[{"role": "user", "content": prompt}],
             temperature=0.6,
             max_tokens=700
