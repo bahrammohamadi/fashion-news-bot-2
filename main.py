@@ -1,4 +1,4 @@
-# main_fashion_gapgpt_v10.py - فقط استنباط + نکته استایل + چند عکس + بدون ترجمه مستقیم
+# main_fashion_gapgpt_v11.py - فیکس کامل rate limit + NameError + فقط خارجی + ۱ پست + با عکس
 
 import os
 import asyncio
@@ -23,31 +23,26 @@ APPWRITE_API_KEY = os.environ.get('APPWRITE_API_KEY')
 APPWRITE_DATABASE_ID = os.environ.get('APPWRITE_DATABASE_ID')
 COLLECTION_ID = 'history'
 
-MAX_POSTS_PER_RUN = 2
+MAX_POSTS_PER_RUN = 1
 CHECK_DAYS = 4
 MAX_RAW_TEXT_LENGTH = 1200
+MAX_FINAL_TEXT_LENGTH = 420
 
-# ====================== فیدهای خارجی مد و فشن ======================
+# ====================== فیدهای خارجی فعال مد و فشن ======================
 RSS_FEEDS = [
     "https://www.vogue.com/feed/rss",
     "https://wwd.com/feed/",
-    "https://www.harpersbazaar.com/rss/fashion.xml",
-    "https://fashionista.com/feed",
     "https://www.businessoffashion.com/feed/",
-    "https://www.elle.com/rss/fashion.xml",
-    "https://www.refinery29.com/rss.xml",
+    "https://fashionista.com/feed",
     "https://www.thecut.com/feed",
     "https://www.whowhatwear.com/rss",
-    "https://www.instyle.com/rss",
-    "https://www.marieclaire.com/rss/fashion/",
-    "https://www.glamour.com/rss/fashion",
-    "https://www.allure.com/rss",
-    "https://nylon.com/feed",
+    "https://www.refinery29.com/rss.xml",
     "https://www.highsnobiety.com/feed/",
     "https://hypebeast.com/feed",
     "https://www.ssense.com/en-us/editorial/rss",
     "https://www.dazeddigital.com/rss",
     "https://i-d.vice.com/en/rss",
+    "https://nylon.com/feed",
     "https://www.papermag.com/rss",
 ]
 
@@ -58,10 +53,9 @@ async def extract_insight_and_style(client, title, raw_text):
 خلاصه خبر: {raw_text[:1000]}
 
 به عنوان سردبیر مجله مد ایرانی، از این خبر فقط برآیند و استنباط اصلی رو استخراج کن:
-- یک تیتر کوتاه و جذاب فارسی بنویس (۸–۱۲ کلمه)
-- ۳ تا ۶ خط توضیح فارسی حرفه‌ای و خلاصه بنویس (فقط جوهره خبر، بدون تبلیغ)
-- یک نکته استایل کاربردی و ایرانی بنویس (۱–۲ جمله، مرتبط با خبر، مناسب مانتو/شال/حجاب/آب‌وهوا)
-- بدون هیچ تبلیغ، لینک، ایموجی یا متن اضافه
+- تیتر کوتاه و جذاب فارسی (۸–۱۲ کلمه)
+- توضیح کوتاه و حرفه‌ای (۳ تا ۶ خط) - فقط جوهره خبر، بدون تبلیغ
+- یک نکته استایل کاربردی ایرانی (۱–۲ جمله) - مرتبط با خبر، با نگاه به مانتو/شال/حجاب/فرهنگ/آب‌وهوا
 
 خروجی دقیقاً این فرمت باشه:
 
@@ -69,26 +63,28 @@ async def extract_insight_and_style(client, title, raw_text):
 
 متن توضیح (۳–۶ خط)
 
-💡 نکته استایل: [نکته ۱–۲ جمله‌ای]
+💡 نکته استایل ایرانی: [نکته ۱–۲ جمله‌ای]
+
+بدون هیچ متن اضافه، تبلیغ یا لینک.
 """
 
     try:
         resp = await client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.7,
-            max_tokens=600
+            temperature=0.75,
+            max_tokens=500
         )
-        final_text = resp.choices[0].message.content.strip()
-        if not final_text or len(final_text) < 80:
+        content = resp.choices[0].message.content.strip()
+        if not content or len(content) < 80:
             raise Exception("پاسخ نامعتبر")
-        return final_text
+        return content
     except Exception as e:
         print(f"[GAPGPT ERROR] {str(e)[:100]} - fallback")
         clean_fallback = clean_html(raw_text)
         if len(clean_fallback) > MAX_FINAL_TEXT_LENGTH:
             clean_fallback = clean_fallback[:MAX_FINAL_TEXT_LENGTH] + "..."
-        return f"**{title}**\n\n{clean_fallback}\n\n💡 نکته استایل: این خبر می‌تونه ایده‌های خوبی برای ترکیب با استایل ایرانی بده."
+        return f"**{title}**\n\n{clean_fallback}\n\n💡 نکته استایل ایرانی: این خبر می‌تونه ایده‌های خوبی برای ترکیب با استایل ایرانی بده."
 
 # ====================== توابع کمکی ======================
 def clean_html(html):
@@ -204,7 +200,7 @@ async def main(event=None, context=None):
                             parse_mode='HTML',
                             disable_notification=True
                         )
-                        # ارسال عکس‌های بعدی (اگر بیشتر از یکی باشه) بدون کپشن
+                        # ارسال عکس‌های بعدی بدون کپشن
                         for extra_img in image_urls[1:]:
                             await bot.send_photo(
                                 chat_id=TELEGRAM_CHANNEL_ID,
@@ -261,9 +257,9 @@ async def extract_insight_and_style(client, title, raw_text):
 
 متن توضیح کوتاه و حرفه‌ای (۳ تا ۶ خط) - فقط جوهره خبر، بدون تبلیغ
 
-💡 نکته استایل ایرانی: [یک نکته کاربردی و مرتبط ۱–۲ جمله‌ای - با نگاه به مانتو، شال، حجاب، فرهنگ و آب‌وهوای ایران]
+💡 نکته استایل ایرانی: [نکته ۱–۲ جمله‌ای مرتبط - با نگاه به مانتو، شال، حجاب، فرهنگ و آب‌وهوای ایران]
 
-بدون هیچ متن اضافه، ایموجی یا لینک.
+بدون هیچ متن اضافه، تبلیغ یا لینک.
 """
 
     try:
@@ -273,10 +269,10 @@ async def extract_insight_and_style(client, title, raw_text):
             temperature=0.75,
             max_tokens=500
         )
-        final_text = resp.choices[0].message.content.strip()
-        if not final_text or len(final_text) < 80:
+        content = resp.choices[0].message.content.strip()
+        if not content or len(content) < 80:
             raise Exception("پاسخ نامعتبر")
-        return final_text
+        return content
     except Exception as e:
         print(f"[GAPGPT ERROR] {str(e)[:100]} - fallback")
         clean_fallback = clean_html(raw_text)
