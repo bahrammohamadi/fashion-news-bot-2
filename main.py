@@ -12,7 +12,6 @@ from openai import AsyncOpenAI
 async def main(event=None, context=None):
     print("[INFO] اجرای تابع main شروع شد")
 
-    # خواندن متغیرهای محیطی
     token = os.environ.get('TELEGRAM_BOT_TOKEN')
     chat_id = os.environ.get('TELEGRAM_CHANNEL_ID')
     appwrite_endpoint = os.environ.get('APPWRITE_ENDPOINT', 'https://cloud.appwrite.io/v1')
@@ -21,42 +20,62 @@ async def main(event=None, context=None):
     database_id = os.environ.get('APPWRITE_DATABASE_ID')
     collection_id = 'history'
 
-    # اعتبارسنجی اولیه
     if not all([token, chat_id, appwrite_project, appwrite_key, database_id]):
-        print("[ERROR] متغیرهای محیطی ناقص! APPWRITE_PROJECT_ID را چک کنید.")
-        return {"status": "error", "message": "Missing environment variables"}
+        print("[ERROR] متغیرهای محیطی ناقص!")
+        return {"status": "error"}
 
     bot = Bot(token=token)
 
-    # اتصال به Appwrite
     aw_client = Client()
     aw_client.set_endpoint(appwrite_endpoint)
     aw_client.set_project(appwrite_project)
     aw_client.set_key(appwrite_key)
     databases = Databases(aw_client)
 
-    # اتصال به OpenRouter
     openrouter_client = AsyncOpenAI(
         api_key=os.environ.get('OPENROUTER_API_KEY'),
         base_url="https://openrouter.ai/api/v1"
     )
 
-    # لیست فیدها (۵ تا برای سرعت و پایداری)
+    # لیست کامل ۲۵ فید (۱۵ فارسی + ۱۰ خارجی)
     rss_feeds = [
-        "https://medopia.ir/feed/",                     # فارسی سریع و مرتبط
-        "https://www.vogue.com/feed/rss",               # منبع اصلی جهانی
-        "https://wwd.com/feed/",                        # صنعت مد حرفه‌ای
-        "https://fashionista.com/feed",                 # اخبار مستقل
+        # فارسی (اول برای اولویت)
+        "https://medopia.ir/feed/",
         "https://www.khabaronline.ir/rss/category/مد-زیبایی",
+        "https://fararu.com/rss/category/مد-زیبایی",
+        "https://www.beytoote.com/rss/fashion",
+        "https://www.zoomit.ir/feed/category/fashion-beauty/",
+        "https://www.digikala.com/mag/feed/?category=مد",
+        "https://www.hamshahrionline.ir/rss/category/مد",
+        "https://www.isna.ir/rss/category/فرهنگ-هنر",
+        "https://www.tasnimnews.com/fa/rss/feed/0/0/0/سبک-زندگی",
+        "https://www.yjc.ir/fa/rss/5/مد-زیبایی",
+        "https://www.tabnak.ir/rss/category/مد-زیبایی",
+        "https://www.mehrnews.com/rss/category/مد-زیبایی",
+        "https://www.irna.ir/rss/category/مد-زیبایی",
+        "https://www.fardanews.com/rss/category/مد-زیبایی",
+        "https://www.ettelaat.com/rss/category/مد-زیبایی",
+        # خارجی
+        "https://www.vogue.com/feed/rss",
+        "https://wwd.com/feed/",
+        "https://fashionista.com/feed",
+        "https://www.harpersbazaar.com/rss/fashion.xml",
+        "https://www.elle.com/rss/all.xml",
+        "https://www.businessoffashion.com/feed/",
+        "https://www.thecut.com/feed",
+        "https://www.refinery29.com/rss.xml",
+        "https://www.whowhatwear.com/rss",
+        "https://feeds.feedburner.com/fibre2fashion/fashion-news",
     ]
 
     now = datetime.now(timezone.utc)
     time_threshold = now - timedelta(hours=24)
 
-    posted = False  # فقط یک پست در هر اجرا
+    posted_count = 0
+    max_posts_per_run = 3  # حداکثر ۳ پست در هر اجرا (برای جلوگیری از timeout)
 
     for feed_url in rss_feeds:
-        if posted:
+        if posted_count >= max_posts_per_run:
             break
 
         try:
@@ -65,10 +84,10 @@ async def main(event=None, context=None):
                 print(f"[INFO] فید خالی: {feed_url}")
                 continue
 
-            is_persian = any(x in feed_url.lower() for x in ['.ir', 'khabaronline', 'medopia'])
+            is_persian = any(x in feed_url.lower() for x in ['.ir', 'khabaronline', 'fararu', 'beytoote', 'zoomit', 'digikala', 'hamshahrionline', 'isna', 'tasnim', 'yjc', 'tabnak', 'mehrnews', 'irna', 'fardanews', 'ettelaat', 'medopia'])
 
             for entry in feed.entries:
-                if posted:
+                if posted_count >= max_posts_per_run:
                     break
 
                 published = entry.get('published_parsed') or entry.get('updated_parsed')
@@ -83,7 +102,7 @@ async def main(event=None, context=None):
                 description = (entry.get('summary') or entry.get('description') or '').strip()
                 content_raw = description[:800]
 
-                # چک تکراری (اگر DB مشکل داشت، ادامه می‌ده)
+                # چک تکراری
                 try:
                     existing = databases.list_documents(
                         database_id=database_id,
@@ -94,10 +113,10 @@ async def main(event=None, context=None):
                         print(f"[INFO] تکراری رد شد: {title[:60]}")
                         continue
                 except Exception as db_err:
-                    print(f"[WARN] خطا در چک دیتابیس (ادامه بدون چک تکراری): {str(db_err)}")
+                    print(f"[WARN] خطا DB: {str(db_err)} - ادامه بدون چک")
 
-                # پرامپت حرفه‌ای و بهینه‌شده
-                prompt = f"""You are a senior Persian fashion editor writing for a professional fashion publication.
+                # پرامپت حرفه‌ای
+                prompt = f"""You are a senior Persian fashion editor.
 
 Write a magazine-quality Persian fashion news article.
 
@@ -110,24 +129,24 @@ Publish Date: {pub_date.strftime('%Y-%m-%d')}
 
 Instructions:
 1. Detect language: Translate English to fluent Persian. Keep Persian as is.
-2. Do NOT translate proper nouns (brands, designers, locations, events).
-3. Structure naturally (no labels like Headline, Lead, etc.).
-4. Start with a strong headline (8–14 words).
-5. Follow with lead paragraph (1–2 sentences).
-6. Write 2–4 body paragraphs with logical flow.
-7. End with 2–3 sentences industry analysis (neutral, objective).
-8. Tone: formal, engaging, journalistic.
+2. Do NOT translate proper nouns.
+3. Structure naturally (no labels).
+4. Headline: 8–14 words.
+5. Lead: 1–2 sentences.
+6. Body: 2–4 paragraphs.
+7. End with 2–3 sentences analysis.
+8. Tone: formal, journalistic.
 9. Length: 220–350 words.
 10. Use only input information.
 
-Output ONLY the article:
-[تیتر جذاب به فارسی]
+Output:
+[تیتر فارسی]
 
-[پاراگراف لید]
+[لید]
 
-[بدنه خبر]
+[بدنه]
 
-[تحلیل کوتاه]
+[تحلیل]
 
 منبع: {feed_url}
 """
@@ -154,8 +173,8 @@ Output ONLY the article:
                             disable_notification=True
                         )
 
-                    posted = True
-                    print(f"[SUCCESS] پست موفق ارسال شد: {title[:60]}")
+                    posted_count += 1
+                    print(f"[SUCCESS] پست موفق ارسال شد ({posted_count}/{max_posts_per_run}): {title[:60]}")
 
                     try:
                         databases.create_document(
@@ -180,24 +199,24 @@ Output ONLY the article:
         except Exception as feed_err:
             print(f"[ERROR] خطا در پردازش فید {feed_url}: {str(feed_err)}")
 
-    print(f"[INFO] پایان اجرا - پست ارسال شد: {posted}")
-    return {"status": "success", "posted": posted}
+    print(f"[INFO] پایان اجرا - تعداد پست ارسال‌شده: {posted_count}")
+    return {"status": "success", "posted": posted_count}
 
 
 async def translate_with_openrouter(client, prompt):
     try:
         response = await client.chat.completions.create(
-            model="deepseek/deepseek-r1-0528:free",
+            model="google/gemma-3n-4b:free",  # سریع و بدون rate limit شناخته‌شده
             messages=[{"role": "user", "content": prompt}],
             temperature=0.6,
-            max_tokens=900
+            max_tokens=700  # کوتاه‌تر برای سرعت
         )
 
         return response.choices[0].message.content.strip()
 
     except Exception as e:
-        print(f"[ERROR] خطا در ترجمه با DeepSeek R1: {str(e)}")
-        return f"خبر: {title}\n\n{description[:400]}...\n(ترجمه موقت - خطا رخ داد)\nمنبع: {feed_url}"
+        print(f"[ERROR] خطا در ترجمه: {str(e)}")
+        return f"خبر جدید مد\n\n{description[:400]}...\n(ترجمه موقت - خطا رخ داد)\nمنبع: {feed_url}"
 
 
 def get_image_from_rss(entry):
