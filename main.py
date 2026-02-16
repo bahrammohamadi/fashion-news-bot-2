@@ -19,7 +19,7 @@ async def main(event=None, context=None):
     collection_id = 'history'
 
     if not all([token, chat_id, appwrite_project, appwrite_key, database_id]):
-        print("متغیرهای محیطی ناقص!")
+        print("خطا: متغیرهای محیطی ناقص! APPWRITE_PROJECT_ID را چک کنید.")
         return {"status": "error"}
 
     bot = Bot(token=token)
@@ -73,9 +73,9 @@ async def main(event=None, context=None):
                 title = entry.title.strip()
                 link = entry.link.strip()
                 description = (entry.get('summary') or entry.get('description') or '').strip()
-                content = description[:800]  # برای جلوگیری از ورودی خیلی طولانی
+                content_raw = description[:1000]
 
-                # چک تکراری
+                # چک تکراری (اگر DB مشکل داشت، رد نمی‌شه)
                 try:
                     existing = databases.list_documents(
                         database_id=database_id,
@@ -87,12 +87,12 @@ async def main(event=None, context=None):
                 except Exception as db_err:
                     print(f"خطا DB: {str(db_err)} - ادامه بدون چک تکراری")
 
-                # آماده‌سازی پرامپت جدید
+                # پرامپت حرفه‌ای جدید
                 prompt = f"""You are a professional fashion news editor.
 Input:
 - Title: {title}
 - Description: {description}
-- Full Content: {content}
+- Full Content: {content_raw}
 - Source: {feed_url}
 - Publish Date: {pub_date.strftime('%Y-%m-%d')}
 
@@ -127,12 +127,9 @@ Additionally:
 - Write in a tone suitable for a professional fashion news website.
 If information is missing, do not fill gaps with assumptions."""
 
-                if is_persian:
-                    final_content = f"{title}\n\n{description}"
-                else:
-                    final_content = await translate_with_openrouter(openrouter_client, prompt)
+                content = await translate_with_openrouter(openrouter_client, prompt)
 
-                final_text = f"{final_content}\n\n🔗 {link}"
+                final_text = f"{content}\n\n🔗 {link}"
 
                 try:
                     image_url = get_image_from_rss(entry)
@@ -184,10 +181,10 @@ If information is missing, do not fill gaps with assumptions."""
 async def translate_with_openrouter(client, prompt):
     try:
         response = await client.chat.completions.create(
-            model="meta-llama/llama-3.1-8b-instruct:free",
+            model="meta-llama/llama-3.3-70b-instruct:free",  # مدل سریع و فعال
             messages=[{"role": "user", "content": prompt}],
             temperature=0.7,
-            max_tokens=700
+            max_tokens=800
         )
 
         return response.choices[0].message.content.strip()
