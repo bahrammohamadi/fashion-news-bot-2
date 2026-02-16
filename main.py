@@ -10,6 +10,7 @@ from appwrite.query import Query
 from openai import AsyncOpenAI
 
 async def main(event=None, context=None):
+    # متغیرهای محیطی
     token = os.environ.get('TELEGRAM_BOT_TOKEN')
     chat_id = os.environ.get('TELEGRAM_CHANNEL_ID')
     appwrite_endpoint = os.environ.get('APPWRITE_ENDPOINT', 'https://cloud.appwrite.io/v1')
@@ -19,22 +20,25 @@ async def main(event=None, context=None):
     collection_id = 'history'
 
     if not all([token, chat_id, appwrite_project, appwrite_key, database_id]):
-        print("متغیرهای محیطی ناقص! چک کن APPWRITE_PROJECT_ID درست باشه.")
-        return {"status": "error"}
+        print("متغیرهای محیطی ناقص! لطفاً APPWRITE_PROJECT_ID، DATABASE_ID و بقیه را چک کنید.")
+        return {"status": "error", "message": "متغیرهای محیطی ناقص"}
 
     bot = Bot(token=token)
 
+    # اتصال به Appwrite
     aw_client = Client()
     aw_client.set_endpoint(appwrite_endpoint)
     aw_client.set_project(appwrite_project)
     aw_client.set_key(appwrite_key)
     databases = Databases(aw_client)
 
+    # کلاینت OpenRouter
     openrouter_client = AsyncOpenAI(
         api_key=os.environ.get('OPENROUTER_API_KEY'),
         base_url="https://openrouter.ai/api/v1"
     )
 
+    # لیست فیدهای RSS (می‌توانید تغییر دهید)
     rss_feeds = [
         "https://www.vogue.com/feed/rss",
         "https://wwd.com/feed/",
@@ -59,12 +63,13 @@ async def main(event=None, context=None):
 
     posted_count = 0
     now = datetime.now(timezone.utc)
-    time_threshold = now - timedelta(hours=24)
+    time_threshold = now - timedelta(hours=24)  # فقط اخبار ۲۴ ساعت اخیر
 
     for feed_url in rss_feeds:
         try:
             feed = feedparser.parse(feed_url)
             if not feed.entries:
+                print(f"فید خالی: {feed_url}")
                 continue
 
             is_persian = any(x in feed_url.lower() for x in ['.ir', 'khabaronline', 'isna', 'tasnim', 'hamshahrionline', 'fararu', 'beytoote', 'digikala', 'zoomit', 'medopia'])
@@ -80,7 +85,7 @@ async def main(event=None, context=None):
                 title = entry.title.strip()
                 link = entry.link.strip()
 
-                # چک تکراری (اگر DB مشکل داشت، این بخش رد می‌شه)
+                # چک تکراری بودن (اگر DB مشکل داشت، رد نمی‌شه)
                 try:
                     existing = databases.list_documents(
                         database_id=database_id,
@@ -88,15 +93,17 @@ async def main(event=None, context=None):
                         queries=[Query.equal("link", link)]
                     )
                     if existing['total'] > 0:
-                        print(f"تکراری رد شد: {title[:60]}")
+                        print(f"پست تکراری رد شد: {title[:60]}...")
                         continue
                 except Exception as db_err:
-                    print(f"خطا چک DB: {str(db_err)} - ادامه می‌دیم بدون چک تکراری")
+                    print(f"خطا در چک دیتابیس (ادامه بدون چک تکراری): {str(db_err)}")
 
                 summary = (entry.get('summary') or entry.get('description') or '').strip()[:500]
 
+                # گرفتن عکس از RSS
                 image_url = get_image_from_rss(entry)
 
+                # ترجمه یا بازنویسی
                 if is_persian:
                     content = f"{title}\n\n{summary}"
                 else:
@@ -106,14 +113,25 @@ async def main(event=None, context=None):
 
                 try:
                     if image_url:
-                        await bot.send_photo(chat_id=chat_id, photo=image_url, caption=final_text, parse_mode='HTML', disable_notification=True)
+                        await bot.send_photo(
+                            chat_id=chat_id,
+                            photo=image_url,
+                            caption=final_text,
+                            parse_mode='HTML',
+                            disable_notification=True
+                        )
                     else:
-                        await bot.send_message(chat_id=chat_id, text=final_text, disable_web_page_preview=True, disable_notification=True)
+                        await bot.send_message(
+                            chat_id=chat_id,
+                            text=final_text,
+                            disable_web_page_preview=True,
+                            disable_notification=True
+                        )
 
                     posted_count += 1
-                    print(f"پست موفق: {title[:60]}")
+                    print(f"پست موفق ارسال شد: {title[:60]}...")
 
-                    # ذخیره در DB (اگر خطا داد، رد می‌شه)
+                    # ذخیره در دیتابیس (اگر خطا داد، رد می‌شه)
                     try:
                         databases.create_document(
                             database_id=database_id,
@@ -123,18 +141,21 @@ async def main(event=None, context=None):
                                 'link': link,
                                 'title': title,
                                 'published_at': now.isoformat(),
-                                'feed_url': feed_url
+                                'feed_url': feed_url,
+                                'created_at': now.isoformat()
                             }
                         )
+                        print("ذخیره در دیتابیس موفق")
                     except Exception as save_err:
-                        print(f"خطا ذخیره DB: {str(save_err)} - پست ارسال شد اما ذخیره نشد")
+                        print(f"خطا در ذخیره دیتابیس: {str(save_err)}")
+
                 except Exception as send_err:
-                    print(f"خطا ارسال: {str(send_err)}")
+                    print(f"خطا در ارسال پست: {str(send_err)}")
 
         except Exception as feed_err:
-            print(f"خطا فید {feed_url}: {str(feed_err)}")
+            print(f"خطا در پردازش فید {feed_url}: {str(feed_err)}")
 
-    print(f"اجرای این دور: {posted_count} پست")
+    print(f"اجرای این دور تمام شد. تعداد پست‌های ارسال‌شده: {posted_count}")
     return {"status": "success", "posted": posted_count}
 
 
@@ -155,26 +176,34 @@ async def translate_with_openrouter(client, title_en, summary_en):
 خلاصه انگلیسی: {summary_en}"""
 
         response = await client.chat.completions.create(
-            model="meta-llama/llama-3.1-70b-instruct:free",  # مدل رایگان قوی برای فارسی
+            model="deepseek/deepseek-r1-0528:free",  # قوی‌ترین مدل رایگان فعلی
             messages=[{"role": "user", "content": prompt}],
             temperature=0.7,
-            max_tokens=500
+            max_tokens=600,
+            top_p=0.9
         )
 
         full_text = response.choices[0].message.content.strip()
 
-        lines = full_text.split('\n', 1)
-        title_fa = lines[0].strip() if lines else title_en
-        content_fa = lines[1].strip() if len(lines) > 1 else full_text
+        # جدا کردن تیتر و متن
+        if '\n' in full_text:
+            title_fa, content_fa = full_text.split('\n', 1)
+            title_fa = title_fa.strip()
+            content_fa = content_fa.strip()
+        else:
+            title_fa = title_en
+            content_fa = full_text
 
         return f"{title_fa}\n\n{content_fa}"
 
     except Exception as e:
-        print(f"خطا در OpenRouter: {str(e)}")
-        return f"📰 {title_en}\n\n{summary_en[:400]}... (ترجمه موقت - خطا رخ داد)"
+        print(f"خطا در ترجمه با DeepSeek R1: {str(e)}")
+        # fallback به متن انگلیسی خام
+        return f"📰 {title_en}\n\n{summary_en[:400]}...\n(ترجمه موقت - خطا رخ داد)"
 
 
 def get_image_from_rss(entry):
+    """گرفتن URL عکس از RSS اگر وجود داشته باشد"""
     if 'enclosure' in entry and entry.enclosure.get('type', '').startswith('image/'):
         return entry.enclosure.href
     if 'media_content' in entry:
