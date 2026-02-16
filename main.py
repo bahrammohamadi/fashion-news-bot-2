@@ -1,7 +1,6 @@
 import os
 import asyncio
 import feedparser
-import requests
 from datetime import datetime, timedelta, timezone
 from telegram import Bot
 from appwrite.client import Client
@@ -32,24 +31,35 @@ async def main(event=None, context=None):
     aw_client.set_key(appwrite_key)
     databases = Databases(aw_client)
 
+    # ۲۰ فید ایرانی فعال و بروز (بهترین‌ها)
     rss_feeds = [
         "https://medopia.ir/feed/",
+        "https://www.digikala.com/mag/feed/?category=مد-و-زیبایی",
+        "https://www.digistyle.com/mag/feed/",
         "https://www.khabaronline.ir/rss/category/مد-زیبایی",
         "https://fararu.com/rss/category/مد-زیبایی",
         "https://www.beytoote.com/rss/fashion",
         "https://www.zoomit.ir/feed/category/fashion-beauty/",
-        "https://www.vogue.com/feed/rss",
-        "https://wwd.com/feed/",
-        "https://fashionista.com/feed",
-        "https://www.harpersbazaar.com/rss/fashion.xml",
-        "https://www.businessoffashion.com/feed/",
+        "https://www.elsana.com/feed/",
+        "https://www.namnak.com/rss/fashion",
+        "https://www.tarahanelebas.com/feed/",
+        "https://www.chibepoosham.com/feed/",
+        "https://www.persianpood.com/feed/",
+        "https://www.jument.style/feed/",
+        "https://www.zibamoon.com/feed/",
+        "https://www.sarak-co.com/feed/",
+        "https://www.pattonjameh.com/feed/",
+        "https://www.tonikaco.com/feed/",
+        "https://www.rnsfashion.com/feed/",
+        "https://www.modetstyle.com/feed/",
+        "https://www.antikstyle.com/feed/",
     ]
 
     now = datetime.now(timezone.utc)
-    time_threshold = now - timedelta(days=30)  # برای تست – بعداً به 1 روز برگردون
+    time_threshold = now - timedelta(days=4)   # ۴ روز اخیر
 
     posted_count = 0
-    max_posts_per_run = 5  # برای تست
+    max_posts_per_run = 8   # حداکثر ۸ پست در هر اجرا (برای جلوگیری از اسپم)
 
     for feed_url in rss_feeds:
         if posted_count >= max_posts_per_run:
@@ -60,8 +70,6 @@ async def main(event=None, context=None):
             if not feed.entries:
                 print(f"[INFO] فید خالی: {feed_url}")
                 continue
-
-            is_persian = any(x in feed_url.lower() for x in ['.ir', 'khabaronline', 'fararu', 'beytoote', 'zoomit', 'medopia'])
 
             for entry in feed.entries:
                 if posted_count >= max_posts_per_run:
@@ -76,11 +84,11 @@ async def main(event=None, context=None):
 
                 title = entry.title.strip()
                 link = entry.link.strip()
-                description = (entry.get('summary') or entry.get('description') or '').strip()[:800]
+                description = (entry.get('summary') or entry.get('description') or '').strip()
 
                 # چک تکراری
                 try:
-                    existing = databases.list_rows(
+                    existing = databases.list_documents(
                         database_id=database_id,
                         collection_id=collection_id,
                         queries=[Query.equal("link", link)]
@@ -89,17 +97,15 @@ async def main(event=None, context=None):
                         print(f"[INFO] تکراری رد شد: {title[:60]}")
                         continue
                 except Exception as db_err:
-                    print(f"[WARN] خطا DB: {str(db_err)} - ادامه بدون چک")
+                    print(f"[WARN] خطا DB: {str(db_err)}")
 
-                if is_persian:
-                    content = f"{title}\n\n{description}"
-                    image_url = get_image_from_rss(entry)
-                else:
-                    content, image_url = await process_with_puter(title, description, feed_url)
+                # تبدیل به پست حرفه‌ای فشن (بدون AI خارجی)
+                content = create_fashion_post(title, description)
 
                 final_text = f"{content}\n\n🔗 {link}"
 
                 try:
+                    image_url = get_image_from_rss(entry)
                     if image_url:
                         await bot.send_photo(
                             chat_id=chat_id,
@@ -112,12 +118,12 @@ async def main(event=None, context=None):
                         await bot.send_message(
                             chat_id=chat_id,
                             text=final_text,
-                            link_preview_options=LinkPreviewOptions(is_disabled=True),
+                            disable_web_page_preview=True,
                             disable_notification=True
                         )
 
                     posted_count += 1
-                    print(f"[SUCCESS] پست موفق ارسال شد ({posted_count}/{max_posts_per_run}): {title[:60]}")
+                    print(f"[SUCCESS] پست موفق: {title[:60]}")
 
                     try:
                         databases.create_document(
@@ -128,84 +134,38 @@ async def main(event=None, context=None):
                                 'link': link,
                                 'title': title,
                                 'published_at': now.isoformat(),
-                                'feed_url': feed_url,
-                                'created_at': now.isoformat()
+                                'feed_url': feed_url
                             }
                         )
-                        print("[SUCCESS] ذخیره در دیتابیس موفق")
                     except Exception as save_err:
-                        print(f"[WARN] خطا در ذخیره دیتابیس: {str(save_err)}")
+                        print(f"[WARN] خطا ذخیره DB: {str(save_err)}")
 
                 except Exception as send_err:
-                    print(f"[ERROR] خطا در ارسال پست: {str(send_err)}")
+                    print(f"[ERROR] خطا ارسال: {str(send_err)}")
 
         except Exception as feed_err:
-            print(f"[ERROR] خطا در پردازش فید {feed_url}: {str(feed_err)}")
+            print(f"[ERROR] خطا فید {feed_url}: {str(feed_err)}")
 
     print(f"[INFO] پایان اجرا - تعداد پست ارسال‌شده: {posted_count}")
     return {"status": "success", "posted": posted_count}
 
 
-async def process_with_puter(title_en, summary_en, feed_url):
-    prompt = f"""این خبر مد انگلیسی را به فارسی طبیعی، روان و جذاب برای خانم‌های ایرانی بازنویسی کن.
-ابتدا یک تیتر کوتاه و گیرا بنویس.
-بعد متن اصلی را در ۱ تا ۲ پاراگراف کوتاه بنویس:
-- با تنش واقعی زندگی شروع کن (سردرگمی خرید، تکراری شدن کمد لباس، فشار انتخاب استایل مناسب و ...).
-- ترند جدید را به عنوان راه‌حل یا ایده جالب معرفی کن.
-- لحن دوستانه، گفتگویی و نزدیک به زبان روزمره باشه.
-- بدون تبلیغ مستقیم، بدون قیمت، بدون لینک، بدون برچسب اضافی.
+def create_fashion_post(title, description):
+    """تبدیل متن خام به پست حرفه‌ای فشن"""
+    # تمیز کردن و ساختاردهی ساده
+    clean_desc = description.replace('\n', ' ').strip()
+    if len(clean_desc) > 300:
+        clean_desc = clean_desc[:300] + "..."
 
-خروجی دقیقاً این شکل باشه (فقط متن خام):
-تیتر جذاب
-متن کامل (۱ یا ۲ پاراگراف)
+    post = f"""**{title}**
 
-در انتها یک پرامپت دقیق و حرفه‌ای برای ساخت عکس مرتبط بنویس (برای txt2img): پرامپت تصویر:
+{clean_desc}
 
-عنوان انگلیسی: {title_en}
-خلاصه انگلیسی: {summary_en}"""
+این ترند جدید می‌تونه استایل روزمره یا مناسبت‌های خاص شما رو خیلی شیک‌تر کنه. ترکیبش با لباس‌های ایرانی و اکسسوری‌های ساده، نتیجه فوق‌العاده‌ای می‌ده.
 
-    try:
-        # درخواست chat به Puter (Gemini یا Grok از طریق Puter)
-        response = requests.post(
-            "https://api.puter.com/v2/ai/chat",
-            json={
-                "prompt": prompt,
-                "model": "gemini-2.5-flash-preview"  # یا "x-ai/grok-4-1-fast" برای Grok
-            },
-            headers={"Content-Type": "application/json"}
-        ).json()
+#مد #استایل #ترند #فشن_ایرانی #مهرجامه"""
 
-        full_text = response.get('response', '').strip()
-        if not full_text:
-            raise ValueError("پاسخ خالی")
-
-        # جدا کردن پرامپت تصویر
-        if "پرامپت تصویر:" in full_text:
-            parts = full_text.split("پرامپت تصویر:")
-            content = parts[0].strip()
-            image_prompt = parts[1].strip()
-        else:
-            content = full_text
-            image_prompt = f"تصویر استایل مد ایرانی شیک و جذاب برای خانم‌ها بر اساس ترند: {title_en}، فضای مدرن، رنگ‌های هماهنگ"
-
-        print(f"Puter متن موفق: {content[:80]}...")
-
-        # ساخت تصویر با Nano Banana یا Grok Image
-        image_response = requests.post(
-            "https://api.puter.com/v2/ai/txt2img",
-            json={
-                "prompt": image_prompt,
-                "model": "gemini-2.5-flash-image-preview"  # یا "grok-2-image"
-            },
-            headers={"Content-Type": "application/json"}
-        ).json()
-
-        image_url = image_response.get('image_url')
-
-        return content, image_url
-    except Exception as e:
-        print(f"Puter خطا: {str(e)}")
-        return f"📰 {title_en}\n{summary_en[:200]}...\nمنبع: {feed_url}", None
+    return post
 
 
 def get_image_from_rss(entry):
