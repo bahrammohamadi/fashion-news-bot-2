@@ -76,9 +76,9 @@ async def main(event=None, context=None):
                 title = entry.title.strip()
                 link = entry.link.strip()
                 description = (entry.get('summary') or entry.get('description') or '').strip()
-                content_raw = description[:800]  # کوتاه‌تر برای سرعت
+                content_raw = description[:800]  # محدود برای سرعت
 
-                # چک تکراری (اگر DB مشکل داشت، رد نمی‌شه)
+                # چک تکراری
                 try:
                     existing = databases.list_documents(
                         database_id=database_id,
@@ -88,10 +88,10 @@ async def main(event=None, context=None):
                     if existing['total'] > 0:
                         print(f"[INFO] تکراری رد شد: {title[:60]}")
                         continue
-                except AppwriteException as db_err:
-                    print(f"[WARN] خطا در چک دیتابیس (ادامه بدون چک): {str(db_err)}")
+                except Exception as db_err:
+                    print(f"[WARN] خطا DB: {str(db_err)} - ادامه بدون چک")
 
-                # پرامپت حرفه‌ای جدید
+                # پرامپت حرفه‌ای (دقیقاً همون که گفتی)
                 prompt = f"""You are a professional fashion news editor.
 Input:
 - Title: {title}
@@ -186,16 +186,16 @@ If information is missing, do not fill gaps with assumptions."""
 async def translate_with_openrouter(client, prompt):
     try:
         response = await client.chat.completions.create(
-            model="google/gemma-3n-4b:free",  # سریع و فعال
+            model="deepseek/deepseek-r1-0528:free",  # بهترین مدل رایگان برای کار تو
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.7,
-            max_tokens=800
+            temperature=0.6,  # کمی پایین‌تر برای دقت بیشتر
+            max_tokens=900    # کافی برای تیتر + بدنه + تحلیل
         )
 
         return response.choices[0].message.content.strip()
 
     except Exception as e:
-        print(f"[ERROR] خطا در ترجمه: {str(e)}")
+        print(f"[ERROR] خطا در ترجمه با DeepSeek R1: {str(e)}")
         return "(ترجمه موقت - خطا رخ داد)\n\nلینک خبر اصلی را ببینید."
 
 
