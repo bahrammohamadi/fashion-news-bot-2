@@ -1,4 +1,4 @@
-# main_fashion_gapgpt_final.py - با GapGPT + کلید جدید + فقط خارجی + ۱-۲ پست + با عکس
+# main_fashion_gapgpt_v8.py - فیکس شده، بدون warning، fallback قوی، ۱-۲ پست، با عکس
 
 import os
 import asyncio
@@ -16,7 +16,7 @@ from appwrite.query import Query
 # ====================== تنظیمات ======================
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHANNEL_ID = os.environ.get('TELEGRAM_CHANNEL_ID')
-GAPGPT_API_KEY = os.environ.get('GAPGPT_API_KEY')  # کلید جدیدت اینجا
+GAPGPT_API_KEY = os.environ.get('GAPGPT_API_KEY')  # کلید جدیدت
 APPWRITE_ENDPOINT = os.environ.get('APPWRITE_ENDPOINT', 'https://cloud.appwrite.io/v1')
 APPWRITE_PROJECT_ID = os.environ.get('APPWRITE_PROJECT_ID')
 APPWRITE_API_KEY = os.environ.get('APPWRITE_API_KEY')
@@ -53,15 +53,14 @@ RSS_FEEDS = [
 
 # ====================== ترجمه و فرمت با GapGPT ======================
 async def translate_and_format(client, title, raw_text):
-    # پرامپت ترکیبی (ترجمه + بازنویسی فشن همزمان)
     prompt = f"""
 عنوان خبر: {title}
 متن انگلیسی: {raw_text[:1200]}
 
 به فارسی روان، حرفه‌ای و جذاب برای کانال مد ترجمه و بازنویسی کن.
-- تیتر را جذاب و کوتاه نگه دار
-- متن را ۳-۶ خطی، شیک و خلاصه بنویس
-- فقط محتوای اصلی خبر را نگه دار
+- تیتر جذاب و کوتاه
+- متن ۳-۶ خطی، شیک و خلاصه
+- فقط محتوای اصلی خبر
 - بدون جمله اضافه، تبلیغ، ایموجی یا لینک
 
 خروجی فقط متن پست نهایی باشه (تیتر + متن).
@@ -69,7 +68,7 @@ async def translate_and_format(client, title, raw_text):
 
     try:
         resp = await client.chat.completions.create(
-            model="gpt-4o-mini",  # مدل قوی و ارزان در GapGPT
+            model="gpt-4o-mini",  # مدل قوی، سریع و ارزان GapGPT
             messages=[{"role": "user", "content": prompt}],
             temperature=0.7,
             max_tokens=600
@@ -79,8 +78,11 @@ async def translate_and_format(client, title, raw_text):
             raise Exception("پاسخ نامعتبر")
         return final_text
     except Exception as e:
-        print(f"[GAPGPT ERROR] {str(e)[:100]} - fallback")
-        return f"**{title}**\n\n{clean_html(raw_text)[:380]}...\n(ترجمه موقت - خطا)"
+        print(f"[GAPGPT ERROR] {str(e)[:100]} - fallback به متن انگلیسی تمیز")
+        clean_fallback = clean_html(raw_text)
+        if len(clean_fallback) > MAX_TEXT_LENGTH:
+            clean_fallback = clean_fallback[:MAX_TEXT_LENGTH] + "..."
+        return f"**{title}**\n\n{clean_fallback}\n\n(ترجمه موقت - خطا در پردازش)"
 
 # ====================== توابع کمکی ======================
 def clean_html(html):
@@ -122,7 +124,7 @@ async def main(event=None, context=None):
 
     gapgpt_client = AsyncOpenAI(
         api_key=GAPGPT_API_KEY,
-        base_url="https://api.gapgpt.app/v1"  # endpoint اصلی GapGPT
+        base_url="https://api.gapgpt.app/v1"  # GapGPT endpoint
     )
 
     aw_client = Client()
@@ -163,7 +165,7 @@ async def main(event=None, context=None):
                 soup = BeautifulSoup(raw_content, 'html.parser')
                 clean_text = soup.get_text(separator=' ').strip()
 
-                # چک تکراری
+                # چک تکراری (با API قدیمی چون سرور تو هنوز آپدیت نشده)
                 try:
                     existing = databases.list_documents(
                         database_id=APPWRITE_DATABASE_ID,
