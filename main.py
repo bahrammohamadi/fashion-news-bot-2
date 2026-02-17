@@ -67,7 +67,7 @@ async def main(event=None, context=None):
     time_threshold = now - timedelta(days=4)
 
     posted_count = 0
-    max_posts_per_run = 1  # فقط ۱ پست در هر اجرا
+    max_posts_per_run = 1
 
     for feed_url in rss_feeds:
         if posted_count >= max_posts_per_run:
@@ -96,8 +96,8 @@ async def main(event=None, context=None):
                 soup = BeautifulSoup(raw_html, 'html.parser')
                 content_raw = soup.get_text(separator=' ').strip()
 
-                # درخواست واحد به GapGPT (فیلتر + ترجمه + مقاله فشن)
-                final_content = await process_full_fashion_post(client, title, content_raw, link, pub_date, feed_url)
+                # درخواست واحد (فیلتر + ترجمه + مقاله)
+                final_content = await process_full_fashion_post(client, title, content_raw, link, pub_date)
                 if not final_content:
                     print(f"[SKIP] پست رد شد: {title[:60]}")
                     continue
@@ -142,13 +142,13 @@ async def main(event=None, context=None):
     return {"status": "success", "posted": posted_count}
 
 
-async def process_full_fashion_post(client, title, content_raw, link, pub_date, feed_url):
+async def process_full_fashion_post(client, title, content_raw, link, pub_date):
     prompt = f"""
 ابتدا بررسی کن آیا این خبر در حوزه مد، فشن، استایل، زیبایی، لباس، ترند پوشاک، طراحی لباس یا استایل ایرانی است؟ اگر نه، فقط بنویس "غیرمرتبط".
 
 اگر بله، این کارها را انجام بده:
 
-۱. ترجمه دقیق و حرفه‌ای متن انگلیسی به فارسی روان و مناسب انتشار در کانال مد (حفظ لحن، ساختار و اصطلاحات تخصصی).
+۱. ترجمه دقیق و حرفه‌ای متن انگلیسی به فارسی روان و مناسب انتشار در کانال مد.
 
 ۲. تبدیل متن ترجمه‌شده به مقاله فشن کامل با ساختار زیر:
    - Headline: ۸–۱۴ کلمه جذاب
@@ -159,7 +159,7 @@ async def process_full_fashion_post(client, title, content_raw, link, pub_date, 
 
 ۳. طول کل: ۲۵۰–۴۵۰ کلمه
 ۴. لحن: حرفه‌ای، ژورنالیستی، خنثی، بدون تبلیغ
-۵. بدون ایموجی، بدون هشتگ در متن اصلی (هشتگ‌ها جداگانه اضافه می‌شوند)
+۵. بدون ایموجی، بدون هشتگ در متن اصلی
 
 عنوان: {title}
 متن خام: {content_raw[:1200]}
@@ -172,7 +172,7 @@ async def process_full_fashion_post(client, title, content_raw, link, pub_date, 
 
     try:
         response = await client.chat.completions.create(
-            model="gemini-2.5-flash",  # سریع‌تر، timeout کمتر
+            model="gemini-2.5-flash",  # سریع و ارزان، timeout کم
             messages=[{"role": "user", "content": prompt}],
             max_tokens=1800,
             temperature=0.4
