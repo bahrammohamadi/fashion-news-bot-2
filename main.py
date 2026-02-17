@@ -8,6 +8,7 @@ from appwrite.services.databases import Databases
 from appwrite.exception import AppwriteException
 from appwrite.query import Query
 from openai import AsyncOpenAI
+import random
 
 async def main(event=None, context=None):
     print("[INFO] اجرای تابع main شروع شد")
@@ -37,6 +38,7 @@ async def main(event=None, context=None):
         base_url="https://openrouter.ai/api/v1"
     )
 
+    # ۲۰ فید خبری خارجی مد و فشن
     rss_feeds = [
         "https://www.vogue.com/feed/rss",
         "https://wwd.com/feed/",
@@ -91,6 +93,7 @@ async def main(event=None, context=None):
                 description = (entry.get('summary') or entry.get('description') or '').strip()
                 content_raw = description[:800]
 
+                # چک تکراری
                 try:
                     existing = databases.list_documents(
                         database_id=database_id,
@@ -103,7 +106,8 @@ async def main(event=None, context=None):
                 except Exception as db_err:
                     print(f"[WARN] خطا در چک دیتابیس (ادامه بدون چک): {str(db_err)}")
 
-                prompt = f"""You are a senior Persian fashion editor writing for a professional fashion publication.
+                # پرامپت حرفه‌ای (بدون لیبل بخش‌ها)
+                prompt = f"""You are a senior Persian fashion editor.
 
 Write a magazine-quality Persian fashion news article.
 
@@ -138,7 +142,7 @@ Output ONLY the clean Persian article text (no extra labels or headers):
 
                 content = await translate_with_openrouter(openrouter_client, prompt)
 
-                # فرمت نهایی پست: تصویر + تیتر فارسی + متن خبر + انتها لینک کانال با موضوع
+                # فرمت نهایی پست: تصویر + تیتر فارسی + متن خبر + انتها لینک کانال با موضوع (بدون لینک خبر)
                 final_text = f"{content}\n\n@irfashionnews - مد و فشن ایرانی"
 
                 try:
@@ -162,6 +166,25 @@ Output ONLY the clean Persian article text (no extra labels or headers):
                     posted = True
                     print(f"[SUCCESS] پست موفق ارسال شد: {title[:60]}")
 
+                    # ارسال ۴ استیکر رندوم واکنش با emoji (عمومی تلگرام)
+                    reaction_emojis = [
+                        "👍", "🔥", "🌹", "❤️", "✨",
+                        "😍", "👏", "🌟", "💃", "👗",
+                        "👠", "👜", "🎀", "💅", "🥰"
+                    ]
+                    selected_emojis = random.sample(reaction_emojis, k=4)
+                    for emoji in selected_emojis:
+                        try:
+                            await bot.send_sticker(
+                                chat_id=chat_id,
+                                sticker=emoji,
+                                disable_notification=True
+                            )
+                        except Exception as sticker_err:
+                            print(f"[WARN] خطا در ارسال استیکر: {str(sticker_err)}")
+                    print("[INFO] ۴ استیکر واکنش عمومی ارسال شد")
+
+                    # ذخیره در دیتابیس
                     try:
                         databases.create_document(
                             database_id=database_id,
@@ -202,7 +225,7 @@ async def translate_with_openrouter(client, prompt):
 
     except Exception as e:
         print(f"[ERROR] خطا در ترجمه با DeepSeek R1: {str(e)}")
-        return "(ترجمه موقت - خطا رخ داد)\n\nلینک خبر اصلی را ببینید."
+        return "(ترجمه موقت - خطا رخ داد)"
 
 
 def get_image_from_rss(entry):
