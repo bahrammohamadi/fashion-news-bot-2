@@ -11,6 +11,7 @@ from openai import AsyncOpenAI
 
 async def main(event=None, context=None):
     print("[INFO] اجرای تابع main شروع شد")
+
     token = os.environ.get('TELEGRAM_BOT_TOKEN')
     chat_id = os.environ.get('TELEGRAM_CHANNEL_ID')
     appwrite_endpoint = os.environ.get('APPWRITE_ENDPOINT', 'https://fra.cloud.appwrite.io/v1')
@@ -24,6 +25,7 @@ async def main(event=None, context=None):
         return {"status": "error"}
 
     bot = Bot(token=token)
+
     aw_client = Client()
     aw_client.set_endpoint(appwrite_endpoint)
     aw_client.set_project(appwrite_project)
@@ -60,11 +62,13 @@ async def main(event=None, context=None):
 
     now = datetime.now(timezone.utc)
     time_threshold = now - timedelta(hours=24)
+
     posted = False
 
     for feed_url in rss_feeds:
         if posted:
             break
+
         try:
             feed = feedparser.parse(feed_url)
             if not feed.entries:
@@ -74,6 +78,7 @@ async def main(event=None, context=None):
             for entry in feed.entries:
                 if posted:
                     break
+
                 published = entry.get('published_parsed') or entry.get('updated_parsed')
                 if not published:
                     continue
@@ -99,13 +104,16 @@ async def main(event=None, context=None):
                     print(f"[WARN] خطا در چک دیتابیس (ادامه بدون چک): {str(db_err)}")
 
                 prompt = f"""You are a senior Persian fashion editor writing for a professional fashion publication.
+
 Write a magazine-quality Persian fashion news article.
+
 Input:
 Title: {title}
 Summary: {description}
 Content: {content_raw}
 Source URL: {feed_url}
 Publish Date: {pub_date.strftime('%Y-%m-%d')}
+
 Instructions:
 1. Detect language: Translate English to fluent Persian. Keep Persian as is.
 2. Do NOT translate proper nouns (brands, designers, locations, events).
@@ -117,28 +125,21 @@ Instructions:
 8. Tone: formal, engaging, journalistic.
 9. Length: 220–350 words.
 10. Use only input information – no speculation or added facts.
-Output format (exactly):
-FIRST LINE: فقط تیتر جذاب به فارسی (بدون هیچ پیشوند یا پسوند)
-AFTER THAT: بقیه متن خبر (لید + بدنه + تحلیل) بدون تکرار تیتر
+
+Output ONLY the clean Persian article text (no extra labels or headers):
+[تیتر جذاب به فارسی]
+
+[پاراگراف لید]
+
+[بدنه خبر]
+
+[پاراگراف تحلیل کوتاه]
 """
-                full_content = await translate_with_openrouter(openrouter_client, prompt)
 
-                # جدا کردن تیتر از بقیه متن
-                lines = full_content.strip().split('\n', 1)
-                if len(lines) == 2:
-                    persian_title = lines[0].strip()
-                    news_body = lines[1].strip()
-                else:
-                    persian_title = title  # fallback
-                    news_body = full_content.strip()
+                content = await translate_with_openrouter(openrouter_client, prompt)
 
-                # ترتیب جدید کپشن
-                caption = (
-                    f"<b>{persian_title}</b>\n\n"
-                    f"@irfashionnews\n\n"
-                    f"{news_body}\n\n"
-                    f"کانال مد و فشن ایرانی"
-                )
+                # فرمت نهایی پست: تصویر + تیتر فارسی + متن خبر + انتها لینک کانال با موضوع
+                final_text = f"{content}\n\n@irfashionnews - مد و فشن ایرانی"
 
                 try:
                     image_url = get_image_from_rss(entry)
@@ -146,14 +147,14 @@ AFTER THAT: بقیه متن خبر (لید + بدنه + تحلیل) بدون ت�
                         await bot.send_photo(
                             chat_id=chat_id,
                             photo=image_url,
-                            caption=caption,
+                            caption=final_text,
                             parse_mode='HTML',
                             disable_notification=True
                         )
                     else:
                         await bot.send_message(
                             chat_id=chat_id,
-                            text=caption,
+                            text=final_text,
                             link_preview_options=LinkPreviewOptions(is_disabled=True),
                             disable_notification=True
                         )
@@ -196,7 +197,9 @@ async def translate_with_openrouter(client, prompt):
             temperature=0.6,
             max_tokens=900
         )
+
         return response.choices[0].message.content.strip()
+
     except Exception as e:
         print(f"[ERROR] خطا در ترجمه با DeepSeek R1: {str(e)}")
         return "(ترجمه موقت - خطا رخ داد)\n\nلینک خبر اصلی را ببینید."
