@@ -38,7 +38,6 @@ async def main(event=None, context=None):
         base_url="https://openrouter.ai/api/v1"
     )
 
-    # ۲۰ فید خبری خارجی مد و فشن
     rss_feeds = [
         "https://www.vogue.com/feed/rss",
         "https://wwd.com/feed/",
@@ -93,7 +92,6 @@ async def main(event=None, context=None):
                 description = (entry.get('summary') or entry.get('description') or '').strip()
                 content_raw = description[:800]
 
-                # چک تکراری
                 try:
                     existing = databases.list_documents(
                         database_id=database_id,
@@ -106,8 +104,8 @@ async def main(event=None, context=None):
                 except Exception as db_err:
                     print(f"[WARN] خطا در چک دیتابیس (ادامه بدون چک): {str(db_err)}")
 
-                # پرامپت حرفه‌ای (بدون لیبل بخش‌ها)
-                prompt = f"""You are a senior Persian fashion editor.
+                # پرامپت اصلاح‌شده: بدون هیچ لیبل یا مقدمه اضافی
+                prompt = f"""You are a senior Persian fashion editor writing for a professional fashion publication.
 
 Write a magazine-quality Persian fashion news article.
 
@@ -121,8 +119,8 @@ Publish Date: {pub_date.strftime('%Y-%m-%d')}
 Instructions:
 1. Detect language: Translate English to fluent Persian. Keep Persian as is.
 2. Do NOT translate proper nouns (brands, designers, locations, events).
-3. Structure naturally – do NOT use any section labels like Headline, Lead, Body, Industry Perspective, etc.
-4. Start directly with a strong headline (8–14 words).
+3. Structure naturally – do NOT use ANY section labels, headers, or extra text like "Headline:", "Lead:", "Body:", "Industry Perspective:", "مقاله فارسی" or anything similar.
+4. Start DIRECTLY with a strong headline (8–14 words) on the first line.
 5. Follow immediately with lead paragraph (1–2 sentences).
 6. Then write 2–4 body paragraphs with logical flow.
 7. End with 2–3 sentences neutral industry analysis (impact on market/designers/consumers).
@@ -130,7 +128,7 @@ Instructions:
 9. Length: 220–350 words.
 10. Use only input information – no speculation or added facts.
 
-Output ONLY the clean Persian article text (no extra labels or headers):
+Output ONLY the clean Persian article text (no extra labels, no introduction, no "##", no "مقاله فارسی"):
 [تیتر جذاب به فارسی]
 
 [پاراگراف لید]
@@ -166,7 +164,7 @@ Output ONLY the clean Persian article text (no extra labels or headers):
                     posted = True
                     print(f"[SUCCESS] پست موفق ارسال شد: {title[:60]}")
 
-                    # ارسال ۴ استیکر رندوم واکنش با emoji (عمومی تلگرام)
+                    # ارسال ۴ استیکر رندوم واکنش با emoji عمومی تلگرام
                     reaction_emojis = [
                         "👍", "🔥", "🌹", "❤️", "✨",
                         "😍", "👏", "🌟", "💃", "👗",
