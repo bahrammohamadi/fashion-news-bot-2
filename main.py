@@ -12,7 +12,6 @@ from openai import AsyncOpenAI
 async def main(event=None, context=None):
     print("[INFO] اجرای تابع main شروع شد")
 
-    # خواندن متغیرهای محیطی (دقیقاً همون اسم‌هایی که ست کردی)
     token = os.environ.get('TELEGRAM_BOT_TOKEN')
     chat_id = os.environ.get('TELEGRAM_CHANNEL_ID')
     appwrite_endpoint = os.environ.get('APPWRITE_ENDPOINT', 'https://fra.cloud.appwrite.io/v1')
@@ -38,7 +37,6 @@ async def main(event=None, context=None):
         base_url="https://openrouter.ai/api/v1"
     )
 
-    # ۲۰ فید خبری خارجی مد و فشن (همه فعال و مرتبط)
     rss_feeds = [
         "https://www.vogue.com/feed/rss",
         "https://wwd.com/feed/",
@@ -93,7 +91,6 @@ async def main(event=None, context=None):
                 description = (entry.get('summary') or entry.get('description') or '').strip()
                 content_raw = description[:800]
 
-                # چک تکراری با دیتابیس
                 try:
                     existing = databases.list_documents(
                         database_id=database_id,
@@ -106,12 +103,9 @@ async def main(event=None, context=None):
                 except Exception as db_err:
                     print(f"[WARN] خطا در چک دیتابیس (ادامه بدون چک): {str(db_err)}")
 
-                # پرامپت حرفه‌ای
-                prompt = f"""
-You are a senior fashion journalist with 15+ years of experience writing for Vogue, Harper's Bazaar, and Elle in Persian market.
+                prompt = f"""You are a senior Persian fashion editor writing for a professional fashion publication.
 
-Objective:
-Produce a magazine-quality Persian fashion news article that is analytically strong, professionally written, yet accessible to informed general audiences.
+Write a magazine-quality Persian fashion news article.
 
 Input:
 Title: {title}
@@ -120,58 +114,32 @@ Content: {content_raw}
 Source URL: {feed_url}
 Publish Date: {pub_date.strftime('%Y-%m-%d')}
 
-Execution Instructions:
-1) Language:
-- If the content is in English → translate into fluent, refined Persian.
-- If already Persian → professionally edit and elevate.
-- Keep all brand names, designer names, fashion houses, event names, and locations in original language.
-- Do NOT translate proper nouns.
-2) Accuracy Rules:
-- Use only information present in the input.
-- No speculation.
-- No added facts.
-- No invented quotes.
-- No exaggeration.
-3) Tone:
-- Professional, analytical, and composed.
-- Accessible but not simplistic.
-- Use correct fashion terminology when relevant.
-- Avoid marketing language.
-- Avoid emotional or dramatic adjectives.
-4) Structure (strict):
-Headline:
-- 8–14 words
-- Clear and informative
-- No sensationalism
-Lead:
-- 1–2 sentences
-- Answer who, what, where, when, and why it matters.
-Body:
-- 2–4 structured paragraphs
-- Expand on key details
-- Maintain logical flow
-- Avoid repetition
-Industry Perspective:
-- 2–3 sentences
-- Briefly explain why this matters for designers, buyers, retailers, or the broader fashion market.
-Length:
-- 220–350 words
-Output Format:
-Headline:
-[Persian headline]
-Lead:
-[Lead paragraph]
-Body:
-[Main article]
-Industry Perspective:
-[Analytical closing]
-Source: {feed_url}
+Instructions:
+1. Detect language: Translate English to fluent Persian. Keep Persian as is.
+2. Do NOT translate proper nouns (brands, designers, locations, events).
+3. Structure naturally – do NOT use any section labels like Headline, Lead, Body, Industry Perspective, etc.
+4. Start directly with a strong headline (8–14 words).
+5. Follow immediately with lead paragraph (1–2 sentences).
+6. Then write 2–4 body paragraphs with logical flow.
+7. End with 2–3 sentences neutral industry analysis (impact on market/designers/consumers).
+8. Tone: formal, engaging, journalistic.
+9. Length: 220–350 words.
+10. Use only input information – no speculation or added facts.
+
+Output ONLY the clean Persian article text (no extra labels or headers):
+[تیتر جذاب به فارسی]
+
+[پاراگراف لید]
+
+[بدنه خبر]
+
+[پاراگراف تحلیل کوتاه]
 """
 
                 content = await translate_with_openrouter(openrouter_client, prompt)
 
-                # فرمت نهایی پست: تصویر + تیتر فارسی + متن خبر + لینک منبع + انتها لینک کانال با موضوع
-                final_text = f"{content}\n\n@irfashionnews - مد و فشن ایرانی\n\n🔗 {link}"
+                # فرمت نهایی پست: تصویر + تیتر فارسی + متن خبر + انتها لینک کانال با موضوع
+                final_text = f"{content}\n\n@irfashionnews - مد و فشن ایرانی"
 
                 try:
                     image_url = get_image_from_rss(entry)
@@ -194,7 +162,6 @@ Source: {feed_url}
                     posted = True
                     print(f"[SUCCESS] پست موفق ارسال شد: {title[:60]}")
 
-                    # ذخیره در دیتابیس
                     try:
                         databases.create_document(
                             database_id=database_id,
