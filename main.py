@@ -144,7 +144,7 @@ async def main(event=None, context=None):
 
 async def process_full_fashion_post(client, title, content_raw, link, pub_date, feed_url):
     prompt = f"""
-اول بررسی کن آیا این خبر در حوزه مد، فشن، استایل، زیبایی، لباس، ترند پوشاک، طراحی لباس یا استایل ایرانی است؟ اگر نه، فقط بنویس "غیرمرتبط".
+ابتدا بررسی کن آیا این خبر در حوزه مد، فشن، استایل، زیبایی، لباس، ترند پوشاک، طراحی لباس یا استایل ایرانی است؟ اگر نه، فقط بنویس "غیرمرتبط".
 
 اگر بله، این کارها را انجام بده:
 
@@ -172,7 +172,7 @@ async def process_full_fashion_post(client, title, content_raw, link, pub_date, 
 
     try:
         response = await client.chat.completions.create(
-            model="gemini-2.5-flash",  # سریع‌تر از pro، ولی کیفیت فارسی هنوز عالی
+            model="gemini-2.5-flash",  # سریع‌تر، timeout کمتر
             messages=[{"role": "user", "content": prompt}],
             max_tokens=1800,
             temperature=0.4
