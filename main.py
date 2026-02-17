@@ -96,14 +96,11 @@ async def main(event=None, context=None):
                 soup = BeautifulSoup(raw_html, 'html.parser')
                 content_raw = soup.get_text(separator=' ').strip()
 
-                # فیلتر هوشمند با GapGPT
-                is_fashion = await is_fashion_related(client, title, content_raw)
-                if not is_fashion:
-                    print(f"[FILTER] رد شد (غیرمرتبط): {title[:60]}")
+                # درخواست واحد به GapGPT (فیلتر + ترجمه + مقاله فشن)
+                final_content = await process_full_fashion_post(client, title, content_raw, link, pub_date, feed_url)
+                if not final_content:
+                    print(f"[SKIP] پست رد شد: {title[:60]}")
                     continue
-
-                # ترجمه و تبدیل به مقاله فشن
-                final_content = await process_fashion_article(client, title, content_raw, link, pub_date)
 
                 final_text = f"{final_content}\n\n🔗 {link}"
 
@@ -113,20 +110,9 @@ async def main(event=None, context=None):
 
                 try:
                     if image_url:
-                        await bot.send_photo(
-                            chat_id=chat_id,
-                            photo=image_url,
-                            caption=final_text,
-                            parse_mode='HTML',
-                            disable_notification=True
-                        )
+                        await bot.send_photo(chat_id=chat_id, photo=image_url, caption=final_text, parse_mode='HTML', disable_notification=True)
                     else:
-                        await bot.send_message(
-                            chat_id=chat_id,
-                            text=final_text,
-                            disable_web_page_preview=True,
-                            disable_notification=True
-                        )
+                        await bot.send_message(chat_id=chat_id, text=final_text, disable_web_page_preview=True, disable_notification=True)
 
                     posted_count += 1
                     print(f"[SUCCESS] پست موفق: {title[:60]}")
@@ -156,78 +142,50 @@ async def main(event=None, context=None):
     return {"status": "success", "posted": posted_count}
 
 
-async def is_fashion_related(client, title, content_raw):
-    prompt = f"""فقط با "بله" یا "خیر" جواب بده.
+async def process_full_fashion_post(client, title, content_raw, link, pub_date, feed_url):
+    prompt = f"""
+اول بررسی کن آیا این خبر در حوزه مد، فشن، استایل، زیبایی، لباس، ترند پوشاک، طراحی لباس یا استایل ایرانی است؟ اگر نه، فقط بنویس "غیرمرتبط".
 
-آیا این خبر در حوزه مد، فشن، استایل، زیبایی، لباس، ترندهای پوشاک، طراحی لباس یا استایل ایرانی است؟
+اگر بله، این کارها را انجام بده:
+
+۱. ترجمه دقیق و حرفه‌ای متن انگلیسی به فارسی روان و مناسب انتشار در کانال مد (حفظ لحن، ساختار و اصطلاحات تخصصی).
+
+۲. تبدیل متن ترجمه‌شده به مقاله فشن کامل با ساختار زیر:
+   - Headline: ۸–۱۴ کلمه جذاب
+   - Subheadline: ۱ جمله تکمیلی
+   - Lead: ۱–۲ جمله (پاسخ به چه، کی، کجا، چرا مهم است)
+   - Body: ۳–۵ پاراگراف کوتاه و روان
+   - Industry Insight: ۲–۴ جمله تحلیلی (تأثیر در بازار مد، استایل ایرانی، یا ترندهای جهانی)
+
+۳. طول کل: ۲۵۰–۴۵۰ کلمه
+۴. لحن: حرفه‌ای، ژورنالیستی، خنثی، بدون تبلیغ
+۵. بدون ایموجی، بدون هشتگ در متن اصلی (هشتگ‌ها جداگانه اضافه می‌شوند)
 
 عنوان: {title}
-متن: {content_raw[:500]}
+متن خام: {content_raw[:1200]}
+لینک: {link}
+تاریخ: {pub_date.strftime('%Y-%m-%d')}
 
-جواب فقط: بله یا خیر"""
+خروجی فقط مقاله نهایی باشه، بدون توضیح اضافی.
+اگر غیرمرتبط بود، فقط بنویس "غیرمرتبط".
+"""
 
     try:
         response = await client.chat.completions.create(
-            model="gemini-2.5-pro",
+            model="gemini-2.5-flash",  # سریع‌تر از pro، ولی کیفیت فارسی هنوز عالی
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=10,
-            temperature=0.0
-        )
-        answer = response.choices[0].message.content.strip().lower()
-        return "بله" in answer
-    except Exception as e:
-        print(f"[WARN] خطا فیلتر: {str(e)}")
-        return False
-
-
-async def process_fashion_article(client, title, content_raw, link, pub_date):
-    translate_prompt = f"""
-ترجمه دقیق و حرفه‌ای متن انگلیسی زیر به فارسی روان و مناسب انتشار در کانال مد:
-
-متن:
-{content_raw[:1200]}
-
-خروجی فقط ترجمه فارسی باشه، بدون توضیح اضافی.
-"""
-
-    try:
-        translate_res = await client.chat.completions.create(
-            model="gemini-2.5-pro",
-            messages=[{"role": "user", "content": translate_prompt}],
-            max_tokens=1200,
-            temperature=0.3
-        )
-        translated = translate_res.choices[0].message.content.strip()
-    except:
-        translated = content_raw[:800] + "..."
-
-    fashion_prompt = f"""
-شما ویراستار ارشد خبر مد هستید. متن زیر را به یک پست حرفه‌ای و جذاب برای کانال مد تبدیل کنید.
-
-عنوان: {title}
-متن ترجمه‌شده: {translated}
-لینک منبع: {link}
-تاریخ انتشار: {pub_date.strftime('%Y-%m-%d')}
-
-ساختار پست:
-- تیتر جذاب (۸–۱۴ کلمه)
-- متن اصلی (۲۰۰–۴۰۰ کلمه، روان و حرفه‌ای)
-- تحلیل کوتاه ۲–۳ جمله (درباره تأثیر در بازار مد یا استایل ایرانی)
-- هشتگ‌ها در انتها
-
-خروجی فقط پست نهایی باشه، بدون توضیح اضافی.
-"""
-
-    try:
-        fashion_res = await client.chat.completions.create(
-            model="gemini-2.5-pro",
-            messages=[{"role": "user", "content": fashion_prompt}],
-            max_tokens=1500,
+            max_tokens=1800,
             temperature=0.4
         )
-        return fashion_res.choices[0].message.content.strip()
-    except:
-        return f"**{title}**\n\n{translated[:800]}...\n\nمنبع: {link}"
+        result = response.choices[0].message.content.strip()
+
+        if "غیرمرتبط" in result:
+            return None
+
+        return result
+    except Exception as e:
+        print(f"[ERROR] خطا پردازش مقاله: {str(e)}")
+        return None
 
 
 def get_image_from_rss(entry):
