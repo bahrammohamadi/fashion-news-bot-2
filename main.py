@@ -24,12 +24,11 @@ async def main(event=None, context=None):
     collection_id = 'history'
 
     if not all([token, chat_id, gapgpt_key, appwrite_project, appwrite_key, database_id]):
-        print("[ERROR] متغیرهای محیطی ناقص! (GAPGPT_API_KEY چک شود)")
+        print("[ERROR] متغیرهای محیطی ناقص!")
         return {"status": "error"}
 
     bot = Bot(token=token)
 
-    # کلاینت GapGPT
     client = AsyncOpenAI(
         api_key=gapgpt_key,
         base_url="https://api.gapgpt.app/v1"
@@ -41,7 +40,6 @@ async def main(event=None, context=None):
     aw_client.set_key(appwrite_key)
     databases = Databases(aw_client)
 
-    # فیدهای تخصصی مد و فشن
     rss_feeds = [
         "https://medopia.ir/feed/",
         "https://www.digistyle.com/mag/feed/",
@@ -98,13 +96,13 @@ async def main(event=None, context=None):
                 soup = BeautifulSoup(raw_html, 'html.parser')
                 content_raw = soup.get_text(separator=' ').strip()
 
-                # مرحله ۱: فیلتر هوشمند با GapGPT
+                # فیلتر هوشمند با GapGPT
                 is_fashion = await is_fashion_related(client, title, content_raw)
                 if not is_fashion:
                     print(f"[FILTER] رد شد (غیرمرتبط): {title[:60]}")
                     continue
 
-                # مرحله ۲: ترجمه و تبدیل به مقاله فشن
+                # ترجمه و تبدیل به مقاله فشن
                 final_content = await process_fashion_article(client, title, content_raw, link, pub_date)
 
                 final_text = f"{final_content}\n\n🔗 {link}"
@@ -115,9 +113,20 @@ async def main(event=None, context=None):
 
                 try:
                     if image_url:
-                        await bot.send_photo(chat_id=chat_id, photo=image_url, caption=final_text, parse_mode='HTML', disable_notification=True)
+                        await bot.send_photo(
+                            chat_id=chat_id,
+                            photo=image_url,
+                            caption=final_text,
+                            parse_mode='HTML',
+                            disable_notification=True
+                        )
                     else:
-                        await bot.send_message(chat_id=chat_id, text=final_text, disable_web_page_preview=True, disable_notification=True)
+                        await bot.send_message(
+                            chat_id=chat_id,
+                            text=final_text,
+                            disable_web_page_preview=True,
+                            disable_notification=True
+                        )
 
                     posted_count += 1
                     print(f"[SUCCESS] پست موفق: {title[:60]}")
@@ -172,26 +181,13 @@ async def is_fashion_related(client, title, content_raw):
 
 
 async def process_fashion_article(client, title, content_raw, link, pub_date):
-    # پرامپت ترجمه دقیق
     translate_prompt = f"""
-Role: You are a senior professional translator and Persian language editor with expertise in precise, publication-level translation.
+ترجمه دقیق و حرفه‌ای متن انگلیسی زیر به فارسی روان و مناسب انتشار در کانال مد:
 
-Objective: Translate the provided English text into high-quality, fluent, publication-ready Persian while preserving the exact meaning, tone, and structure of the original content.
+متن:
+{content_raw[:1200]}
 
-Source Text:
-\"\"\"
-{content_raw}
-\"\"\"
-
-Translation Instructions:
-1) Accuracy & Fidelity: Preserve the exact meaning. Do NOT omit, summarize, or expand.
-2) Tone & Register: Maintain the same tone (formal, analytical, neutral).
-3) Terminology: Preserve proper nouns (brands, designers, events). Do NOT translate trademarks.
-4) Structural Integrity: Preserve paragraph structure.
-5) Linguistic Quality: Fluent, natural, grammatically correct Persian. No slang.
-6) Output: ONLY the final Persian translation. No explanations.
-
-Final Output: [Persian translation only]
+خروجی فقط ترجمه فارسی باشه، بدون توضیح اضافی.
 """
 
     try:
@@ -203,50 +199,23 @@ Final Output: [Persian translation only]
         )
         translated = translate_res.choices[0].message.content.strip()
     except:
-        translated = content_raw[:800] + "..."  # fallback
+        translated = content_raw[:800] + "..."
 
-    # پرامپت تبدیل به مقاله فشن
     fashion_prompt = f"""
-Role: You are a senior fashion news editor writing for a professional Persian fashion news channel.
+شما ویراستار ارشد خبر مد هستید. متن زیر را به یک پست حرفه‌ای و جذاب برای کانال مد تبدیل کنید.
 
-Mission: Transform the provided raw information into a publication-ready, high-standard fashion news article.
+عنوان: {title}
+متن ترجمه‌شده: {translated}
+لینک منبع: {link}
+تاریخ انتشار: {pub_date.strftime('%Y-%m-%d')}
 
-Input:
-Title: {title}
-Summary: {translated[:500]}
-Content: {translated}
-Source URL: {link}
-Publish Date: {pub_date.strftime('%Y-%m-%d')}
+ساختار پست:
+- تیتر جذاب (۸–۱۴ کلمه)
+- متن اصلی (۲۰۰–۴۰۰ کلمه، روان و حرفه‌ای)
+- تحلیل کوتاه ۲–۳ جمله (درباره تأثیر در بازار مد یا استایل ایرانی)
+- هشتگ‌ها در انتها
 
-Editorial Principles:
-1) Accuracy: Use ONLY the information provided.
-2) Language: Fluent Persian, professional tone.
-3) Structure (STRICT):
-   - Headline: 8–14 words
-   - Subheadline: 1 sentence
-   - Lead: 1–2 sentences
-   - Body: 3–5 paragraphs
-   - Industry Insight: 2–4 analytical sentences
-4) Length: 250–450 words
-5) No emojis, no promotional tone.
-
-Output Format (strict):
-Headline:
-[Persian headline]
-
-Subheadline:
-[Context sentence]
-
-Lead:
-[Opening paragraph]
-
-Body:
-[Main content]
-
-Industry Insight:
-[Analytical closing]
-
-Source: {link}
+خروجی فقط پست نهایی باشه، بدون توضیح اضافی.
 """
 
     try:
