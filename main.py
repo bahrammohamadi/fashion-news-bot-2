@@ -1,5 +1,3 @@
-# main_fashion_openrouter_final.py - نهایی، بدون ترجمه مستقیم، فقط استنباط + نکته استایل، ۱ پست، با عکس‌ها
-
 import os
 import asyncio
 import feedparser
@@ -13,139 +11,68 @@ from appwrite.services.databases import Databases
 from appwrite.exception import AppwriteException
 from appwrite.query import Query
 
-# ====================== تنظیمات ======================
-TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
-TELEGRAM_CHANNEL_ID = os.environ.get('TELEGRAM_CHANNEL_ID')
-OPENROUTER_API_KEY = os.environ.get('OPENROUTER_API_KEY')
-APPWRITE_ENDPOINT = os.environ.get('APPWRITE_ENDPOINT', 'https://cloud.appwrite.io/v1')
-APPWRITE_PROJECT_ID = os.environ.get('APPWRITE_PROJECT_ID')
-APPWRITE_API_KEY = os.environ.get('APPWRITE_API_KEY')
-APPWRITE_DATABASE_ID = os.environ.get('APPWRITE_DATABASE_ID')
-COLLECTION_ID = 'history'
-
-MAX_POSTS_PER_RUN = 1
-CHECK_DAYS = 4
-MAX_RAW_TEXT_LENGTH = 1200
-MAX_FINAL_TEXT_LENGTH = 420
-
-# ====================== فیدهای خارجی مد و فشن ======================
-RSS_FEEDS = [
-    "https://www.vogue.com/feed/rss",
-    "https://wwd.com/feed/",
-    "https://www.harpersbazaar.com/rss/fashion.xml",
-    "https://fashionista.com/feed",
-    "https://www.businessoffashion.com/feed/",
-    "https://www.elle.com/rss/fashion.xml",
-    "https://www.refinery29.com/rss.xml",
-    "https://www.thecut.com/feed",
-    "https://www.whowhatwear.com/rss",
-    "https://www.instyle.com/rss",
-    "https://www.marieclaire.com/rss/fashion/",
-    "https://www.glamour.com/rss/fashion",
-    "https://www.allure.com/rss",
-    "https://nylon.com/feed",
-    "https://www.highsnobiety.com/feed/",
-    "https://hypebeast.com/feed",
-    "https://www.ssense.com/en-us/editorial/rss",
-    "https://www.dazeddigital.com/rss",
-    "https://i-d.vice.com/en/rss",
-    "https://www.papermag.com/rss",
-]
-
-# ====================== تولید استنباط + نکته استایل ======================
-async def extract_insight_and_style(client, title, raw_text):
-    prompt = f"""
-از این خبر مد و فشن فقط برآیند و استنباط اصلی رو استخراج کن:
-
-عنوان: {title}
-متن: {raw_text[:1000]}
-
-خروجی دقیقاً این فرمت باشه:
-
-**تیتر جذاب فارسی**
-
-متن توضیح کوتاه و حرفه‌ای (۳ تا ۶ خط) - فقط جوهره خبر، بدون تبلیغ
-
-نکته استایل: [یک نکته کاربردی و مرتبط ۱–۲ جمله‌ای - با نگاه به مانتو، شال، حجاب، فرهنگ و آب‌وهوای ایران]
-
-بدون هیچ متن اضافه، تبلیغ یا لینک.
-"""
-
-    try:
-        resp = await client.chat.completions.create(
-            model="qwen/qwen2.5-coder-32b-instruct",  # مدل قوی فارسی، بدون لیمیت سخت
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.75,
-            max_tokens=500
-        )
-        content = resp.choices[0].message.content.strip()
-        if not content or len(content) < 80:
-            raise Exception("پاسخ نامعتبر")
-        return content
-    except Exception as e:
-        print(f"[OPENROUTER ERROR] {str(e)[:100]} - fallback")
-        clean_fallback = clean_html(raw_text)
-        if len(clean_fallback) > MAX_FINAL_TEXT_LENGTH:
-            clean_fallback = clean_fallback[:MAX_FINAL_TEXT_LENGTH] + "..."
-        return f"**{title}**\n\n{clean_fallback}\n\nنکته استایل: این خبر می‌تونه ایده‌های خوبی برای ترکیب با استایل ایرانی بده."
-
-# ====================== توابع کمکی ======================
-def clean_html(html):
-    soup = BeautifulSoup(html, 'html.parser')
-    return soup.get_text(separator=' ', strip=True)
-
-def get_all_images_from_rss(entry):
-    images = []
-    if 'enclosure' in entry and entry.enclosure.get('type', '').startswith('image/'):
-        images.append(entry.enclosure.get('href'))
-    if 'media_content' in entry:
-        for media in entry.media_content:
-            if media.get('medium') == 'image' and media.get('url'):
-                images.append(media.get('url'))
-    return images if images else None
-
-async def extract_og_image(url):
-    try:
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        response = requests.get(url, timeout=8, headers=headers)
-        if response.status_code != 200:
-            return None
-        soup = BeautifulSoup(response.text, 'html.parser')
-        og = soup.find('meta', property='og:image')
-        if og and og.get('content'):
-            return og['content']
-        return None
-    except:
-        return None
-
-# ====================== تابع اصلی ======================
 async def main(event=None, context=None):
-    print("[INFO] شروع اجرا")
+    print("[INFO] اجرای تابع main شروع شد")
 
-    if not all([TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL_ID, OPENROUTER_API_KEY, APPWRITE_PROJECT_ID, APPWRITE_API_KEY, APPWRITE_DATABASE_ID]):
-        print("[ERROR] متغیرهای محیطی ناقص")
+    token = os.environ.get('TELEGRAM_BOT_TOKEN')
+    chat_id = os.environ.get('TELEGRAM_CHANNEL_ID')
+    gapgpt_key = os.environ.get('GAPGPT_API_KEY')
+    appwrite_endpoint = os.environ.get('APPWRITE_ENDPOINT', 'https://cloud.appwrite.io/v1')
+    appwrite_project = os.environ.get('APPWRITE_PROJECT_ID')
+    appwrite_key = os.environ.get('APPWRITE_API_KEY')
+    database_id = os.environ.get('APPWRITE_DATABASE_ID')
+    collection_id = 'history'
+
+    if not all([token, chat_id, gapgpt_key, appwrite_project, appwrite_key, database_id]):
+        print("[ERROR] متغیرهای محیطی ناقص! (GAPGPT_API_KEY چک شود)")
         return {"status": "error"}
 
-    bot = Bot(token=TELEGRAM_BOT_TOKEN)
+    bot = Bot(token=token)
 
+    # کلاینت GapGPT
     client = AsyncOpenAI(
-        api_key=OPENROUTER_API_KEY,
-        base_url="https://openrouter.ai/api/v1"
+        api_key=gapgpt_key,
+        base_url="https://api.gapgpt.app/v1"
     )
 
     aw_client = Client()
-    aw_client.set_endpoint(APPWRITE_ENDPOINT)
-    aw_client.set_project(APPWRITE_PROJECT_ID)
-    aw_client.set_key(APPWRITE_API_KEY)
+    aw_client.set_endpoint(appwrite_endpoint)
+    aw_client.set_project(appwrite_project)
+    aw_client.set_key(appwrite_key)
     databases = Databases(aw_client)
 
+    # فیدهای تخصصی مد و فشن
+    rss_feeds = [
+        "https://medopia.ir/feed/",
+        "https://www.digistyle.com/mag/feed/",
+        "https://www.chibepoosham.com/feed/",
+        "https://www.tarahanelebas.com/feed/",
+        "https://www.persianpood.com/feed/",
+        "https://www.jument.style/feed/",
+        "https://www.zibamoon.com/feed/",
+        "https://www.sarak-co.com/feed/",
+        "https://www.elsana.com/feed/",
+        "https://www.beytoote.com/rss/fashion",
+        "https://www.namnak.com/rss/fashion",
+        "https://www.modetstyle.com/feed/",
+        "https://www.antikstyle.com/feed/",
+        "https://www.rnsfashion.com/feed/",
+        "https://www.pattonjameh.com/feed/",
+        "https://www.tonikaco.com/feed/",
+        "https://www.zoomit.ir/feed/category/fashion-beauty/",
+        "https://www.khabaronline.ir/rss/category/مد-زیبایی",
+        "https://fararu.com/rss/category/مد-زیبایی",
+        "https://www.digikala.com/mag/feed/?category=مد-و-زیبایی",
+    ]
+
     now = datetime.now(timezone.utc)
-    time_threshold = now - timedelta(days=CHECK_DAYS)
+    time_threshold = now - timedelta(days=4)
 
     posted_count = 0
+    max_posts_per_run = 1  # فقط ۱ پست در هر اجرا
 
-    for feed_url in RSS_FEEDS:
-        if posted_count >= MAX_POSTS_PER_RUN:
+    for feed_url in rss_feeds:
+        if posted_count >= max_posts_per_run:
             break
 
         try:
@@ -154,7 +81,7 @@ async def main(event=None, context=None):
                 continue
 
             for entry in feed.entries:
-                if posted_count >= MAX_POSTS_PER_RUN:
+                if posted_count >= max_posts_per_run:
                     break
 
                 published = entry.get('published_parsed') or entry.get('updated_parsed')
@@ -166,83 +93,205 @@ async def main(event=None, context=None):
 
                 title = entry.title.strip()
                 link = entry.link.strip()
-                raw_content = (entry.get('summary') or entry.get('description') or '')[:MAX_RAW_TEXT_LENGTH]
+                raw_html = entry.get('summary') or entry.get('description') or ''
 
-                soup = BeautifulSoup(raw_content, 'html.parser')
-                clean_text = soup.get_text(separator=' ').strip()
+                soup = BeautifulSoup(raw_html, 'html.parser')
+                content_raw = soup.get_text(separator=' ').strip()
 
-                # چک تکراری
-                try:
-                    existing = databases.list_documents(
-                        database_id=APPWRITE_DATABASE_ID,
-                        collection_id=COLLECTION_ID,
-                        queries=[Query.equal("link", link)]
-                    )
-                    if existing['total'] > 0:
-                        continue
-                except Exception as e:
-                    print(f"[DB WARN] {e}")
+                # مرحله ۱: فیلتر هوشمند با GapGPT
+                is_fashion = await is_fashion_related(client, title, content_raw)
+                if not is_fashion:
+                    print(f"[FILTER] رد شد (غیرمرتبط): {title[:60]}")
+                    continue
 
-                # استنباط + نکته استایل
-                final_text = await extract_insight_and_style(client, title, clean_text)
+                # مرحله ۲: ترجمه و تبدیل به مقاله فشن
+                final_content = await process_fashion_article(client, title, content_raw, link, pub_date)
 
-                # استخراج عکس‌ها
-                image_urls = get_all_images_from_rss(entry)
-                if not image_urls:
-                    og_image = await extract_og_image(link)
-                    if og_image:
-                        image_urls = [og_image]
+                final_text = f"{final_content}\n\n🔗 {link}"
+
+                image_url = get_image_from_rss(entry)
+                if not image_url:
+                    image_url = await extract_image_from_page(link)
 
                 try:
-                    if image_urls:
-                        await bot.send_photo(
-                            chat_id=TELEGRAM_CHANNEL_ID,
-                            photo=image_urls[0],
-                            caption=final_text,
-                            parse_mode='HTML',
-                            disable_notification=True
-                        )
-                        for extra_img in image_urls[1:]:
-                            await bot.send_photo(
-                                chat_id=TELEGRAM_CHANNEL_ID,
-                                photo=extra_img,
-                                caption="",
-                                disable_notification=True
-                            )
+                    if image_url:
+                        await bot.send_photo(chat_id=chat_id, photo=image_url, caption=final_text, parse_mode='HTML', disable_notification=True)
                     else:
-                        await bot.send_message(
-                            chat_id=TELEGRAM_CHANNEL_ID,
-                            text=final_text,
-                            parse_mode='HTML',
-                            disable_notification=True
-                        )
+                        await bot.send_message(chat_id=chat_id, text=final_text, disable_web_page_preview=True, disable_notification=True)
 
                     posted_count += 1
-                    print(f"[SUCCESS] پست ارسال شد: {title[:60]} - عکس‌ها: {len(image_urls) if image_urls else 0}")
+                    print(f"[SUCCESS] پست موفق: {title[:60]}")
 
                     try:
                         databases.create_document(
-                            database_id=APPWRITE_DATABASE_ID,
-                            collection_id=COLLECTION_ID,
+                            database_id=database_id,
+                            collection_id=collection_id,
                             document_id='unique()',
                             data={
                                 'link': link,
-                                'title': title[:250],
+                                'title': title,
                                 'published_at': now.isoformat(),
                                 'feed_url': feed_url
                             }
                         )
                     except Exception as save_err:
-                        print(f"[DB SAVE WARN] {save_err}")
+                        print(f"[WARN] خطا ذخیره DB: {str(save_err)}")
 
                 except Exception as send_err:
-                    print(f"[SEND ERROR] {send_err}")
+                    print(f"[ERROR] خطا ارسال: {str(send_err)}")
 
         except Exception as feed_err:
-            print(f"[FEED ERROR] {feed_url}: {feed_err}")
+            print(f"[ERROR] خطا فید {feed_url}: {str(feed_err)}")
 
-    print(f"[INFO] پایان اجرا - پست شده: {posted_count}")
-    return {"status": "ok", "posted": posted_count}
+    print(f"[INFO] پایان اجرا - تعداد پست ارسال‌شده: {posted_count}")
+    return {"status": "success", "posted": posted_count}
+
+
+async def is_fashion_related(client, title, content_raw):
+    prompt = f"""فقط با "بله" یا "خیر" جواب بده.
+
+آیا این خبر در حوزه مد، فشن، استایل، زیبایی، لباس، ترندهای پوشاک، طراحی لباس یا استایل ایرانی است؟
+
+عنوان: {title}
+متن: {content_raw[:500]}
+
+جواب فقط: بله یا خیر"""
+
+    try:
+        response = await client.chat.completions.create(
+            model="gemini-2.5-pro",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=10,
+            temperature=0.0
+        )
+        answer = response.choices[0].message.content.strip().lower()
+        return "بله" in answer
+    except Exception as e:
+        print(f"[WARN] خطا فیلتر: {str(e)}")
+        return False
+
+
+async def process_fashion_article(client, title, content_raw, link, pub_date):
+    # پرامپت ترجمه دقیق
+    translate_prompt = f"""
+Role: You are a senior professional translator and Persian language editor with expertise in precise, publication-level translation.
+
+Objective: Translate the provided English text into high-quality, fluent, publication-ready Persian while preserving the exact meaning, tone, and structure of the original content.
+
+Source Text:
+\"\"\"
+{content_raw}
+\"\"\"
+
+Translation Instructions:
+1) Accuracy & Fidelity: Preserve the exact meaning. Do NOT omit, summarize, or expand.
+2) Tone & Register: Maintain the same tone (formal, analytical, neutral).
+3) Terminology: Preserve proper nouns (brands, designers, events). Do NOT translate trademarks.
+4) Structural Integrity: Preserve paragraph structure.
+5) Linguistic Quality: Fluent, natural, grammatically correct Persian. No slang.
+6) Output: ONLY the final Persian translation. No explanations.
+
+Final Output: [Persian translation only]
+"""
+
+    try:
+        translate_res = await client.chat.completions.create(
+            model="gemini-2.5-pro",
+            messages=[{"role": "user", "content": translate_prompt}],
+            max_tokens=1200,
+            temperature=0.3
+        )
+        translated = translate_res.choices[0].message.content.strip()
+    except:
+        translated = content_raw[:800] + "..."  # fallback
+
+    # پرامپت تبدیل به مقاله فشن
+    fashion_prompt = f"""
+Role: You are a senior fashion news editor writing for a professional Persian fashion news channel.
+
+Mission: Transform the provided raw information into a publication-ready, high-standard fashion news article.
+
+Input:
+Title: {title}
+Summary: {translated[:500]}
+Content: {translated}
+Source URL: {link}
+Publish Date: {pub_date.strftime('%Y-%m-%d')}
+
+Editorial Principles:
+1) Accuracy: Use ONLY the information provided.
+2) Language: Fluent Persian, professional tone.
+3) Structure (STRICT):
+   - Headline: 8–14 words
+   - Subheadline: 1 sentence
+   - Lead: 1–2 sentences
+   - Body: 3–5 paragraphs
+   - Industry Insight: 2–4 analytical sentences
+4) Length: 250–450 words
+5) No emojis, no promotional tone.
+
+Output Format (strict):
+Headline:
+[Persian headline]
+
+Subheadline:
+[Context sentence]
+
+Lead:
+[Opening paragraph]
+
+Body:
+[Main content]
+
+Industry Insight:
+[Analytical closing]
+
+Source: {link}
+"""
+
+    try:
+        fashion_res = await client.chat.completions.create(
+            model="gemini-2.5-pro",
+            messages=[{"role": "user", "content": fashion_prompt}],
+            max_tokens=1500,
+            temperature=0.4
+        )
+        return fashion_res.choices[0].message.content.strip()
+    except:
+        return f"**{title}**\n\n{translated[:800]}...\n\nمنبع: {link}"
+
+
+def get_image_from_rss(entry):
+    if 'enclosure' in entry and entry.enclosure.get('type', '').startswith('image/'):
+        return entry.enclosure.href
+    if 'media_content' in entry:
+        for media in entry.media_content:
+            if media.get('medium') == 'image' and media.get('url'):
+                return media.get('url')
+    return None
+
+
+async def extract_image_from_page(url):
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        response = requests.get(url, timeout=8, headers=headers)
+        if response.status_code != 200:
+            return None
+
+        soup = BeautifulSoup(response.text, 'html.parser')
+        og = soup.find('meta', property='og:image')
+        if og and og.get('content'):
+            return og['content']
+
+        for img in soup.find_all('img'):
+            src = img.get('src') or img.get('data-src')
+            if src and len(src) > 15:
+                if any(bad in src.lower() for bad in ['logo', 'icon', 'banner']):
+                    continue
+                return src
+        return None
+    except:
+        return None
 
 
 if __name__ == "__main__":
