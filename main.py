@@ -8,7 +8,6 @@ from appwrite.services.databases import Databases
 from appwrite.exception import AppwriteException
 from appwrite.query import Query
 from openai import AsyncOpenAI
-import random
 
 async def main(event=None, context=None):
     print("[INFO] اجرای تابع main شروع شد")
@@ -38,7 +37,6 @@ async def main(event=None, context=None):
         base_url="https://openrouter.ai/api/v1"
     )
 
-    # ۲۰ فید خبری خارجی مد و فشن
     rss_feeds = [
         "https://www.vogue.com/feed/rss",
         "https://wwd.com/feed/",
@@ -106,10 +104,9 @@ async def main(event=None, context=None):
                 except Exception as db_err:
                     print(f"[WARN] خطا در چک دیتابیس (ادامه بدون چک): {str(db_err)}")
 
-                # پرامپت حرفه‌ای (بدون لیبل بخش‌ها)
-                prompt = f"""You are a senior Persian fashion editor.
+                prompt = f"""You are a senior Persian fashion editor writing for a professional fashion publication.
 
-Write a magazine-quality Persian fashion news article.
+Write ONLY the clean Persian fashion news article. Do NOT add any introductory text, labels, headers, or extra phrases like "مقاله فارسی" or "##" or any other markup.
 
 Input:
 Title: {title}
@@ -121,29 +118,26 @@ Publish Date: {pub_date.strftime('%Y-%m-%d')}
 Instructions:
 1. Detect language: Translate English to fluent Persian. Keep Persian as is.
 2. Do NOT translate proper nouns (brands, designers, locations, events).
-3. Structure naturally – do NOT use any section labels like Headline, Lead, Body, Industry Perspective, etc.
-4. Start directly with a strong headline (8–14 words).
-5. Follow immediately with lead paragraph (1–2 sentences).
-6. Then write 2–4 body paragraphs with logical flow.
-7. End with 2–3 sentences neutral industry analysis (impact on market/designers/consumers).
-8. Tone: formal, engaging, journalistic.
-9. Length: 220–350 words.
-10. Use only input information – no speculation or added facts.
+3. Start directly with a strong headline (8–14 words).
+4. Follow immediately with lead paragraph (1–2 sentences).
+5. Write 2–4 body paragraphs with logical flow.
+6. End with 2–3 sentences neutral industry analysis (impact on market/designers/consumers).
+7. Tone: formal, engaging, journalistic.
+8. Length: 220–350 words.
+9. Use only input information – no speculation or added facts.
 
-Output ONLY the clean Persian article text (no extra labels or headers):
-[تیتر جذاب به فارسی]
-
-[پاراگراف لید]
-
-[بدنه خبر]
-
-[پاراگراف تحلیل کوتاه]
+Output ONLY the article text (headline followed by paragraphs, nothing else):
 """
 
                 content = await translate_with_openrouter(openrouter_client, prompt)
 
-                # فرمت نهایی پست: تصویر + تیتر فارسی + متن خبر + انتها لینک کانال با موضوع (بدون لینک خبر)
-                final_text = f"{content}\n\n@irfashionnews - مد و فشن ایرانی"
+                # اگر ترجمه شکست خورد، پست ارسال نشود
+                if "خطا" in content or "ترجمه موقت" in content:
+                    print(f"[WARN] ترجمه شکست خورد برای خبر: {title[:60]} - پست ارسال نمی‌شود")
+                    continue
+
+                # فرمت نهایی پست: تیتر فارسی + ایدی کانال + متن خبر + اسم کانال به فارسی
+                final_text = f"{content}\n\n@irfashionnews\nمد و فشن ایرانی"
 
                 try:
                     image_url = get_image_from_rss(entry)
@@ -166,25 +160,6 @@ Output ONLY the clean Persian article text (no extra labels or headers):
                     posted = True
                     print(f"[SUCCESS] پست موفق ارسال شد: {title[:60]}")
 
-                    # ارسال ۴ استیکر رندوم واکنش با emoji (عمومی تلگرام)
-                    reaction_emojis = [
-                        "👍", "🔥", "🌹", "❤️", "✨",
-                        "😍", "👏", "🌟", "💃", "👗",
-                        "👠", "👜", "🎀", "💅", "🥰"
-                    ]
-                    selected_emojis = random.sample(reaction_emojis, k=4)
-                    for emoji in selected_emojis:
-                        try:
-                            await bot.send_sticker(
-                                chat_id=chat_id,
-                                sticker=emoji,
-                                disable_notification=True
-                            )
-                        except Exception as sticker_err:
-                            print(f"[WARN] خطا در ارسال استیکر: {str(sticker_err)}")
-                    print("[INFO] ۴ استیکر واکنش عمومی ارسال شد")
-
-                    # ذخیره در دیتابیس
                     try:
                         databases.create_document(
                             database_id=database_id,
