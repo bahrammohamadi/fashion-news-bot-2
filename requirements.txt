@@ -1,6 +1,7 @@
-feedparser
+feedparser==6.0.11
 python-telegram-bot==20.8
 openai>=1.0.0
-appwrite>=1.5.0
-beautifulsoup4
-requests
+appwrite>=5.0.0
+beautifulsoup4==4.12.3
+requests==2.31.0
+lxml==5.2.1
