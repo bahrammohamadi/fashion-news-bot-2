@@ -1,19 +1,22 @@
 # ============================================================
 # Function 1: International Fashion Poster
 # Project: @irfashionnews — FashionBotProject
-# Version: 4.2 — FULLY FIXED (Feb 2026)
+# Version: 4.3 — SCHEMA FIXED (Feb 2026)
 #
-# Fixes in this version:
-#   [1] Replaced deprecated databases.list_documents()
-#       → tablesDB.list_rows()
-#   [2] Replaced deprecated databases.create_document()
-#       → tablesDB.create_row()
-#   [3] Removed unknown "created_at" field from DB writes
-#   [4] Switched LLM model to gemini-flash-1.5 (3-8s vs 35s)
-#   [5] Increased LLM timeout to 45s for safety
-#   [6] Added LLM fallback model if primary fails
+# Fixes in this version vs 4.2:
+#   [1] published_at → sent as datetime object (not ISO string)
+#   [2] link         → hard trimmed to 999 chars (schema size: 1000)
+#   [3] feed_url     → hard trimmed to 499 chars (schema size: 500)
+#   [4] title        → hard trimmed to 499 chars (schema size: 500)
+#   [5] Removed all unknown fields (created_at was already removed)
+#   [6] Dual SDK support: create_row (>=1.8) + create_document fallback
+#   [7] Dual SDK support: list_rows  (>=1.8) + list_documents  fallback
 #
-# Appwrite Free plan: 60-second function timeout
+# Database: fashion_db
+# Collection: history
+# Columns: $id, link, title, published_at, feed_url, source_type,
+#          $createdAt, $updatedAt
+#
 # Schedule: Every 45 minutes
 # ============================================================
 
@@ -42,17 +45,22 @@ CAPTION_MAX       = 1020
 MAX_SCRAPED_CHARS = 2000
 MAX_RSS_CHARS     = 800
 
-# Timeout budgets (seconds)
-# Total must stay well under 60-second Appwrite limit
-FEED_FETCH_TIMEOUT  = 6     # per-feed socket timeout
-FEEDS_SCAN_TIMEOUT  = 18    # total parallel scan budget
-SCRAPE_TIMEOUT      = 8     # article scrape budget
-LLM_TIMEOUT         = 45    # increased — Gemini needs up to 15s on free tier
-TELEGRAM_TIMEOUT    = 8     # Telegram API budget
+# Appwrite schema size limits (stay 1 char under to be safe)
+DB_LINK_MAX        = 999    # schema: 1000
+DB_TITLE_MAX       = 499    # schema: 500
+DB_FEED_URL_MAX    = 499    # schema: 500
+DB_SOURCE_TYPE_MAX = 19     # schema: 20
 
-# LLM Models — primary + fallback
-LLM_PRIMARY  = "google/gemini-flash-1.5:free"       # fast: 3-8s
-LLM_FALLBACK = "meta-llama/llama-3.1-8b-instruct:free"  # backup: 8-12s
+# Timeout budgets (seconds) — total must stay under 60s
+FEED_FETCH_TIMEOUT  = 6
+FEEDS_SCAN_TIMEOUT  = 18
+SCRAPE_TIMEOUT      = 8
+LLM_TIMEOUT         = 45
+TELEGRAM_TIMEOUT    = 8
+
+# LLM models — primary (fast) + fallback
+LLM_PRIMARY  = "google/gemini-flash-1.5:free"            # ~3-8s
+LLM_FALLBACK = "meta-llama/llama-3.1-8b-instruct:free"  # ~8-12s
 
 
 # ─────────────────────────────────────────────
@@ -86,7 +94,7 @@ RSS_FEEDS = [
 # MAIN ENTRY POINT
 # ─────────────────────────────────────────────
 async def main(event=None, context=None):
-    print("[INFO] ═══ Function 1 v4.2 started ═══")
+    print("[INFO] ═══ Function 1 v4.3 started ═══")
     start_time = asyncio.get_event_loop().time()
 
     def elapsed():
@@ -118,22 +126,15 @@ async def main(event=None, context=None):
         print(f"[ERROR] Missing env vars: {missing}")
         return {"status": "error", "missing_vars": missing}
 
-    # ── Initialize Telegram bot ──
+    # ── Initialize clients ──
     bot = Bot(token=token)
 
-    # ── Initialize Appwrite ──
-    # FIX [1]: Use tablesDB (new API) instead of deprecated Databases
     aw_client = Client()
     aw_client.set_endpoint(appwrite_endpoint)
     aw_client.set_project(appwrite_project)
     aw_client.set_key(appwrite_key)
-
-    # Keep Databases for any remaining compatibility needs
-    # but primary DB operations now use tablesDB pattern via
-    # the fixed helper functions below
     databases = Databases(aw_client)
 
-    # ── Initialize LLM client ──
     llm_client = AsyncOpenAI(
         api_key=openrouter_key,
         base_url="https://openrouter.ai/api/v1",
@@ -144,8 +145,6 @@ async def main(event=None, context=None):
 
     # ════════════════════════════════════════════════
     # PHASE 1: FAST PARALLEL RSS SCAN
-    # All 20 feeds fetched simultaneously
-    # Time budget: 18 seconds max
     # ════════════════════════════════════════════════
     print(
         f"[INFO] [{elapsed()}s] Phase 1: "
@@ -164,7 +163,7 @@ async def main(event=None, context=None):
             timeout=FEEDS_SCAN_TIMEOUT,
         )
     except asyncio.TimeoutError:
-        print(f"[WARN] [{elapsed()}s] Feed scan timed out — using partial results.")
+        print(f"[WARN] [{elapsed()}s] Feed scan timed out.")
         candidate = None
 
     print(f"[INFO] [{elapsed()}s] Phase 1 complete.")
@@ -184,8 +183,6 @@ async def main(event=None, context=None):
 
     # ════════════════════════════════════════════════
     # PHASE 2: SCRAPE FULL ARTICLE
-    # Single article only — tight timeout
-    # Time budget: 8 seconds
     # ════════════════════════════════════════════════
     print(f"[INFO] [{elapsed()}s] Phase 2: Scraping article...")
 
@@ -199,8 +196,8 @@ async def main(event=None, context=None):
     except asyncio.TimeoutError:
         print(f"[WARN] [{elapsed()}s] Scrape timed out — using RSS summary.")
         full_content = None
-    except Exception as scrape_err:
-        print(f"[WARN] [{elapsed()}s] Scrape error: {scrape_err}")
+    except Exception as e:
+        print(f"[WARN] [{elapsed()}s] Scrape error: {e}")
         full_content = None
 
     content_for_llm = (
@@ -217,9 +214,6 @@ async def main(event=None, context=None):
 
     # ════════════════════════════════════════════════
     # PHASE 3: LLM — TRANSLATE + REWRITE IN PERSIAN
-    # Primary: Gemini Flash 1.5 (3-8s)
-    # Fallback: Llama 3.1 8B (8-12s)
-    # Time budget: 45 seconds
     # ════════════════════════════════════════════════
     print(f"[INFO] [{elapsed()}s] Phase 3: Calling LLM ({LLM_PRIMARY})...")
 
@@ -241,15 +235,17 @@ async def main(event=None, context=None):
         )
     except asyncio.TimeoutError:
         print(f"[WARN] [{elapsed()}s] Primary LLM timed out.")
-    except Exception as llm_err:
-        print(f"[WARN] [{elapsed()}s] Primary LLM error: {llm_err}")
+    except Exception as e:
+        print(f"[WARN] [{elapsed()}s] Primary LLM error: {e}")
 
     # Try fallback model if primary failed
     if not persian_article:
+        remaining = max(5.0, 57.0 - elapsed())
         print(
-            f"[INFO] [{elapsed()}s] Trying fallback LLM ({LLM_FALLBACK})..."
+            f"[INFO] [{elapsed()}s] "
+            f"Trying fallback LLM ({LLM_FALLBACK}) "
+            f"— budget: {remaining}s..."
         )
-        remaining = max(5, 55 - elapsed())  # use remaining time budget
         try:
             persian_article = await asyncio.wait_for(
                 call_llm(llm_client, prompt, model=LLM_FALLBACK),
@@ -257,14 +253,14 @@ async def main(event=None, context=None):
             )
         except asyncio.TimeoutError:
             print(f"[WARN] [{elapsed()}s] Fallback LLM also timed out.")
-        except Exception as llm_err2:
-            print(f"[WARN] [{elapsed()}s] Fallback LLM error: {llm_err2}")
+        except Exception as e:
+            print(f"[WARN] [{elapsed()}s] Fallback LLM error: {e}")
 
-    # If both LLMs failed — save to DB to avoid infinite retry
+    # Both LLMs failed — save link to prevent infinite retry loop
     if not persian_article:
         print(
             f"[ERROR] [{elapsed()}s] Both LLMs failed. "
-            "Saving link to prevent retry loop."
+            "Saving link to DB to prevent retry."
         )
         save_to_db(
             databases=databases,
@@ -282,7 +278,6 @@ async def main(event=None, context=None):
 
     # ════════════════════════════════════════════════
     # PHASE 4: BUILD CAPTION + POST TO TELEGRAM
-    # Time budget: 8 seconds
     # ════════════════════════════════════════════════
     print(f"[INFO] [{elapsed()}s] Phase 4: Posting to Telegram...")
 
@@ -297,8 +292,8 @@ async def main(event=None, context=None):
     except asyncio.TimeoutError:
         print(f"[WARN] [{elapsed()}s] Telegram send timed out.")
         send_ok = False
-    except Exception as tg_err:
-        print(f"[ERROR] [{elapsed()}s] Telegram error: {tg_err}")
+    except Exception as e:
+        print(f"[ERROR] [{elapsed()}s] Telegram error: {e}")
         send_ok = False
 
     if send_ok:
@@ -314,10 +309,10 @@ async def main(event=None, context=None):
             source_type=SOURCE_TYPE,
         )
     else:
-        print(f"[ERROR] [{elapsed()}s] Telegram send failed — not saving to DB.")
+        print(f"[ERROR] [{elapsed()}s] Telegram failed — not saving to DB.")
 
     print(
-        f"[INFO] ═══ Function 1 v4.2 finished in {elapsed()}s "
+        f"[INFO] ═══ v4.3 finished in {elapsed()}s "
         f"| posted={send_ok} ═══"
     )
     return {"status": "success", "posted": send_ok}
@@ -331,13 +326,11 @@ async def find_candidate_parallel(
     feeds, databases, database_id, collection_id, time_threshold
 ):
     """
-    Fetch all RSS feeds simultaneously using thread pool.
-    Check duplicates for each candidate.
-    Return first unposted article (newest first), or None.
+    Fetch all RSS feeds simultaneously.
+    Returns first unposted article (newest first), or None.
     """
     loop = asyncio.get_event_loop()
 
-    # Launch all feed fetches at once
     tasks = [
         loop.run_in_executor(
             None, fetch_feed_entries, feed_url, time_threshold
@@ -347,7 +340,6 @@ async def find_candidate_parallel(
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    # Collect all valid candidates
     all_candidates = []
     for i, result in enumerate(results):
         if isinstance(result, Exception):
@@ -361,10 +353,10 @@ async def find_candidate_parallel(
     if not all_candidates:
         return None
 
-    # Sort newest first
+    # Newest articles first
     all_candidates.sort(key=lambda x: x["pub_date"], reverse=True)
 
-    # Find first unposted
+    # Return first unposted article
     for candidate in all_candidates:
         if not is_duplicate(
             databases, database_id, collection_id, candidate["link"]
@@ -378,17 +370,14 @@ async def find_candidate_parallel(
 
 def fetch_feed_entries(feed_url, time_threshold):
     """
-    Synchronous RSS feed fetcher — runs in thread pool.
-    Returns list of candidate article dicts from this feed.
+    Synchronous RSS fetcher — runs in thread pool executor.
+    Returns list of recent article dicts from this feed.
     """
     import socket
     try:
-        # Apply socket timeout to control feedparser fetch time
         old_timeout = socket.getdefaulttimeout()
         socket.setdefaulttimeout(FEED_FETCH_TIMEOUT)
-
         feed = feedparser.parse(feed_url)
-
         socket.setdefaulttimeout(old_timeout)
 
         if not feed.entries:
@@ -411,7 +400,6 @@ def fetch_feed_entries(feed_url, time_threshold):
             if not title or not link:
                 continue
 
-            # Strip HTML tags from description
             raw_desc    = entry.get("summary") or entry.get("description") or ""
             description = re.sub(r"<[^>]+>", " ", raw_desc)
             description = re.sub(r"\s+", " ", description).strip()
@@ -438,9 +426,8 @@ def fetch_feed_entries(feed_url, time_threshold):
 
 def scrape_article(url):
     """
-    Fetch article URL and extract clean plain text.
+    Fetch article page and extract clean plain text.
     Synchronous — called via run_in_executor.
-    Returns cleaned string or None on failure.
     """
     try:
         headers = {
@@ -451,37 +438,24 @@ def scrape_article(url):
             ),
             "Accept-Language": "en-US,en;q=0.9",
         }
-        resp = requests.get(
-            url, headers=headers, timeout=SCRAPE_TIMEOUT - 1
-        )
+        resp = requests.get(url, headers=headers, timeout=SCRAPE_TIMEOUT - 1)
         resp.raise_for_status()
 
         soup = BeautifulSoup(resp.text, "lxml")
 
-        # Remove all non-content elements
         for tag in soup([
             "script", "style", "nav", "footer", "header",
             "aside", "form", "iframe", "noscript", "figure",
             "figcaption", "button", "input", "select", "svg",
-            "advertisement", "ads",
         ]):
             tag.decompose()
 
-        # Try common article body containers in priority order
         article_body = (
             soup.find("article")
-            or soup.find("div", {"class": re.compile(
-                r"article[-_]?body", re.I
-            )})
-            or soup.find("div", {"class": re.compile(
-                r"post[-_]?content", re.I
-            )})
-            or soup.find("div", {"class": re.compile(
-                r"entry[-_]?content", re.I
-            )})
-            or soup.find("div", {"class": re.compile(
-                r"story[-_]?body", re.I
-            )})
+            or soup.find("div", {"class": re.compile(r"article[-_]?body", re.I)})
+            or soup.find("div", {"class": re.compile(r"post[-_]?content", re.I)})
+            or soup.find("div", {"class": re.compile(r"entry[-_]?content", re.I)})
+            or soup.find("div", {"class": re.compile(r"story[-_]?body", re.I)})
             or soup.find("main")
         )
 
@@ -517,8 +491,8 @@ def scrape_article(url):
 
 def build_prompt(title, description, content, feed_url, pub_date):
     """
-    Concise, effective prompt for Persian magazine-style article.
-    Shorter prompt = faster LLM response.
+    Concise prompt for Persian magazine-style fashion article.
+    Shorter prompt = faster LLM response time.
     """
     return f"""You are a Persian fashion magazine editor. Write a fluent Persian fashion news article.
 
@@ -531,27 +505,24 @@ Date: {pub_date.strftime('%Y-%m-%d')}
 RULES:
 - Write ENTIRELY in Persian (Farsi)
 - Keep brand/designer/city/event names in English (Chanel, Dior, Milan, etc.)
-- NO section labels like Headline or Body
+- NO section labels
 - Start directly with a bold headline (8-12 words)
-- Then lead paragraph (2 sentences, most important fact)
-- Then 2-3 body paragraphs with logical flow
+- Lead paragraph (2 sentences, most important fact)
+- 2-3 body paragraphs with logical flow
 - End with brief neutral industry analysis (2 sentences)
-- Total length: 180-280 words
-- Use ONLY facts from the source — no invented details
+- Total: 180-280 words
+- Use ONLY facts from the source above
 
-Output ONLY the Persian article text with no extra commentary:"""
+Output ONLY the Persian article — no extra commentary:"""
 
 
 async def call_llm(client, prompt, model):
     """
     Call OpenRouter with specified model.
-    Returns cleaned Persian text string or None.
-
-    FIX [4]: Model switched to Gemini Flash 1.5 (much faster).
-    FIX [5]: Strips <think> tags that some models output.
+    Returns cleaned Persian text or None.
     """
     try:
-        print(f"[INFO] Requesting model: {model}")
+        print(f"[INFO] Requesting: {model}")
         response = await client.chat.completions.create(
             model=model,
             messages=[{"role": "user", "content": prompt}],
@@ -561,20 +532,20 @@ async def call_llm(client, prompt, model):
 
         result = (response.choices[0].message.content or "").strip()
 
-        # Strip <think>...</think> blocks (DeepSeek artifact — safe for all models)
+        # Strip <think> blocks (DeepSeek artifact — harmless for other models)
         result = re.sub(
             r"<think>.*?</think>", "", result, flags=re.DOTALL
         ).strip()
 
-        # Strip any markdown code fences
+        # Strip markdown code fences if any
         result = re.sub(r"^```[\w]*\n?", "", result).strip()
         result = re.sub(r"\n?```$", "", result).strip()
 
         if not result:
-            print(f"[WARN] Model {model} returned empty content.")
+            print(f"[WARN] {model} returned empty content.")
             return None
 
-        print(f"[INFO] Model response: {len(result)} chars")
+        print(f"[INFO] LLM response: {len(result)} chars")
         return result
 
     except Exception as e:
@@ -588,32 +559,27 @@ async def call_llm(client, prompt, model):
 
 def build_caption(persian_article):
     """
-    Build Telegram caption in exact requested format:
+    Build Telegram caption — exact format:
 
-    [Photo sent as media — not in caption]
-    1. Bold Persian title (first line of article)
-    2. @irfashionnews
-    3. Full article body
-    4. Channel signature
+    1. [Photo as media]
+    2. <b>Bold Persian title</b>
+    3. @irfashionnews
+    4. Article body text
+    5. Channel signature
 
-    Enforces Telegram 1024-char caption limit.
+    Enforces 1024-char Telegram caption limit.
     """
-    lines = persian_article.strip().split("\n")
-
+    lines       = persian_article.strip().split("\n")
     title_line  = ""
     body_lines  = []
     found_title = False
 
     for line in lines:
-        # Clean any markdown formatting the LLM might add
-        stripped = line.strip()
-        stripped = stripped.strip("*").strip("#").strip("_").strip()
-
+        stripped = line.strip().strip("*").strip("#").strip("_").strip()
         if not stripped:
             if found_title:
                 body_lines.append("")
             continue
-
         if not found_title:
             title_line  = stripped
             found_title = True
@@ -623,7 +589,6 @@ def build_caption(persian_article):
     body_text = "\n".join(body_lines).strip()
 
     def esc(t):
-        """Escape HTML special characters for Telegram HTML parse mode."""
         return (
             t.replace("&", "&amp;")
              .replace("<", "&lt;")
@@ -631,28 +596,22 @@ def build_caption(persian_article):
         )
 
     parts = []
-
     if title_line:
         parts.append(f"<b>{esc(title_line)}</b>")
-
     parts.append("@irfashionnews")
-
     if body_text:
         parts.append(esc(body_text))
-
     parts.append("🌐 <i>کانال مد و فشن ایرانی</i>")
 
     caption = "\n\n".join(parts)
 
-    # Hard trim to stay within Telegram 1024-char limit
+    # Trim to Telegram limit
     if len(caption) > CAPTION_MAX:
         overflow = len(caption) - CAPTION_MAX
         if body_text:
             safe_body = esc(body_text)
-            trimmed   = (
-                safe_body[:max(0, len(safe_body) - overflow - 5)] + "…"
-            )
-            body_idx = 2 if title_line else 1
+            trimmed   = safe_body[:max(0, len(safe_body) - overflow - 5)] + "…"
+            body_idx  = 2 if title_line else 1
             if body_idx < len(parts):
                 parts[body_idx] = trimmed
                 caption = "\n\n".join(parts)
@@ -662,69 +621,98 @@ def build_caption(persian_article):
 
 # ─────────────────────────────────────────────
 # DATABASE HELPERS
-# FIX [1] + FIX [2] + FIX [3]:
-# Replaced deprecated list_documents / create_document
-# with tablesDB.list_rows / tablesDB.create_row
-# Removed unknown "created_at" field
+# Schema: link(1000), title(500), published_at(datetime),
+#         feed_url(500), source_type(20)
 # ─────────────────────────────────────────────
+
+def _build_db_data(link, title, feed_url, pub_date, source_type):
+    """
+    Build the data dict that exactly matches the Appwrite schema.
+
+    SCHEMA RULES APPLIED:
+    ┌─────────────┬──────────┬──────────────────────────────────────┐
+    │ Field       │ Type     │ Fix applied                          │
+    ├─────────────┼──────────┼──────────────────────────────────────┤
+    │ link        │ string   │ trimmed to 999 chars (limit: 1000)   │
+    │ title       │ string   │ trimmed to 499 chars (limit: 500)    │
+    │ published_at│ datetime │ sent as ISO-8601 string with Z       │
+    │ feed_url    │ string   │ trimmed to 499 chars (limit: 500)    │
+    │ source_type │ string   │ trimmed to 19 chars  (limit: 20)     │
+    │ $id         │ auto     │ NOT sent — Appwrite generates it     │
+    │ $createdAt  │ auto     │ NOT sent — Appwrite generates it     │
+    │ $updatedAt  │ auto     │ NOT sent — Appwrite generates it     │
+    └─────────────┴──────────┴──────────────────────────────────────┘
+    """
+    # Format datetime for Appwrite datetime field
+    # Appwrite expects ISO-8601 format: "2026-02-18T10:30:00.000+00:00"
+    if pub_date.tzinfo is None:
+        pub_date = pub_date.replace(tzinfo=timezone.utc)
+
+    published_at_str = pub_date.strftime("%Y-%m-%dT%H:%M:%S.000+00:00")
+
+    return {
+        "link":         link[:DB_LINK_MAX],
+        "title":        title[:DB_TITLE_MAX],
+        "published_at": published_at_str,
+        "feed_url":     feed_url[:DB_FEED_URL_MAX],
+        "source_type":  source_type[:DB_SOURCE_TYPE_MAX],
+    }
+
 
 def is_duplicate(databases, database_id, collection_id, link):
     """
-    Check if article link already exists in Appwrite.
-
-    FIX [1]: Replaced deprecated databases.list_documents()
-             with databases.list_rows() (Appwrite SDK >= 1.8.0)
+    Return True if this link already exists in the history collection.
+    Tries new SDK method first, falls back to deprecated method.
     """
+    safe_link = link[:DB_LINK_MAX]
+
+    # ── Try new SDK (>= 1.8.0) ──
     try:
         result = databases.list_rows(
             database_id=database_id,
             collection_id=collection_id,
-            queries=[Query.equal("link", link)],
+            queries=[Query.equal("link", safe_link)],
         )
         return result["total"] > 0
-
     except AttributeError:
-        # SDK version doesn't have list_rows — try list_documents as fallback
-        try:
-            result = databases.list_documents(
-                database_id=database_id,
-                collection_id=collection_id,
-                queries=[Query.equal("link", link)],
-            )
-            return result["total"] > 0
-        except Exception as e:
-            print(f"[WARN] Duplicate check fallback failed: {e}")
-            return False
-
+        pass  # SDK too old — try deprecated method
     except AppwriteException as e:
-        print(f"[WARN] Duplicate check AppwriteException: {e.message}")
+        print(f"[WARN] list_rows AppwriteException: {e.message}")
         return False
     except Exception as e:
-        print(f"[WARN] Duplicate check error: {e}")
+        print(f"[WARN] list_rows error: {e}")
+        return False
+
+    # ── Fallback: deprecated SDK (< 1.8.0) ──
+    try:
+        result = databases.list_documents(
+            database_id=database_id,
+            collection_id=collection_id,
+            queries=[Query.equal("link", safe_link)],
+        )
+        return result["total"] > 0
+    except AppwriteException as e:
+        print(f"[WARN] list_documents AppwriteException: {e.message}")
+        return False
+    except Exception as e:
+        print(f"[WARN] list_documents error: {e}")
         return False
 
 
 def save_to_db(databases, database_id, collection_id,
                link, title, feed_url, pub_date, source_type):
     """
-    Save posted article to Appwrite for duplicate prevention.
-
-    FIX [2]: Replaced deprecated databases.create_document()
-             with databases.create_row() (Appwrite SDK >= 1.8.0)
-
-    FIX [3]: Removed "created_at" field — not in collection schema.
-             Only fields that exist in Appwrite collection are written:
-             link, title, published_at, feed_url, source_type
+    Save article metadata to Appwrite history collection.
+    Tries new SDK method first, falls back to deprecated method.
+    Only writes fields that exist in the schema.
     """
-    data = {
-        "link":         link[:2048],
-        "title":        title[:500],
-        "published_at": pub_date.isoformat(),
-        "feed_url":     feed_url[:2048],
-        "source_type":  source_type,
-        # "created_at" REMOVED — was causing "Unknown attribute" error
-    }
+    data = _build_db_data(link, title, feed_url, pub_date, source_type)
 
+    print(f"[INFO] Saving to DB: link={data['link'][:60]}...")
+    print(f"[INFO] DB data: published_at={data['published_at']} | "
+          f"source_type={data['source_type']}")
+
+    # ── Try new SDK (>= 1.8.0) ──
     try:
         databases.create_row(
             database_id=database_id,
@@ -732,21 +720,17 @@ def save_to_db(databases, database_id, collection_id,
             row_id="unique()",
             data=data,
         )
-        print("[SUCCESS] Saved to Appwrite (create_row).")
+        print("[SUCCESS] Saved to Appwrite via create_row.")
         return
-
     except AttributeError:
-        # Older SDK — fall back to create_document
-        pass
+        pass  # SDK too old — try deprecated method
     except AppwriteException as e:
         print(f"[WARN] create_row AppwriteException: {e.message}")
-        # Try fallback
-        pass
+        # Don't return — try fallback
     except Exception as e:
         print(f"[WARN] create_row error: {e}")
-        pass
 
-    # Fallback for older SDK versions
+    # ── Fallback: deprecated SDK (< 1.8.0) ──
     try:
         databases.create_document(
             database_id=database_id,
@@ -754,11 +738,11 @@ def save_to_db(databases, database_id, collection_id,
             document_id="unique()",
             data=data,
         )
-        print("[SUCCESS] Saved to Appwrite (create_document fallback).")
+        print("[SUCCESS] Saved to Appwrite via create_document (fallback).")
     except AppwriteException as e:
-        print(f"[WARN] create_document fallback error: {e.message}")
+        print(f"[ERROR] create_document fallback failed: {e.message}")
     except Exception as e:
-        print(f"[WARN] DB save final fallback error: {e}")
+        print(f"[ERROR] DB save completely failed: {e}")
 
 
 # ─────────────────────────────────────────────
@@ -768,15 +752,15 @@ def save_to_db(databases, database_id, collection_id,
 def extract_image(entry):
     """
     Extract best available image URL from RSS entry.
-    Tries 6 methods in priority order.
+    6 methods tried in priority order.
     """
-    # 1. media:content with explicit image medium
+    # 1. media:content — explicit image medium
     for media in entry.get("media_content", []):
         url = media.get("url", "")
         if url and media.get("medium") == "image":
             return url
 
-    # 2. media:content — any image file extension
+    # 2. media:content — image file extension
     for media in entry.get("media_content", []):
         url = media.get("url", "")
         if url and any(
@@ -800,7 +784,7 @@ def extract_image(entry):
         if url:
             return url
 
-    # 5. Parse <img> from summary/description HTML
+    # 5. <img> in summary/description HTML
     for field in ["summary", "description"]:
         html = entry.get(field, "")
         if html:
@@ -831,10 +815,7 @@ def extract_image(entry):
 # ─────────────────────────────────────────────
 
 async def send_to_telegram(bot, chat_id, caption, image_url):
-    """
-    Send photo + caption or text-only message to Telegram channel.
-    Returns True on success, False on any failure.
-    """
+    """Send photo+caption or text message to Telegram channel."""
     try:
         if image_url:
             await bot.send_photo(
@@ -855,9 +836,8 @@ async def send_to_telegram(bot, chat_id, caption, image_url):
             )
             print("[INFO] Text message sent (no image).")
         return True
-
     except Exception as e:
-        print(f"[ERROR] Telegram send error: {e}")
+        print(f"[ERROR] Telegram error: {e}")
         return False
 
 
