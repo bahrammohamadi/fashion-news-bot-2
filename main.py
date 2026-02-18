@@ -1,19 +1,24 @@
 # ============================================================
 # Function 1: International Fashion Poster
 # Project: @irfashionnews — FashionBotProject
-# Version: 4.4 — Google Gemini Direct API (Feb 2026)
+# Version: 4.5 — FULLY FIXED (Feb 2026)
 #
-# Changes vs 4.3:
-#   [1] Replaced OpenRouter → Google Gemini API directly
-#       Uses GOOGLE_AI_KEY environment variable
-#       Uses google-generativeai library
-#   [2] Kept OpenRouter as fallback if Gemini fails
-#   [3] All schema fixes from v4.3 preserved
+# Fixes vs 4.4:
+#   [1] Replaced deprecated google.generativeai
+#       → google.genai (new official SDK)
+#   [2] Fixed model names for new SDK:
+#       gemini-1.5-flash   → gemini-2.0-flash
+#       gemini-1.5-flash-8b → gemini-2.0-flash-lite
+#   [3] Fixed Appwrite SDK — appwrite 5.x uses list_documents
+#       and create_document (list_rows/create_row don't exist yet)
+#       Removed confusing dual-SDK fallback logic
+#   [4] Fixed OpenRouter fallback model (was 404)
+#       → google/gemini-flash-1.5 via OpenRouter
 #
 # Database schema (history collection):
 #   link(1000), title(500), published_at(datetime),
 #   feed_url(500), source_type(20)
-#   $id, $createdAt, $updatedAt → auto-generated
+#   $id, $createdAt, $updatedAt → auto by Appwrite
 #
 # Schedule: Every 45 minutes
 # ============================================================
@@ -31,10 +36,11 @@ from appwrite.services.databases import Databases
 from appwrite.exception import AppwriteException
 from appwrite.query import Query
 
-# Google Gemini direct SDK
-import google.generativeai as genai
+# ── NEW Google Gemini SDK (replaces deprecated google.generativeai) ──
+from google import genai
+from google.genai import types
 
-# OpenRouter as fallback only
+# ── OpenRouter as fallback ──
 from openai import AsyncOpenAI
 
 
@@ -54,19 +60,20 @@ DB_TITLE_MAX       = 499
 DB_FEED_URL_MAX    = 499
 DB_SOURCE_TYPE_MAX = 19
 
-# Timeout budgets (seconds) — must total under 60s
+# Timeout budgets (seconds) — total must stay under 60s
 FEED_FETCH_TIMEOUT  = 6
 FEEDS_SCAN_TIMEOUT  = 18
 SCRAPE_TIMEOUT      = 8
-LLM_TIMEOUT         = 35    # Gemini direct is faster than OpenRouter
+LLM_TIMEOUT         = 35
 TELEGRAM_TIMEOUT    = 8
 
-# Google Gemini models (direct API)
-GEMINI_PRIMARY  = "gemini-1.5-flash"      # fastest, free tier
-GEMINI_FALLBACK = "gemini-1.5-flash-8b"  # even lighter if primary fails
+# ── Gemini model names (google.genai SDK) ──
+# These are the correct names for the NEW google.genai package
+GEMINI_PRIMARY  = "gemini-2.0-flash"       # fastest, free tier
+GEMINI_FALLBACK = "gemini-2.0-flash-lite"  # lighter fallback
 
-# OpenRouter fallback (only if Gemini completely fails)
-OPENROUTER_FALLBACK = "meta-llama/llama-3.1-8b-instruct:free"
+# ── OpenRouter fallback (if both Gemini models fail) ──
+OPENROUTER_FALLBACK = "google/gemini-flash-1.5"  # paid but cheap
 
 
 # ─────────────────────────────────────────────
@@ -100,7 +107,7 @@ RSS_FEEDS = [
 # MAIN ENTRY POINT
 # ─────────────────────────────────────────────
 async def main(event=None, context=None):
-    print("[INFO] ═══ Function 1 v4.4 started ═══")
+    print("[INFO] ═══ Function 1 v4.5 started ═══")
     start_time = asyncio.get_event_loop().time()
 
     def elapsed():
@@ -133,11 +140,12 @@ async def main(event=None, context=None):
         print(f"[ERROR] Missing env vars: {missing}")
         return {"status": "error", "missing_vars": missing}
 
-    # ── Configure Google Gemini ──
-    genai.configure(api_key=google_ai_key)
-    print("[INFO] Google Gemini SDK configured successfully.")
+    # ── Initialize Google Gemini (new SDK) ──
+    # FIX [1]: Use google.genai instead of google.generativeai
+    gemini_client = genai.Client(api_key=google_ai_key)
+    print("[INFO] google.genai Client initialized.")
 
-    # ── Configure OpenRouter as fallback ──
+    # ── Initialize OpenRouter fallback ──
     openrouter_client = None
     if openrouter_key:
         openrouter_client = AsyncOpenAI(
@@ -145,13 +153,13 @@ async def main(event=None, context=None):
             base_url="https://openrouter.ai/api/v1",
         )
         print("[INFO] OpenRouter fallback client ready.")
-    else:
-        print("[WARN] OPENROUTER_API_KEY not set — no fallback available.")
 
     # ── Initialize Telegram ──
     bot = Bot(token=token)
 
     # ── Initialize Appwrite ──
+    # FIX [3]: appwrite SDK 5.x uses list_documents + create_document
+    # list_rows / create_row do NOT exist in SDK 5.x
     aw_client = Client()
     aw_client.set_endpoint(appwrite_endpoint)
     aw_client.set_project(appwrite_project)
@@ -237,16 +245,19 @@ async def main(event=None, context=None):
     )
 
     # ════════════════════════════════════════════════
-    # PHASE 3: LLM — TRANSLATE + REWRITE IN PERSIAN
+    # PHASE 3: LLM TRANSLATION + PERSIAN REWRITE
     #
-    # Priority order:
-    #   1. Google Gemini 1.5 Flash (direct, fastest)
-    #   2. Google Gemini 1.5 Flash 8B (direct, lighter)
-    #   3. OpenRouter Llama fallback (if both Gemini fail)
+    # Priority:
+    #   1. Gemini 2.0 Flash        (google.genai direct)
+    #   2. Gemini 2.0 Flash Lite   (google.genai direct)
+    #   3. OpenRouter fallback     (if both Gemini fail)
     #
     # Budget: 35 seconds
     # ════════════════════════════════════════════════
-    print(f"[INFO] [{elapsed()}s] Phase 3: Calling Gemini ({GEMINI_PRIMARY})...")
+    print(
+        f"[INFO] [{elapsed()}s] "
+        f"Phase 3: Calling Gemini ({GEMINI_PRIMARY})..."
+    )
 
     prompt = build_prompt(
         title=title,
@@ -257,10 +268,10 @@ async def main(event=None, context=None):
 
     persian_article = None
 
-    # ── Try Gemini 1.5 Flash (primary) ──
+    # ── Try Gemini 2.0 Flash (primary) ──
     try:
         persian_article = await asyncio.wait_for(
-            call_gemini(model_name=GEMINI_PRIMARY, prompt=prompt),
+            call_gemini(gemini_client, prompt, GEMINI_PRIMARY),
             timeout=LLM_TIMEOUT,
         )
         if persian_article:
@@ -270,16 +281,17 @@ async def main(event=None, context=None):
     except Exception as e:
         print(f"[WARN] [{elapsed()}s] Gemini primary error: {e}")
 
-    # ── Try Gemini Flash 8B (fallback) ──
+    # ── Try Gemini 2.0 Flash Lite (fallback) ──
     if not persian_article:
+        remaining = max(5.0, 52.0 - elapsed())
         print(
             f"[INFO] [{elapsed()}s] "
-            f"Trying Gemini fallback ({GEMINI_FALLBACK})..."
+            f"Trying Gemini fallback ({GEMINI_FALLBACK}) "
+            f"— {remaining:.1f}s budget..."
         )
-        remaining = max(5.0, 52.0 - elapsed())
         try:
             persian_article = await asyncio.wait_for(
-                call_gemini(model_name=GEMINI_FALLBACK, prompt=prompt),
+                call_gemini(gemini_client, prompt, GEMINI_FALLBACK),
                 timeout=remaining,
             )
             if persian_article:
@@ -289,12 +301,13 @@ async def main(event=None, context=None):
         except Exception as e:
             print(f"[WARN] [{elapsed()}s] Gemini fallback error: {e}")
 
-    # ── Try OpenRouter as last resort ──
+    # ── Try OpenRouter (last resort) ──
     if not persian_article and openrouter_client:
         remaining = max(5.0, 56.0 - elapsed())
         print(
             f"[INFO] [{elapsed()}s] "
-            f"Trying OpenRouter last resort ({OPENROUTER_FALLBACK})..."
+            f"Trying OpenRouter ({OPENROUTER_FALLBACK}) "
+            f"— {remaining:.1f}s budget..."
         )
         try:
             persian_article = await asyncio.wait_for(
@@ -304,11 +317,11 @@ async def main(event=None, context=None):
                 timeout=remaining,
             )
             if persian_article:
-                print(f"[INFO] [{elapsed()}s] OpenRouter fallback succeeded.")
+                print(f"[INFO] [{elapsed()}s] OpenRouter succeeded.")
         except asyncio.TimeoutError:
-            print(f"[WARN] [{elapsed()}s] OpenRouter fallback timed out.")
+            print(f"[WARN] [{elapsed()}s] OpenRouter timed out.")
         except Exception as e:
-            print(f"[WARN] [{elapsed()}s] OpenRouter fallback error: {e}")
+            print(f"[WARN] [{elapsed()}s] OpenRouter error: {e}")
 
     # ── All LLMs failed ──
     if not persian_article:
@@ -339,9 +352,11 @@ async def main(event=None, context=None):
     caption   = build_caption(persian_article)
     image_url = extract_image(entry)
 
-    print(f"[INFO] [{elapsed()}s] Caption length: {len(caption)} chars")
-    print(f"[INFO] [{elapsed()}s] Image URL: "
-          f"{image_url[:70] if image_url else 'None'}")
+    print(f"[INFO] [{elapsed()}s] Caption: {len(caption)} chars")
+    print(
+        f"[INFO] [{elapsed()}s] Image: "
+        f"{image_url[:70] if image_url else 'None'}"
+    )
 
     try:
         send_ok = await asyncio.wait_for(
@@ -349,7 +364,7 @@ async def main(event=None, context=None):
             timeout=TELEGRAM_TIMEOUT,
         )
     except asyncio.TimeoutError:
-        print(f"[WARN] [{elapsed()}s] Telegram send timed out.")
+        print(f"[WARN] [{elapsed()}s] Telegram timed out.")
         send_ok = False
     except Exception as e:
         print(f"[ERROR] [{elapsed()}s] Telegram error: {e}")
@@ -368,10 +383,13 @@ async def main(event=None, context=None):
             source_type=SOURCE_TYPE,
         )
     else:
-        print(f"[ERROR] [{elapsed()}s] Telegram failed — not saving to DB.")
+        print(
+            f"[ERROR] [{elapsed()}s] "
+            "Telegram failed — not saving to DB."
+        )
 
     print(
-        f"[INFO] ═══ v4.4 finished in {elapsed()}s "
+        f"[INFO] ═══ v4.5 finished in {elapsed()}s "
         f"| posted={send_ok} ═══"
     )
     return {"status": "success", "posted": send_ok}
@@ -385,8 +403,8 @@ async def find_candidate_parallel(
     feeds, databases, database_id, collection_id, time_threshold
 ):
     """
-    Fetch all RSS feeds simultaneously using thread pool.
-    Returns first unposted article (newest first), or None.
+    Fetch all RSS feeds simultaneously.
+    Returns first unposted article (newest first) or None.
     """
     loop = asyncio.get_event_loop()
 
@@ -433,7 +451,7 @@ async def find_candidate_parallel(
 def fetch_feed_entries(feed_url, time_threshold):
     """
     Synchronous RSS fetcher — runs in thread pool.
-    Returns list of recent article dicts.
+    Returns list of recent article candidate dicts.
     """
     import socket
     try:
@@ -448,7 +466,8 @@ def fetch_feed_entries(feed_url, time_threshold):
         candidates = []
         for entry in feed.entries:
             published = (
-                entry.get("published_parsed") or entry.get("updated_parsed")
+                entry.get("published_parsed")
+                or entry.get("updated_parsed")
             )
             if not published:
                 continue
@@ -490,7 +509,7 @@ def fetch_feed_entries(feed_url, time_threshold):
 
 def scrape_article(url):
     """
-    Fetch article and extract clean text.
+    Fetch article page and extract clean plain text.
     Synchronous — called via run_in_executor.
     """
     try:
@@ -556,13 +575,13 @@ def scrape_article(url):
 
 
 # ─────────────────────────────────────────────
-# PHASE 3: LLM — PROMPT + CALLS
+# PHASE 3: PROMPT + LLM CALLS
 # ─────────────────────────────────────────────
 
 def build_prompt(title, description, content, pub_date):
     """
-    Concise, effective prompt for Persian magazine article.
-    Shorter prompt = faster LLM response.
+    Concise prompt for Persian magazine-style article.
+    Shorter = faster LLM response.
     """
     return f"""You are a Persian fashion magazine editor. Write a fluent Persian fashion news article.
 
@@ -575,7 +594,7 @@ Date: {pub_date.strftime('%Y-%m-%d')}
 RULES:
 - Write ENTIRELY in Persian (Farsi)
 - Keep brand/designer/city/event names in English (Chanel, Dior, Milan, etc.)
-- NO section labels like Headline or Body
+- NO section labels
 - Start directly with a bold headline (8-12 words)
 - Lead paragraph (2 sentences, most important fact)
 - 2-3 body paragraphs with logical flow
@@ -583,82 +602,56 @@ RULES:
 - Total: 180-280 words
 - Use ONLY facts from the source above
 
-Output ONLY the Persian article text — no extra commentary:"""
+Output ONLY the Persian article — no extra commentary:"""
 
 
-async def call_gemini(model_name, prompt):
+async def call_gemini(client, prompt, model_name):
     """
-    Call Google Gemini API directly using google-generativeai SDK.
-    Runs synchronous SDK call in thread pool to avoid blocking.
-    Returns cleaned Persian text or None.
+    Call Google Gemini using the NEW google.genai SDK.
+
+    FIX [1]: Uses google.genai.Client (not google.generativeai)
+    FIX [2]: Uses correct model names (gemini-2.0-flash etc.)
+
+    Runs blocking SDK call in thread pool executor.
+    Returns cleaned text string or None.
     """
     def _sync_call():
         try:
-            model = genai.GenerativeModel(
-                model_name=model_name,
-                generation_config=genai.types.GenerationConfig(
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config=types.GenerateContentConfig(
                     temperature=0.6,
                     max_output_tokens=700,
                     candidate_count=1,
                 ),
-                safety_settings=[
-                    {
-                        "category": "HARM_CATEGORY_HARASSMENT",
-                        "threshold": "BLOCK_NONE",
-                    },
-                    {
-                        "category": "HARM_CATEGORY_HATE_SPEECH",
-                        "threshold": "BLOCK_NONE",
-                    },
-                    {
-                        "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
-                        "threshold": "BLOCK_MEDIUM_AND_ABOVE",
-                    },
-                    {
-                        "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
-                        "threshold": "BLOCK_NONE",
-                    },
-                ],
             )
 
-            print(f"[INFO] Gemini model loaded: {model_name}")
-            response = model.generate_content(prompt)
-
-            # Extract text safely
-            if not response.candidates:
-                print(f"[WARN] Gemini {model_name}: no candidates returned.")
+            # Safely extract text
+            if not response or not response.text:
+                print(f"[WARN] Gemini {model_name}: empty response.")
                 return None
 
-            candidate = response.candidates[0]
-
-            # Check finish reason
-            finish_reason = str(candidate.finish_reason)
-            print(f"[INFO] Gemini finish_reason: {finish_reason}")
-
-            if "SAFETY" in finish_reason:
-                print(f"[WARN] Gemini blocked by safety filter.")
-                return None
-
-            result = response.text.strip() if response.text else ""
+            result = response.text.strip()
 
             if not result:
-                print(f"[WARN] Gemini {model_name}: empty text response.")
+                print(f"[WARN] Gemini {model_name}: blank text.")
                 return None
 
-            # Clean markdown artifacts
+            # Clean any markdown artifacts
             result = re.sub(r"^```[\w]*\n?", "", result).strip()
             result = re.sub(r"\n?```$", "", result).strip()
-            result = re.sub(
-                r"<think>.*?</think>", "", result, flags=re.DOTALL
-            ).strip()
 
+            print(
+                f"[INFO] Gemini {model_name} "
+                f"response: {len(result)} chars"
+            )
             return result
 
         except Exception as e:
             print(f"[ERROR] Gemini _sync_call ({model_name}): {e}")
             return None
 
-    # Run blocking SDK call in thread pool
     loop   = asyncio.get_event_loop()
     result = await loop.run_in_executor(None, _sync_call)
     return result
@@ -666,11 +659,11 @@ async def call_gemini(model_name, prompt):
 
 async def call_openrouter(client, prompt, model):
     """
-    Call OpenRouter API (fallback only).
+    Call OpenRouter API as last-resort fallback.
     Returns cleaned text or None.
     """
     try:
-        print(f"[INFO] OpenRouter model: {model}")
+        print(f"[INFO] OpenRouter requesting: {model}")
         response = await client.chat.completions.create(
             model=model,
             messages=[{"role": "user", "content": prompt}],
@@ -679,6 +672,8 @@ async def call_openrouter(client, prompt, model):
         )
 
         result = (response.choices[0].message.content or "").strip()
+
+        # Clean artifacts
         result = re.sub(
             r"<think>.*?</think>", "", result, flags=re.DOTALL
         ).strip()
@@ -693,7 +688,7 @@ async def call_openrouter(client, prompt, model):
         return result
 
     except Exception as e:
-        print(f"[ERROR] OpenRouter call failed ({model}): {e}")
+        print(f"[ERROR] OpenRouter ({model}): {e}")
         return None
 
 
@@ -705,7 +700,7 @@ def build_caption(persian_article):
     """
     Build Telegram caption:
     1. [Photo as media]
-    2. Bold Persian title
+    2. Bold Persian title (first line)
     3. @irfashionnews
     4. Article body
     5. Channel signature
@@ -772,29 +767,33 @@ def build_caption(persian_article):
 
 # ─────────────────────────────────────────────
 # DATABASE HELPERS
+# FIX [3]: appwrite SDK 5.x → use list_documents + create_document
+# list_rows / create_row do NOT exist in SDK 5.x
+# Schema: link(999), title(499), published_at(datetime),
+#         feed_url(499), source_type(19)
 # ─────────────────────────────────────────────
 
 def _build_db_data(link, title, feed_url, pub_date, source_type):
     """
     Build data dict that exactly matches Appwrite schema.
 
-    Schema:
-    ┌─────────────┬──────────┬─────────────────────────────────────┐
-    │ Field       │ Type     │ Rule                                │
-    ├─────────────┼──────────┼─────────────────────────────────────┤
-    │ link        │ string   │ max 999 chars                       │
-    │ title       │ string   │ max 499 chars                       │
-    │ published_at│ datetime │ ISO-8601 with timezone              │
-    │ feed_url    │ string   │ max 499 chars                       │
-    │ source_type │ string   │ max 19 chars                        │
-    │ $id         │ auto     │ NOT sent                            │
-    │ $createdAt  │ auto     │ NOT sent                            │
-    │ $updatedAt  │ auto     │ NOT sent                            │
-    └─────────────┴──────────┴─────────────────────────────────────┘
+    ┌─────────────┬──────────┬────────────────────────────────────┐
+    │ Field       │ Schema   │ What we send                       │
+    ├─────────────┼──────────┼────────────────────────────────────┤
+    │ link        │ str(1000)│ trimmed to 999                     │
+    │ title       │ str(500) │ trimmed to 499                     │
+    │ published_at│ datetime │ ISO-8601 "+00:00" format           │
+    │ feed_url    │ str(500) │ trimmed to 499                     │
+    │ source_type │ str(20)  │ "en" or "fa"                       │
+    │ $id         │ auto     │ NOT sent                           │
+    │ $createdAt  │ auto     │ NOT sent                           │
+    │ $updatedAt  │ auto     │ NOT sent                           │
+    └─────────────┴──────────┴────────────────────────────────────┘
     """
     if pub_date.tzinfo is None:
         pub_date = pub_date.replace(tzinfo=timezone.utc)
 
+    # Appwrite datetime format
     published_at_str = pub_date.strftime("%Y-%m-%dT%H:%M:%S.000+00:00")
 
     return {
@@ -807,27 +806,11 @@ def _build_db_data(link, title, feed_url, pub_date, source_type):
 
 
 def is_duplicate(databases, database_id, collection_id, link):
-    """Check if link exists in Appwrite. Tries new SDK then fallback."""
+    """
+    Check if article link already exists in history collection.
+    Uses list_documents (correct method for appwrite SDK 5.x).
+    """
     safe_link = link[:DB_LINK_MAX]
-
-    # New SDK (>= 1.8.0)
-    try:
-        result = databases.list_rows(
-            database_id=database_id,
-            collection_id=collection_id,
-            queries=[Query.equal("link", safe_link)],
-        )
-        return result["total"] > 0
-    except AttributeError:
-        pass
-    except AppwriteException as e:
-        print(f"[WARN] list_rows: {e.message}")
-        return False
-    except Exception as e:
-        print(f"[WARN] list_rows error: {e}")
-        return False
-
-    # Fallback deprecated SDK
     try:
         result = databases.list_documents(
             database_id=database_id,
@@ -835,42 +818,30 @@ def is_duplicate(databases, database_id, collection_id, link):
             queries=[Query.equal("link", safe_link)],
         )
         return result["total"] > 0
+
     except AppwriteException as e:
-        print(f"[WARN] list_documents: {e.message}")
+        print(f"[WARN] is_duplicate AppwriteException: {e.message}")
         return False
     except Exception as e:
-        print(f"[WARN] list_documents error: {e}")
+        print(f"[WARN] is_duplicate error: {e}")
         return False
 
 
 def save_to_db(databases, database_id, collection_id,
                link, title, feed_url, pub_date, source_type):
-    """Save article to Appwrite. Tries new SDK then fallback."""
+    """
+    Save article metadata to Appwrite.
+    Uses create_document (correct method for appwrite SDK 5.x).
+    Only sends fields that exist in schema.
+    """
     data = _build_db_data(link, title, feed_url, pub_date, source_type)
 
     print(
-        f"[INFO] Saving: link={data['link'][:60]} | "
-        f"published_at={data['published_at']}"
+        f"[INFO] Saving to DB → "
+        f"link: {data['link'][:60]} | "
+        f"published_at: {data['published_at']}"
     )
 
-    # New SDK (>= 1.8.0)
-    try:
-        databases.create_row(
-            database_id=database_id,
-            collection_id=collection_id,
-            row_id="unique()",
-            data=data,
-        )
-        print("[SUCCESS] Saved via create_row.")
-        return
-    except AttributeError:
-        pass
-    except AppwriteException as e:
-        print(f"[WARN] create_row: {e.message}")
-    except Exception as e:
-        print(f"[WARN] create_row error: {e}")
-
-    # Fallback deprecated SDK
     try:
         databases.create_document(
             database_id=database_id,
@@ -878,11 +849,12 @@ def save_to_db(databases, database_id, collection_id,
             document_id="unique()",
             data=data,
         )
-        print("[SUCCESS] Saved via create_document (fallback).")
+        print("[SUCCESS] Saved to Appwrite.")
+
     except AppwriteException as e:
-        print(f"[ERROR] create_document: {e.message}")
+        print(f"[ERROR] save_to_db AppwriteException: {e.message}")
     except Exception as e:
-        print(f"[ERROR] DB save failed completely: {e}")
+        print(f"[ERROR] save_to_db failed: {e}")
 
 
 # ─────────────────────────────────────────────
@@ -890,15 +862,17 @@ def save_to_db(databases, database_id, collection_id,
 # ─────────────────────────────────────────────
 
 def extract_image(entry):
-    """Extract best image URL from RSS entry — 6 methods."""
-
-    # 1. media:content explicit image
+    """
+    Extract best image URL from RSS entry.
+    Tries 6 methods in priority order.
+    """
+    # 1. media:content — explicit image medium
     for media in entry.get("media_content", []):
         url = media.get("url", "")
         if url and media.get("medium") == "image":
             return url
 
-    # 2. media:content image extension
+    # 2. media:content — image file extension
     for media in entry.get("media_content", []):
         url = media.get("url", "")
         if url and any(
@@ -907,7 +881,7 @@ def extract_image(entry):
         ):
             return url
 
-    # 3. enclosure
+    # 3. enclosure tag
     enc = entry.get("enclosure")
     if enc:
         enc_url  = enc.get("href") or enc.get("url", "")
@@ -922,7 +896,7 @@ def extract_image(entry):
         if url:
             return url
 
-    # 5. <img> in summary/description
+    # 5. <img> in summary/description HTML
     for field in ["summary", "description"]:
         html = entry.get(field, "")
         if html:
@@ -933,7 +907,7 @@ def extract_image(entry):
                 if src and src.startswith("http"):
                     return src
 
-    # 6. content:encoded
+    # 6. content:encoded field
     if hasattr(entry, "content") and entry.content:
         html = entry.content[0].get("value", "")
         if html:
@@ -944,7 +918,7 @@ def extract_image(entry):
                 if src and src.startswith("http"):
                     return src
 
-    print("[INFO] No image found.")
+    print("[INFO] No image found in RSS entry.")
     return None
 
 
@@ -953,7 +927,7 @@ def extract_image(entry):
 # ─────────────────────────────────────────────
 
 async def send_to_telegram(bot, chat_id, caption, image_url):
-    """Send photo+caption or text message to Telegram."""
+    """Send photo+caption or text message to Telegram channel."""
     try:
         if image_url:
             await bot.send_photo(
