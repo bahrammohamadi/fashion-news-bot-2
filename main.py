@@ -1,21 +1,19 @@
 # ============================================================
 # Function 1: International Fashion Poster
 # Project: @irfashionnews — FashionBotProject
-# Version: 4.3 — SCHEMA FIXED (Feb 2026)
+# Version: 4.4 — Google Gemini Direct API (Feb 2026)
 #
-# Fixes in this version vs 4.2:
-#   [1] published_at → sent as datetime object (not ISO string)
-#   [2] link         → hard trimmed to 999 chars (schema size: 1000)
-#   [3] feed_url     → hard trimmed to 499 chars (schema size: 500)
-#   [4] title        → hard trimmed to 499 chars (schema size: 500)
-#   [5] Removed all unknown fields (created_at was already removed)
-#   [6] Dual SDK support: create_row (>=1.8) + create_document fallback
-#   [7] Dual SDK support: list_rows  (>=1.8) + list_documents  fallback
+# Changes vs 4.3:
+#   [1] Replaced OpenRouter → Google Gemini API directly
+#       Uses GOOGLE_AI_KEY environment variable
+#       Uses google-generativeai library
+#   [2] Kept OpenRouter as fallback if Gemini fails
+#   [3] All schema fixes from v4.3 preserved
 #
-# Database: fashion_db
-# Collection: history
-# Columns: $id, link, title, published_at, feed_url, source_type,
-#          $createdAt, $updatedAt
+# Database schema (history collection):
+#   link(1000), title(500), published_at(datetime),
+#   feed_url(500), source_type(20)
+#   $id, $createdAt, $updatedAt → auto-generated
 #
 # Schedule: Every 45 minutes
 # ============================================================
@@ -32,6 +30,11 @@ from appwrite.client import Client
 from appwrite.services.databases import Databases
 from appwrite.exception import AppwriteException
 from appwrite.query import Query
+
+# Google Gemini direct SDK
+import google.generativeai as genai
+
+# OpenRouter as fallback only
 from openai import AsyncOpenAI
 
 
@@ -45,22 +48,25 @@ CAPTION_MAX       = 1020
 MAX_SCRAPED_CHARS = 2000
 MAX_RSS_CHARS     = 800
 
-# Appwrite schema size limits (stay 1 char under to be safe)
-DB_LINK_MAX        = 999    # schema: 1000
-DB_TITLE_MAX       = 499    # schema: 500
-DB_FEED_URL_MAX    = 499    # schema: 500
-DB_SOURCE_TYPE_MAX = 19     # schema: 20
+# Appwrite schema size limits (1 under max to be safe)
+DB_LINK_MAX        = 999
+DB_TITLE_MAX       = 499
+DB_FEED_URL_MAX    = 499
+DB_SOURCE_TYPE_MAX = 19
 
-# Timeout budgets (seconds) — total must stay under 60s
+# Timeout budgets (seconds) — must total under 60s
 FEED_FETCH_TIMEOUT  = 6
 FEEDS_SCAN_TIMEOUT  = 18
 SCRAPE_TIMEOUT      = 8
-LLM_TIMEOUT         = 45
+LLM_TIMEOUT         = 35    # Gemini direct is faster than OpenRouter
 TELEGRAM_TIMEOUT    = 8
 
-# LLM models — primary (fast) + fallback
-LLM_PRIMARY  = "google/gemini-flash-1.5:free"            # ~3-8s
-LLM_FALLBACK = "meta-llama/llama-3.1-8b-instruct:free"  # ~8-12s
+# Google Gemini models (direct API)
+GEMINI_PRIMARY  = "gemini-1.5-flash"      # fastest, free tier
+GEMINI_FALLBACK = "gemini-1.5-flash-8b"  # even lighter if primary fails
+
+# OpenRouter fallback (only if Gemini completely fails)
+OPENROUTER_FALLBACK = "meta-llama/llama-3.1-8b-instruct:free"
 
 
 # ─────────────────────────────────────────────
@@ -94,7 +100,7 @@ RSS_FEEDS = [
 # MAIN ENTRY POINT
 # ─────────────────────────────────────────────
 async def main(event=None, context=None):
-    print("[INFO] ═══ Function 1 v4.3 started ═══")
+    print("[INFO] ═══ Function 1 v4.4 started ═══")
     start_time = asyncio.get_event_loop().time()
 
     def elapsed():
@@ -109,9 +115,10 @@ async def main(event=None, context=None):
     appwrite_project  = os.environ.get("APPWRITE_PROJECT_ID")
     appwrite_key      = os.environ.get("APPWRITE_API_KEY")
     database_id       = os.environ.get("APPWRITE_DATABASE_ID")
+    google_ai_key     = os.environ.get("GOOGLE_AI_KEY")
     openrouter_key    = os.environ.get("OPENROUTER_API_KEY")
 
-    # ── Validate all required vars ──
+    # ── Validate required vars ──
     missing = [
         name for name, val in {
             "TELEGRAM_BOT_TOKEN":   token,
@@ -119,32 +126,44 @@ async def main(event=None, context=None):
             "APPWRITE_PROJECT_ID":  appwrite_project,
             "APPWRITE_API_KEY":     appwrite_key,
             "APPWRITE_DATABASE_ID": database_id,
-            "OPENROUTER_API_KEY":   openrouter_key,
+            "GOOGLE_AI_KEY":        google_ai_key,
         }.items() if not val
     ]
     if missing:
         print(f"[ERROR] Missing env vars: {missing}")
         return {"status": "error", "missing_vars": missing}
 
-    # ── Initialize clients ──
+    # ── Configure Google Gemini ──
+    genai.configure(api_key=google_ai_key)
+    print("[INFO] Google Gemini SDK configured successfully.")
+
+    # ── Configure OpenRouter as fallback ──
+    openrouter_client = None
+    if openrouter_key:
+        openrouter_client = AsyncOpenAI(
+            api_key=openrouter_key,
+            base_url="https://openrouter.ai/api/v1",
+        )
+        print("[INFO] OpenRouter fallback client ready.")
+    else:
+        print("[WARN] OPENROUTER_API_KEY not set — no fallback available.")
+
+    # ── Initialize Telegram ──
     bot = Bot(token=token)
 
+    # ── Initialize Appwrite ──
     aw_client = Client()
     aw_client.set_endpoint(appwrite_endpoint)
     aw_client.set_project(appwrite_project)
     aw_client.set_key(appwrite_key)
     databases = Databases(aw_client)
 
-    llm_client = AsyncOpenAI(
-        api_key=openrouter_key,
-        base_url="https://openrouter.ai/api/v1",
-    )
-
     now            = datetime.now(timezone.utc)
     time_threshold = now - timedelta(hours=ARTICLE_AGE_HOURS)
 
     # ════════════════════════════════════════════════
     # PHASE 1: FAST PARALLEL RSS SCAN
+    # Budget: 18 seconds
     # ════════════════════════════════════════════════
     print(
         f"[INFO] [{elapsed()}s] Phase 1: "
@@ -170,7 +189,11 @@ async def main(event=None, context=None):
 
     if not candidate:
         print("[INFO] No new unposted articles found.")
-        return {"status": "success", "posted": False, "reason": "no_new_articles"}
+        return {
+            "status": "success",
+            "posted": False,
+            "reason": "no_new_articles",
+        }
 
     title    = candidate["title"]
     link     = candidate["link"]
@@ -183,6 +206,7 @@ async def main(event=None, context=None):
 
     # ════════════════════════════════════════════════
     # PHASE 2: SCRAPE FULL ARTICLE
+    # Budget: 8 seconds
     # ════════════════════════════════════════════════
     print(f"[INFO] [{elapsed()}s] Phase 2: Scraping article...")
 
@@ -214,53 +238,83 @@ async def main(event=None, context=None):
 
     # ════════════════════════════════════════════════
     # PHASE 3: LLM — TRANSLATE + REWRITE IN PERSIAN
+    #
+    # Priority order:
+    #   1. Google Gemini 1.5 Flash (direct, fastest)
+    #   2. Google Gemini 1.5 Flash 8B (direct, lighter)
+    #   3. OpenRouter Llama fallback (if both Gemini fail)
+    #
+    # Budget: 35 seconds
     # ════════════════════════════════════════════════
-    print(f"[INFO] [{elapsed()}s] Phase 3: Calling LLM ({LLM_PRIMARY})...")
+    print(f"[INFO] [{elapsed()}s] Phase 3: Calling Gemini ({GEMINI_PRIMARY})...")
 
     prompt = build_prompt(
         title=title,
         description=desc,
         content=content_for_llm,
-        feed_url=feed_url,
         pub_date=pub_date,
     )
 
     persian_article = None
 
-    # Try primary model
+    # ── Try Gemini 1.5 Flash (primary) ──
     try:
         persian_article = await asyncio.wait_for(
-            call_llm(llm_client, prompt, model=LLM_PRIMARY),
+            call_gemini(model_name=GEMINI_PRIMARY, prompt=prompt),
             timeout=LLM_TIMEOUT,
         )
+        if persian_article:
+            print(f"[INFO] [{elapsed()}s] Gemini primary succeeded.")
     except asyncio.TimeoutError:
-        print(f"[WARN] [{elapsed()}s] Primary LLM timed out.")
+        print(f"[WARN] [{elapsed()}s] Gemini primary timed out.")
     except Exception as e:
-        print(f"[WARN] [{elapsed()}s] Primary LLM error: {e}")
+        print(f"[WARN] [{elapsed()}s] Gemini primary error: {e}")
 
-    # Try fallback model if primary failed
+    # ── Try Gemini Flash 8B (fallback) ──
     if not persian_article:
-        remaining = max(5.0, 57.0 - elapsed())
         print(
             f"[INFO] [{elapsed()}s] "
-            f"Trying fallback LLM ({LLM_FALLBACK}) "
-            f"— budget: {remaining}s..."
+            f"Trying Gemini fallback ({GEMINI_FALLBACK})..."
+        )
+        remaining = max(5.0, 52.0 - elapsed())
+        try:
+            persian_article = await asyncio.wait_for(
+                call_gemini(model_name=GEMINI_FALLBACK, prompt=prompt),
+                timeout=remaining,
+            )
+            if persian_article:
+                print(f"[INFO] [{elapsed()}s] Gemini fallback succeeded.")
+        except asyncio.TimeoutError:
+            print(f"[WARN] [{elapsed()}s] Gemini fallback timed out.")
+        except Exception as e:
+            print(f"[WARN] [{elapsed()}s] Gemini fallback error: {e}")
+
+    # ── Try OpenRouter as last resort ──
+    if not persian_article and openrouter_client:
+        remaining = max(5.0, 56.0 - elapsed())
+        print(
+            f"[INFO] [{elapsed()}s] "
+            f"Trying OpenRouter last resort ({OPENROUTER_FALLBACK})..."
         )
         try:
             persian_article = await asyncio.wait_for(
-                call_llm(llm_client, prompt, model=LLM_FALLBACK),
+                call_openrouter(
+                    openrouter_client, prompt, OPENROUTER_FALLBACK
+                ),
                 timeout=remaining,
             )
+            if persian_article:
+                print(f"[INFO] [{elapsed()}s] OpenRouter fallback succeeded.")
         except asyncio.TimeoutError:
-            print(f"[WARN] [{elapsed()}s] Fallback LLM also timed out.")
+            print(f"[WARN] [{elapsed()}s] OpenRouter fallback timed out.")
         except Exception as e:
-            print(f"[WARN] [{elapsed()}s] Fallback LLM error: {e}")
+            print(f"[WARN] [{elapsed()}s] OpenRouter fallback error: {e}")
 
-    # Both LLMs failed — save link to prevent infinite retry loop
+    # ── All LLMs failed ──
     if not persian_article:
         print(
-            f"[ERROR] [{elapsed()}s] Both LLMs failed. "
-            "Saving link to DB to prevent retry."
+            f"[ERROR] [{elapsed()}s] All LLMs failed. "
+            "Saving link to prevent retry loop."
         )
         save_to_db(
             databases=databases,
@@ -278,11 +332,16 @@ async def main(event=None, context=None):
 
     # ════════════════════════════════════════════════
     # PHASE 4: BUILD CAPTION + POST TO TELEGRAM
+    # Budget: 8 seconds
     # ════════════════════════════════════════════════
     print(f"[INFO] [{elapsed()}s] Phase 4: Posting to Telegram...")
 
     caption   = build_caption(persian_article)
     image_url = extract_image(entry)
+
+    print(f"[INFO] [{elapsed()}s] Caption length: {len(caption)} chars")
+    print(f"[INFO] [{elapsed()}s] Image URL: "
+          f"{image_url[:70] if image_url else 'None'}")
 
     try:
         send_ok = await asyncio.wait_for(
@@ -312,21 +371,21 @@ async def main(event=None, context=None):
         print(f"[ERROR] [{elapsed()}s] Telegram failed — not saving to DB.")
 
     print(
-        f"[INFO] ═══ v4.3 finished in {elapsed()}s "
+        f"[INFO] ═══ v4.4 finished in {elapsed()}s "
         f"| posted={send_ok} ═══"
     )
     return {"status": "success", "posted": send_ok}
 
 
 # ─────────────────────────────────────────────
-# PHASE 1 HELPERS: PARALLEL FEED SCANNING
+# PHASE 1: PARALLEL FEED SCANNING
 # ─────────────────────────────────────────────
 
 async def find_candidate_parallel(
     feeds, databases, database_id, collection_id, time_threshold
 ):
     """
-    Fetch all RSS feeds simultaneously.
+    Fetch all RSS feeds simultaneously using thread pool.
     Returns first unposted article (newest first), or None.
     """
     loop = asyncio.get_event_loop()
@@ -348,15 +407,18 @@ async def find_candidate_parallel(
         if result:
             all_candidates.extend(result)
 
-    print(f"[INFO] Found {len(all_candidates)} recent articles across all feeds.")
+    print(
+        f"[INFO] Found {len(all_candidates)} recent articles "
+        "across all feeds."
+    )
 
     if not all_candidates:
         return None
 
-    # Newest articles first
+    # Newest first
     all_candidates.sort(key=lambda x: x["pub_date"], reverse=True)
 
-    # Return first unposted article
+    # Return first unposted
     for candidate in all_candidates:
         if not is_duplicate(
             databases, database_id, collection_id, candidate["link"]
@@ -370,8 +432,8 @@ async def find_candidate_parallel(
 
 def fetch_feed_entries(feed_url, time_threshold):
     """
-    Synchronous RSS fetcher — runs in thread pool executor.
-    Returns list of recent article dicts from this feed.
+    Synchronous RSS fetcher — runs in thread pool.
+    Returns list of recent article dicts.
     """
     import socket
     try:
@@ -400,7 +462,9 @@ def fetch_feed_entries(feed_url, time_threshold):
             if not title or not link:
                 continue
 
-            raw_desc    = entry.get("summary") or entry.get("description") or ""
+            raw_desc    = (
+                entry.get("summary") or entry.get("description") or ""
+            )
             description = re.sub(r"<[^>]+>", " ", raw_desc)
             description = re.sub(r"\s+", " ", description).strip()
 
@@ -426,7 +490,7 @@ def fetch_feed_entries(feed_url, time_threshold):
 
 def scrape_article(url):
     """
-    Fetch article page and extract clean plain text.
+    Fetch article and extract clean text.
     Synchronous — called via run_in_executor.
     """
     try:
@@ -438,7 +502,9 @@ def scrape_article(url):
             ),
             "Accept-Language": "en-US,en;q=0.9",
         }
-        resp = requests.get(url, headers=headers, timeout=SCRAPE_TIMEOUT - 1)
+        resp = requests.get(
+            url, headers=headers, timeout=SCRAPE_TIMEOUT - 1
+        )
         resp.raise_for_status()
 
         soup = BeautifulSoup(resp.text, "lxml")
@@ -452,10 +518,14 @@ def scrape_article(url):
 
         article_body = (
             soup.find("article")
-            or soup.find("div", {"class": re.compile(r"article[-_]?body", re.I)})
-            or soup.find("div", {"class": re.compile(r"post[-_]?content", re.I)})
-            or soup.find("div", {"class": re.compile(r"entry[-_]?content", re.I)})
-            or soup.find("div", {"class": re.compile(r"story[-_]?body", re.I)})
+            or soup.find("div", {"class": re.compile(
+                r"article[-_]?body", re.I)})
+            or soup.find("div", {"class": re.compile(
+                r"post[-_]?content", re.I)})
+            or soup.find("div", {"class": re.compile(
+                r"entry[-_]?content", re.I)})
+            or soup.find("div", {"class": re.compile(
+                r"story[-_]?body", re.I)})
             or soup.find("main")
         )
 
@@ -486,13 +556,13 @@ def scrape_article(url):
 
 
 # ─────────────────────────────────────────────
-# PHASE 3: LLM PROMPT + CALL
+# PHASE 3: LLM — PROMPT + CALLS
 # ─────────────────────────────────────────────
 
-def build_prompt(title, description, content, feed_url, pub_date):
+def build_prompt(title, description, content, pub_date):
     """
-    Concise prompt for Persian magazine-style fashion article.
-    Shorter prompt = faster LLM response time.
+    Concise, effective prompt for Persian magazine article.
+    Shorter prompt = faster LLM response.
     """
     return f"""You are a Persian fashion magazine editor. Write a fluent Persian fashion news article.
 
@@ -505,7 +575,7 @@ Date: {pub_date.strftime('%Y-%m-%d')}
 RULES:
 - Write ENTIRELY in Persian (Farsi)
 - Keep brand/designer/city/event names in English (Chanel, Dior, Milan, etc.)
-- NO section labels
+- NO section labels like Headline or Body
 - Start directly with a bold headline (8-12 words)
 - Lead paragraph (2 sentences, most important fact)
 - 2-3 body paragraphs with logical flow
@@ -513,16 +583,94 @@ RULES:
 - Total: 180-280 words
 - Use ONLY facts from the source above
 
-Output ONLY the Persian article — no extra commentary:"""
+Output ONLY the Persian article text — no extra commentary:"""
 
 
-async def call_llm(client, prompt, model):
+async def call_gemini(model_name, prompt):
     """
-    Call OpenRouter with specified model.
+    Call Google Gemini API directly using google-generativeai SDK.
+    Runs synchronous SDK call in thread pool to avoid blocking.
     Returns cleaned Persian text or None.
     """
+    def _sync_call():
+        try:
+            model = genai.GenerativeModel(
+                model_name=model_name,
+                generation_config=genai.types.GenerationConfig(
+                    temperature=0.6,
+                    max_output_tokens=700,
+                    candidate_count=1,
+                ),
+                safety_settings=[
+                    {
+                        "category": "HARM_CATEGORY_HARASSMENT",
+                        "threshold": "BLOCK_NONE",
+                    },
+                    {
+                        "category": "HARM_CATEGORY_HATE_SPEECH",
+                        "threshold": "BLOCK_NONE",
+                    },
+                    {
+                        "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+                        "threshold": "BLOCK_MEDIUM_AND_ABOVE",
+                    },
+                    {
+                        "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
+                        "threshold": "BLOCK_NONE",
+                    },
+                ],
+            )
+
+            print(f"[INFO] Gemini model loaded: {model_name}")
+            response = model.generate_content(prompt)
+
+            # Extract text safely
+            if not response.candidates:
+                print(f"[WARN] Gemini {model_name}: no candidates returned.")
+                return None
+
+            candidate = response.candidates[0]
+
+            # Check finish reason
+            finish_reason = str(candidate.finish_reason)
+            print(f"[INFO] Gemini finish_reason: {finish_reason}")
+
+            if "SAFETY" in finish_reason:
+                print(f"[WARN] Gemini blocked by safety filter.")
+                return None
+
+            result = response.text.strip() if response.text else ""
+
+            if not result:
+                print(f"[WARN] Gemini {model_name}: empty text response.")
+                return None
+
+            # Clean markdown artifacts
+            result = re.sub(r"^```[\w]*\n?", "", result).strip()
+            result = re.sub(r"\n?```$", "", result).strip()
+            result = re.sub(
+                r"<think>.*?</think>", "", result, flags=re.DOTALL
+            ).strip()
+
+            return result
+
+        except Exception as e:
+            print(f"[ERROR] Gemini _sync_call ({model_name}): {e}")
+            return None
+
+    # Run blocking SDK call in thread pool
+    loop   = asyncio.get_event_loop()
+    result = await loop.run_in_executor(None, _sync_call)
+    return result
+
+
+async def call_openrouter(client, prompt, model):
+    """
+    Call OpenRouter API (fallback only).
+    Returns cleaned text or None.
+    """
     try:
-        print(f"[INFO] Requesting: {model}")
+        print(f"[INFO] OpenRouter model: {model}")
         response = await client.chat.completions.create(
             model=model,
             messages=[{"role": "user", "content": prompt}],
@@ -531,25 +679,21 @@ async def call_llm(client, prompt, model):
         )
 
         result = (response.choices[0].message.content or "").strip()
-
-        # Strip <think> blocks (DeepSeek artifact — harmless for other models)
         result = re.sub(
             r"<think>.*?</think>", "", result, flags=re.DOTALL
         ).strip()
-
-        # Strip markdown code fences if any
         result = re.sub(r"^```[\w]*\n?", "", result).strip()
         result = re.sub(r"\n?```$", "", result).strip()
 
         if not result:
-            print(f"[WARN] {model} returned empty content.")
+            print(f"[WARN] OpenRouter {model}: empty response.")
             return None
 
-        print(f"[INFO] LLM response: {len(result)} chars")
+        print(f"[INFO] OpenRouter response: {len(result)} chars")
         return result
 
     except Exception as e:
-        print(f"[ERROR] LLM call failed ({model}): {e}")
+        print(f"[ERROR] OpenRouter call failed ({model}): {e}")
         return None
 
 
@@ -559,15 +703,14 @@ async def call_llm(client, prompt, model):
 
 def build_caption(persian_article):
     """
-    Build Telegram caption — exact format:
-
+    Build Telegram caption:
     1. [Photo as media]
-    2. <b>Bold Persian title</b>
+    2. Bold Persian title
     3. @irfashionnews
-    4. Article body text
+    4. Article body
     5. Channel signature
 
-    Enforces 1024-char Telegram caption limit.
+    Enforces 1024-char Telegram limit.
     """
     lines       = persian_article.strip().split("\n")
     title_line  = ""
@@ -575,7 +718,13 @@ def build_caption(persian_article):
     found_title = False
 
     for line in lines:
-        stripped = line.strip().strip("*").strip("#").strip("_").strip()
+        stripped = (
+            line.strip()
+               .strip("*")
+               .strip("#")
+               .strip("_")
+               .strip()
+        )
         if not stripped:
             if found_title:
                 body_lines.append("")
@@ -605,13 +754,15 @@ def build_caption(persian_article):
 
     caption = "\n\n".join(parts)
 
-    # Trim to Telegram limit
+    # Trim to Telegram 1024-char limit
     if len(caption) > CAPTION_MAX:
         overflow = len(caption) - CAPTION_MAX
         if body_text:
             safe_body = esc(body_text)
-            trimmed   = safe_body[:max(0, len(safe_body) - overflow - 5)] + "…"
-            body_idx  = 2 if title_line else 1
+            trimmed   = (
+                safe_body[:max(0, len(safe_body) - overflow - 5)] + "…"
+            )
+            body_idx = 2 if title_line else 1
             if body_idx < len(parts):
                 parts[body_idx] = trimmed
                 caption = "\n\n".join(parts)
@@ -621,30 +772,26 @@ def build_caption(persian_article):
 
 # ─────────────────────────────────────────────
 # DATABASE HELPERS
-# Schema: link(1000), title(500), published_at(datetime),
-#         feed_url(500), source_type(20)
 # ─────────────────────────────────────────────
 
 def _build_db_data(link, title, feed_url, pub_date, source_type):
     """
-    Build the data dict that exactly matches the Appwrite schema.
+    Build data dict that exactly matches Appwrite schema.
 
-    SCHEMA RULES APPLIED:
-    ┌─────────────┬──────────┬──────────────────────────────────────┐
-    │ Field       │ Type     │ Fix applied                          │
-    ├─────────────┼──────────┼──────────────────────────────────────┤
-    │ link        │ string   │ trimmed to 999 chars (limit: 1000)   │
-    │ title       │ string   │ trimmed to 499 chars (limit: 500)    │
-    │ published_at│ datetime │ sent as ISO-8601 string with Z       │
-    │ feed_url    │ string   │ trimmed to 499 chars (limit: 500)    │
-    │ source_type │ string   │ trimmed to 19 chars  (limit: 20)     │
-    │ $id         │ auto     │ NOT sent — Appwrite generates it     │
-    │ $createdAt  │ auto     │ NOT sent — Appwrite generates it     │
-    │ $updatedAt  │ auto     │ NOT sent — Appwrite generates it     │
-    └─────────────┴──────────┴──────────────────────────────────────┘
+    Schema:
+    ┌─────────────┬──────────┬─────────────────────────────────────┐
+    │ Field       │ Type     │ Rule                                │
+    ├─────────────┼──────────┼─────────────────────────────────────┤
+    │ link        │ string   │ max 999 chars                       │
+    │ title       │ string   │ max 499 chars                       │
+    │ published_at│ datetime │ ISO-8601 with timezone              │
+    │ feed_url    │ string   │ max 499 chars                       │
+    │ source_type │ string   │ max 19 chars                        │
+    │ $id         │ auto     │ NOT sent                            │
+    │ $createdAt  │ auto     │ NOT sent                            │
+    │ $updatedAt  │ auto     │ NOT sent                            │
+    └─────────────┴──────────┴─────────────────────────────────────┘
     """
-    # Format datetime for Appwrite datetime field
-    # Appwrite expects ISO-8601 format: "2026-02-18T10:30:00.000+00:00"
     if pub_date.tzinfo is None:
         pub_date = pub_date.replace(tzinfo=timezone.utc)
 
@@ -660,13 +807,10 @@ def _build_db_data(link, title, feed_url, pub_date, source_type):
 
 
 def is_duplicate(databases, database_id, collection_id, link):
-    """
-    Return True if this link already exists in the history collection.
-    Tries new SDK method first, falls back to deprecated method.
-    """
+    """Check if link exists in Appwrite. Tries new SDK then fallback."""
     safe_link = link[:DB_LINK_MAX]
 
-    # ── Try new SDK (>= 1.8.0) ──
+    # New SDK (>= 1.8.0)
     try:
         result = databases.list_rows(
             database_id=database_id,
@@ -675,15 +819,15 @@ def is_duplicate(databases, database_id, collection_id, link):
         )
         return result["total"] > 0
     except AttributeError:
-        pass  # SDK too old — try deprecated method
+        pass
     except AppwriteException as e:
-        print(f"[WARN] list_rows AppwriteException: {e.message}")
+        print(f"[WARN] list_rows: {e.message}")
         return False
     except Exception as e:
         print(f"[WARN] list_rows error: {e}")
         return False
 
-    # ── Fallback: deprecated SDK (< 1.8.0) ──
+    # Fallback deprecated SDK
     try:
         result = databases.list_documents(
             database_id=database_id,
@@ -692,7 +836,7 @@ def is_duplicate(databases, database_id, collection_id, link):
         )
         return result["total"] > 0
     except AppwriteException as e:
-        print(f"[WARN] list_documents AppwriteException: {e.message}")
+        print(f"[WARN] list_documents: {e.message}")
         return False
     except Exception as e:
         print(f"[WARN] list_documents error: {e}")
@@ -701,18 +845,15 @@ def is_duplicate(databases, database_id, collection_id, link):
 
 def save_to_db(databases, database_id, collection_id,
                link, title, feed_url, pub_date, source_type):
-    """
-    Save article metadata to Appwrite history collection.
-    Tries new SDK method first, falls back to deprecated method.
-    Only writes fields that exist in the schema.
-    """
+    """Save article to Appwrite. Tries new SDK then fallback."""
     data = _build_db_data(link, title, feed_url, pub_date, source_type)
 
-    print(f"[INFO] Saving to DB: link={data['link'][:60]}...")
-    print(f"[INFO] DB data: published_at={data['published_at']} | "
-          f"source_type={data['source_type']}")
+    print(
+        f"[INFO] Saving: link={data['link'][:60]} | "
+        f"published_at={data['published_at']}"
+    )
 
-    # ── Try new SDK (>= 1.8.0) ──
+    # New SDK (>= 1.8.0)
     try:
         databases.create_row(
             database_id=database_id,
@@ -720,17 +861,16 @@ def save_to_db(databases, database_id, collection_id,
             row_id="unique()",
             data=data,
         )
-        print("[SUCCESS] Saved to Appwrite via create_row.")
+        print("[SUCCESS] Saved via create_row.")
         return
     except AttributeError:
-        pass  # SDK too old — try deprecated method
+        pass
     except AppwriteException as e:
-        print(f"[WARN] create_row AppwriteException: {e.message}")
-        # Don't return — try fallback
+        print(f"[WARN] create_row: {e.message}")
     except Exception as e:
         print(f"[WARN] create_row error: {e}")
 
-    # ── Fallback: deprecated SDK (< 1.8.0) ──
+    # Fallback deprecated SDK
     try:
         databases.create_document(
             database_id=database_id,
@@ -738,11 +878,11 @@ def save_to_db(databases, database_id, collection_id,
             document_id="unique()",
             data=data,
         )
-        print("[SUCCESS] Saved to Appwrite via create_document (fallback).")
+        print("[SUCCESS] Saved via create_document (fallback).")
     except AppwriteException as e:
-        print(f"[ERROR] create_document fallback failed: {e.message}")
+        print(f"[ERROR] create_document: {e.message}")
     except Exception as e:
-        print(f"[ERROR] DB save completely failed: {e}")
+        print(f"[ERROR] DB save failed completely: {e}")
 
 
 # ─────────────────────────────────────────────
@@ -750,17 +890,15 @@ def save_to_db(databases, database_id, collection_id,
 # ─────────────────────────────────────────────
 
 def extract_image(entry):
-    """
-    Extract best available image URL from RSS entry.
-    6 methods tried in priority order.
-    """
-    # 1. media:content — explicit image medium
+    """Extract best image URL from RSS entry — 6 methods."""
+
+    # 1. media:content explicit image
     for media in entry.get("media_content", []):
         url = media.get("url", "")
         if url and media.get("medium") == "image":
             return url
 
-    # 2. media:content — image file extension
+    # 2. media:content image extension
     for media in entry.get("media_content", []):
         url = media.get("url", "")
         if url and any(
@@ -769,7 +907,7 @@ def extract_image(entry):
         ):
             return url
 
-    # 3. enclosure tag
+    # 3. enclosure
     enc = entry.get("enclosure")
     if enc:
         enc_url  = enc.get("href") or enc.get("url", "")
@@ -784,7 +922,7 @@ def extract_image(entry):
         if url:
             return url
 
-    # 5. <img> in summary/description HTML
+    # 5. <img> in summary/description
     for field in ["summary", "description"]:
         html = entry.get(field, "")
         if html:
@@ -795,7 +933,7 @@ def extract_image(entry):
                 if src and src.startswith("http"):
                     return src
 
-    # 6. content:encoded field
+    # 6. content:encoded
     if hasattr(entry, "content") and entry.content:
         html = entry.content[0].get("value", "")
         if html:
@@ -806,7 +944,7 @@ def extract_image(entry):
                 if src and src.startswith("http"):
                     return src
 
-    print("[INFO] No image found in RSS entry.")
+    print("[INFO] No image found.")
     return None
 
 
@@ -815,7 +953,7 @@ def extract_image(entry):
 # ─────────────────────────────────────────────
 
 async def send_to_telegram(bot, chat_id, caption, image_url):
-    """Send photo+caption or text message to Telegram channel."""
+    """Send photo+caption or text message to Telegram."""
     try:
         if image_url:
             await bot.send_photo(
@@ -837,7 +975,7 @@ async def send_to_telegram(bot, chat_id, caption, image_url):
             print("[INFO] Text message sent (no image).")
         return True
     except Exception as e:
-        print(f"[ERROR] Telegram error: {e}")
+        print(f"[ERROR] Telegram: {e}")
         return False
 
 
