@@ -1,51 +1,40 @@
 # ============================================================
 # Function 1: International Fashion Poster
 # Project:    @irfashionnews — FashionBotProject
-# Version:    8.3 — OVER-FILTERING FIX
+# Version:    8.4 — CAPTION DUPLICATE + CONTENT EXTRACTION FIX
 # Runtime:    python-3.12 / Appwrite Cloud Functions
 # Timeout:    120 seconds
 #
-# Fixed in v8.3 vs v8.2:
+# Fixed in v8.4 vs v8.3:
 #
-#   [FIX-1] L4a domain dedup logic corrected.
-#           OLD (WRONG): domain added to seen_domains on ANY
-#                        candidate from that domain, including
-#                        ones already rejected by L1/L2/L3.
-#                        Result: domain "used up" by old posts,
-#                        blocking all fresh articles from same domain.
-#           NEW (CORRECT): domain only consumed when candidate
-#                          PASSES L1+L2+L3 and is selected.
-#                          Fresh articles from prolific domains
-#                          are no longer silently suppressed.
+#   [FIX-1] Duplicate caption / duplicate first image eliminated.
+#           ROOT CAUSE: images[0] was included in BOTH the album
+#           (send_media_group) and the captioned post (send_photo).
+#           Telegram rendered this as two separate image blocks,
+#           making the first image and caption appear twice.
+#           FIX: Album now sends images[1:] only.
+#                send_photo uses images[0] exclusively.
+#                No image appears in both messages.
 #
-#   [FIX-2] L4a scope clarified.
-#           Purpose: prevent posting TWO articles from the
-#           same domain in a single execution run.
-#           NOT: prevent any article from a domain that had
-#           a previously-posted article anywhere in history.
+#   [FIX-2] Content extraction now includes structured elements.
+#           OLD: only <p> tags collected → bullet lists, numbered
+#                lists, and section headers completely missing.
+#           NEW: collects <h2>, <h3>, <h4>, <li> in addition to
+#                <p>, preserving document order and structure.
+#                List items are prefixed with "• " for readability.
+#                Headers are prefixed with "▌ " as section markers.
+#                This captures "key points", trend lists, numbered
+#                fashion tips, and article sub-sections correctly.
 #
-#   [FIX-3] L4b (cross-run domain hash) made optional/relaxed.
-#           Cross-run domain blocking was set to 6 hours,
-#           which when combined with broken L4a was causing
-#           total silence. Raised to informational warning only
-#           — does not block candidates.
-#           Rationale: L1 (exact link) + L2 (content_hash)
-#           are sufficient cross-run duplicate protection.
-#           Domain-level cross-run blocking is too aggressive
-#           for prolific sources (vogue, whowhatwear, wwd).
+#   [FIX-3] DeprecationWarnings for list_documents suppressed
+#           at call site level in addition to module level,
+#           eliminating log noise from SDK legacy mode.
 #
-#   [FIX-4] SDK deprecation warnings suppressed globally.
-#           DeprecationWarning for list_documents is cosmetic
-#           and clutters logs. Suppressed at module level.
-#
-# Duplicate protection after fixes:
-#   L1:  exact link (blocks repost of same URL)         ← hard block
-#   L2:  content_hash (blocks same story, diff URL)     ← hard block
-#   L2b: title_hash legacy (backward compat)            ← hard block
-#   L3:  fuzzy Jaccard ≥ 0.65 (paraphrased titles)     ← hard block
-#   L4a: one article per domain PER RUN                 ← soft block
-#        (only applied after L1–L3 pass)
-#   L4b: domain cross-run (informational log only)      ← warning only
+# All v8.3 fixes preserved:
+#   - L4a domain dedup only on passing candidates
+#   - L4b cross-run domain check informational only
+#   - DB write before Telegram post (distributed lock)
+#   - Strict pre-flight duplicate check
 # ============================================================
 
 import os
@@ -70,8 +59,8 @@ from sumy.summarizers.lsa import LsaSummarizer
 from sumy.nlp.stemmers import Stemmer
 from sumy.utils import get_stop_words
 
-# Suppress Appwrite SDK deprecation warnings globally
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="appwrite")
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -123,11 +112,7 @@ IMAGE_BLOCKLIST  = [
 # Duplicate detection
 FUZZY_SIMILARITY_THRESHOLD = 0.65
 FUZZY_LOOKBACK_COUNT       = 150
-
-# [FIX-3] Domain cross-run dedup is now WARNING ONLY.
-# L1 + L2 handle true duplicate prevention.
-# L4b is purely informational.
-DOMAIN_DEDUP_HOURS = 6
+DOMAIN_DEDUP_HOURS         = 6
 
 TITLE_STOP_WORDS = {
     "a", "an", "the", "is", "are", "was", "were", "be", "been",
@@ -139,7 +124,7 @@ TITLE_STOP_WORDS = {
     "after", "new", "first", "last", "says", "said",
 }
 
-# Peak hours (UTC, mapped from Tehran UTC+3:30)
+# Peak hours UTC (Tehran UTC+3:30)
 PEAK_HOURS_UTC  = {4, 5, 6, 9, 10, 11, 16, 17, 18, 19}
 PEAK_HOUR_BONUS = 15
 
@@ -202,28 +187,28 @@ CONTENT_CATEGORIES = {
 }
 
 HASHTAG_MAP = {
-    "chanel":        "#Chanel #شنل",
-    "dior":          "#Dior #دیور",
-    "gucci":         "#Gucci #گوچی",
-    "prada":         "#Prada #پرادا",
-    "louis vuitton": "#LouisVuitton #لویی_ویتون",
-    "balenciaga":    "#Balenciaga #بالنسیاگا",
-    "versace":       "#Versace #ورساچه",
-    "zara":          "#Zara #زارا",
-    "hm":            "#HM #اچ_اند_ام",
-    "nike":          "#Nike #نایکی",
-    "adidas":        "#Adidas #آدیداس",
-    "runway":        "#Runway #رانوی",
-    "fashion week":  "#FashionWeek #هفته_مد",
-    "collection":    "#Collection #کالکشن",
-    "sustainability": "#Sustainability #مد_پایدار",
-    "beauty":        "#Beauty #زیبایی",
-    "trend":         "#Trend #ترند",
-    "style":         "#Style #استایل",
-    "celebrity":     "#Celebrity #سلبریتی",
-    "streetwear":    "#Streetwear #استریت_ویر",
-    "luxury":        "#Luxury #لاکچری",
-    "vintage":       "#Vintage #وینتیج",
+    "chanel":         "#Chanel #شنل",
+    "dior":           "#Dior #دیور",
+    "gucci":          "#Gucci #گوچی",
+    "prada":          "#Prada #پرادا",
+    "louis vuitton":  "#LouisVuitton #لویی_ویتون",
+    "balenciaga":     "#Balenciaga #بالنسیاگا",
+    "versace":        "#Versace #ورساچه",
+    "zara":           "#Zara #زارا",
+    "hm":             "#HM #اچ_اند_ام",
+    "nike":           "#Nike #نایکی",
+    "adidas":         "#Adidas #آدیداس",
+    "runway":         "#Runway #رانوی",
+    "fashion week":   "#FashionWeek #هفته_مد",
+    "collection":     "#Collection #کالکشن",
+    "sustainability":  "#Sustainability #مد_پایدار",
+    "beauty":         "#Beauty #زیبایی",
+    "trend":          "#Trend #ترند",
+    "style":          "#Style #استایل",
+    "celebrity":      "#Celebrity #سلبریتی",
+    "streetwear":     "#Streetwear #استریت_ویر",
+    "luxury":         "#Luxury #لاکچری",
+    "vintage":        "#Vintage #وینتیج",
 }
 MAX_HASHTAGS = 4
 
@@ -256,7 +241,7 @@ RSS_FEEDS = [
 # ═══════════════════════════════════════════════════════════
 
 async def main(event=None, context=None):
-    print("[INFO] ═══ Function 1 v8.3 started ═══")
+    print("[INFO] ═══ Function 1 v8.4 started ═══")
     loop       = asyncio.get_event_loop()
     start_time = loop.time()
 
@@ -311,7 +296,7 @@ async def main(event=None, context=None):
     )
     print(f"[INFO] [{elapsed()}s] {len(recent_titles)} titles loaded.")
 
-    # Phase 1: RSS scan
+    # ── Phase 1: RSS scan ──
     print(f"[INFO] [{elapsed()}s] Phase 1: Scanning {len(RSS_FEEDS)} feeds...")
     try:
         candidate = await asyncio.wait_for(
@@ -354,24 +339,21 @@ async def main(event=None, context=None):
         f"score={score} cat={category} | {title[:65]}"
     )
 
-    # Pre-flight strict re-check (race condition guard)
+    # ── Phase 1b: Pre-flight strict re-check ──
     print(f"[INFO] [{elapsed()}s] Pre-flight strict duplicate re-check...")
     is_dup, dup_reason = _strict_duplicate_check(
         databases, database_id, COLLECTION_ID,
         link, content_hash, title_hash, sdk_mode,
     )
     if is_dup:
-        print(
-            f"[WARN] [{elapsed()}s] "
-            f"Pre-flight caught duplicate ({dup_reason}). Abort."
-        )
+        print(f"[WARN] [{elapsed()}s] Pre-flight duplicate ({dup_reason}). Abort.")
         return {
             "status": "success",
             "posted": False,
             "reason": f"preflight_{dup_reason}",
         }
 
-    # Phase 5: Save to DB BEFORE posting (distributed lock)
+    # ── Phase 5: Save to DB BEFORE posting (distributed lock) ──
     print(f"[INFO] [{elapsed()}s] Phase 5: Saving to DB (pre-post lock)...")
     saved = _save_to_db(
         databases=databases,
@@ -391,15 +373,12 @@ async def main(event=None, context=None):
         domain_hash=domain_hash,
     )
     if not saved:
-        print(
-            f"[WARN] [{elapsed()}s] "
-            f"DB save failed — aborting to prevent duplicate post."
-        )
+        print(f"[WARN] [{elapsed()}s] DB save failed. Aborting.")
         return {"status": "error", "reason": "db_save_failed", "posted": False}
 
     print(f"[INFO] [{elapsed()}s] DB lock acquired.")
 
-    # Phase 2: Scrape
+    # ── Phase 2: Parallel scrape ──
     print(f"[INFO] [{elapsed()}s] Phase 2: Scraping text + images...")
     try:
         text_result, image_result = await asyncio.wait_for(
@@ -434,7 +413,7 @@ async def main(event=None, context=None):
         print(f"[WARN] [{elapsed()}s] Content too thin. DB record kept, no post.")
         return {"status": "skipped", "reason": "thin_content", "posted": False}
 
-    # Phase 3: Summarize + Translate
+    # ── Phase 3: Summarize + Translate ──
     print(f"[INFO] [{elapsed()}s] Phase 3: Summarize + Translate...")
     english_summary = await loop.run_in_executor(
         None, _extractive_summarize, content, SUMMARY_SENTENCES
@@ -462,7 +441,7 @@ async def main(event=None, context=None):
         f"title_fa={len(title_fa)}ch | body_fa={len(body_fa)}ch"
     )
 
-    # Phase 4: Build caption
+    # ── Phase 4: Build caption ──
     hashtags = _extract_hashtags(title, desc)
     caption  = _build_caption(title_fa, body_fa, hashtags, category)
 
@@ -472,7 +451,7 @@ async def main(event=None, context=None):
         f"Hashtags={len(hashtags)}"
     )
 
-    # Phase 6: Post to Telegram
+    # ── Phase 6: Post to Telegram ──
     print(f"[INFO] [{elapsed()}s] Phase 6: Posting to Telegram...")
     try:
         posted = await asyncio.wait_for(
@@ -480,7 +459,7 @@ async def main(event=None, context=None):
             timeout=TELEGRAM_TIMEOUT,
         )
     except asyncio.TimeoutError:
-        print(f"[WARN] [{elapsed()}s] Telegram post timed out.")
+        print(f"[WARN] [{elapsed()}s] Telegram timed out.")
         posted = False
     except Exception as e:
         print(f"[ERROR] [{elapsed()}s] Telegram unexpected: {e}")
@@ -494,7 +473,7 @@ async def main(event=None, context=None):
             f"DB record retained — article will not be retried."
         )
 
-    print(f"[INFO] ═══ v8.3 done in {elapsed()}s | posted={posted} ═══")
+    print(f"[INFO] ═══ v8.4 done in {elapsed()}s | posted={posted} ═══")
     return {"status": "success", "posted": posted}
 
 
@@ -506,17 +485,6 @@ async def _find_best_candidate(
     feeds, databases, database_id, collection_id,
     time_threshold, sdk_mode, now, recent_titles, is_peak,
 ):
-    """
-    Fetch all feeds in parallel, score all articles,
-    apply duplicate checks L1–L3, then L4a only on passing candidates.
-
-    KEY BEHAVIOR (v8.3 fix):
-      L4a (domain/run) is checked AFTER L1+L2+L3 pass.
-      A domain is only "consumed" when a candidate from that
-      domain has passed all content checks and is eligible.
-      Domains are NOT consumed by articles that were already
-      rejected by L1/L2/L3 — those are irrelevant old posts.
-    """
     loop  = asyncio.get_event_loop()
     tasks = [
         loop.run_in_executor(None, _fetch_feed, url, time_threshold)
@@ -536,7 +504,6 @@ async def _find_best_candidate(
     if not all_candidates:
         return None
 
-    # Score + categorize all
     for c in all_candidates:
         c["score"]    = _score_article(c, now, is_peak)
         c["category"] = _detect_category(c["title"], c["description"])
@@ -550,17 +517,16 @@ async def _find_best_candidate(
             f"{c['title'][:60]}"
         )
 
-    # [FIX-3] Load recent domain hashes — informational only
+    # L4b: load recent domain hashes (informational only)
     recent_domain_hashes = _load_recent_domain_hashes(
         databases, database_id, collection_id, sdk_mode
     )
     print(
-        f"[INFO] Recent domain hashes loaded: {len(recent_domain_hashes)} "
+        f"[INFO] Recent domain hashes: {len(recent_domain_hashes)} "
         f"(informational — does not block)"
     )
 
-    # [FIX-1] Domain tracking — only populated when a candidate
-    # PASSES L1+L2+L3. Does not inherit rejected candidates.
+    # [FIX-1 v8.3] Domain slot only consumed when candidate passes L1–L3
     seen_domains_this_run = set()
 
     for c in all_candidates:
@@ -617,21 +583,18 @@ async def _find_best_candidate(
             )
             continue
 
-        # ── L4b: Cross-run domain (informational only — does not block) ──
+        # ── L4b: Cross-run domain (informational only) ──
         if domain_hash in recent_domain_hashes:
             print(
                 f"[INFO] L4b domain seen recently ({domain}) "
-                f"— not blocking, continuing: {title[:50]}"
+                f"— not blocking: {title[:50]}"
             )
 
-        # ── L4a: Domain dedup within this run ──
-        # [FIX-1] Only reached here if L1+L2+L3 all passed.
-        # This domain slot is consumed by a genuinely new article.
+        # ── L4a: Domain dedup this run (only on passing candidates) ──
         if domain in seen_domains_this_run:
             print(f"[SKIP] L4a domain/run ({domain}): {title[:60]}")
             continue
 
-        # ── PASSED ALL CHECKS ──
         seen_domains_this_run.add(domain)
         print(
             f"[INFO] Candidate passed all checks "
@@ -802,11 +765,6 @@ def _strict_duplicate_check(
     databases, database_id, collection_id,
     link, content_hash, title_hash, sdk_mode,
 ):
-    """
-    Final check immediately before DB write.
-    Conservative: DB error → treat as duplicate → abort.
-    Returns (is_duplicate: bool, reason: str).
-    """
     for field, value in [
         ("link",         link[:DB_LINK_MAX]),
         ("content_hash", content_hash),
@@ -825,12 +783,6 @@ def _strict_duplicate_check(
 
 def _query_field(databases, database_id, collection_id,
                  field, value, sdk_mode):
-    """
-    Returns:
-      True  → record found
-      False → not found
-      None  → DB error
-    """
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", DeprecationWarning)
         try:
@@ -886,10 +838,6 @@ def _load_recent_titles(databases, database_id, collection_id,
 
 
 def _load_recent_domain_hashes(databases, database_id, collection_id, sdk_mode):
-    """
-    Load domain hashes posted within DOMAIN_DEDUP_HOURS.
-    Used for L4b informational logging only — does not block candidates.
-    """
     cutoff     = datetime.now(timezone.utc) - timedelta(hours=DOMAIN_DEDUP_HOURS)
     cutoff_str = cutoff.strftime("%Y-%m-%dT%H:%M:%S.000+00:00")
     with warnings.catch_warnings():
@@ -932,6 +880,16 @@ def _get_domain(url):
 # ═══════════════════════════════════════════════════════════
 
 def _scrape_text(url):
+    """
+    Scrape article body including:
+      - <p>  paragraph text
+      - <h2> <h3> <h4> section headers  → prefixed with "▌ "
+      - <li> list items (bullets/numbered) → prefixed with "• "
+
+    Elements are collected in document order to preserve
+    the structure of "key points" lists and numbered tips.
+    Short or boilerplate snippets are filtered out.
+    """
     try:
         resp = requests.get(
             url,
@@ -948,6 +906,7 @@ def _scrape_text(url):
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "lxml")
 
+        # Remove non-content chrome
         for tag in soup([
             "script", "style", "nav", "footer", "header",
             "aside", "form", "iframe", "noscript",
@@ -955,6 +914,7 @@ def _scrape_text(url):
         ]):
             tag.decompose()
 
+        # Find primary content container
         body = (
             soup.find("article")
             or soup.find("div", {"class": re.compile(r"article[-_]?body",  re.I)})
@@ -963,15 +923,59 @@ def _scrape_text(url):
             or soup.find("div", {"class": re.compile(r"story[-_]?body",     re.I)})
             or soup.find("main")
         )
+        area = body or soup
 
-        paragraphs = (body or soup).find_all("p")
-        text = " ".join(
-            p.get_text(" ").strip()
-            for p in paragraphs
-            if len(p.get_text().strip()) > 40
-        )
-        text = re.sub(r"\s+", " ", text).strip()
-        return text[:MAX_SCRAPED_CHARS] if len(text) >= 100 else None
+        # Collect content elements in document order
+        # Tags to extract: paragraphs, headers, list items
+        TARGET_TAGS = {"p", "h2", "h3", "h4", "li"}
+        lines       = []
+        seen_texts  = set()
+
+        for el in area.find_all(TARGET_TAGS):
+            raw_text = el.get_text(" ").strip()
+            raw_text = re.sub(r"\s+", " ", raw_text)
+
+            # Skip empty or very short elements
+            if len(raw_text) < 25:
+                continue
+
+            # Skip near-duplicate lines (same text in different wrappers)
+            normalized = raw_text.lower()[:80]
+            if normalized in seen_texts:
+                continue
+            seen_texts.add(normalized)
+
+            tag = el.name
+
+            if tag in ("h2", "h3", "h4"):
+                # Section header — short enough to include directly
+                lines.append(f"▌ {raw_text}")
+
+            elif tag == "li":
+                # List item — bullet prefix
+                # Skip nav/menu items: very short or all-caps
+                if len(raw_text) < 30:
+                    continue
+                lines.append(f"• {raw_text}")
+
+            else:
+                # Paragraph — include as-is
+                # Filter boilerplate patterns
+                lower = raw_text.lower()
+                if any(pat in lower for pat in [
+                    "subscribe", "newsletter", "sign up", "cookie",
+                    "privacy policy", "terms of service", "all rights reserved",
+                    "advertisement", "sponsored", "follow us", "share this",
+                    "read more", "click here", "tap here",
+                ]):
+                    continue
+                lines.append(raw_text)
+
+        text = "\n".join(lines).strip()
+
+        if len(text) >= 100:
+            return text[:MAX_SCRAPED_CHARS]
+        return None
 
     except requests.exceptions.Timeout:
         print(f"[WARN] Text scrape timeout: {url[:60]}")
@@ -985,6 +989,14 @@ def _scrape_text(url):
 
 
 def _scrape_images(url, rss_entry):
+    """
+    Collect article images.
+
+    [FIX-1] images[0] is reserved for the captioned send_photo.
+    The album (send_media_group) uses images[1:].
+    Therefore we still collect all images here — the split
+    is handled in _post_to_telegram, not here.
+    """
     images = []
     seen   = set()
 
@@ -1111,6 +1123,14 @@ def _extract_rss_image(entry):
 # ═══════════════════════════════════════════════════════════
 
 def _extractive_summarize(text, sentence_count=8):
+    """
+    Offline extractive summarization via sumy LsaSummarizer.
+
+    Note: sumy splits on sentence boundaries — structured lines
+    prefixed with "▌" and "•" are treated as sentences and
+    may be selected by the summarizer if they score highly,
+    preserving key points in the summary.
+    """
     try:
         parser     = PlaintextParser.from_string(text, Tokenizer("english"))
         stemmer    = Stemmer("english")
@@ -1255,23 +1275,39 @@ def _build_caption(title_fa, body_fa, hashtags, category):
 # SECTION 8 — TELEGRAM POSTING
 #
 # MANDATORY ORDER (project spec):
-#   Step 1: send_media_group(ALL images, NO caption)
+#   Step 1: send_media_group(images[1:], NO caption)
 #   Step 2: sleep(0.8s)
 #   Step 3: send_photo(images[0] + caption)
 #
-# Caption appears EXACTLY ONCE — on send_photo only.
-# Album step is non-fatal if it fails.
+# [FIX-1] images[0] is EXCLUDED from the album.
+#         images[0] appears ONLY in the captioned send_photo.
+#         This prevents the first image from appearing twice
+#         (once in album, once as captioned photo), which was
+#         the root cause of the "duplicate caption" visual.
+#
+# Album step (Step 1) is non-fatal if it fails.
+# Caption step (Step 3) is the primary deliverable.
 # ═══════════════════════════════════════════════════════════
 
 async def _post_to_telegram(bot, chat_id, caption, image_urls):
-    caption_image = image_urls[0] if image_urls else None
+    """
+    Step 1: Album of images[1:]  — NO caption, no first image
+    Step 2: sleep(0.8s)
+    Step 3: send_photo(images[0] + caption)
 
-    # Step 1: Album (no caption)
-    if len(image_urls) >= 2:
+    images[0] is the lead/captioned photo.
+    images[1:] form the supplemental album.
+    No image ever appears in both messages.
+    """
+    caption_image  = image_urls[0]  if image_urls       else None
+    album_images   = image_urls[1:] if len(image_urls) > 1 else []
+
+    # ── Step 1: Supplemental album (images[1:], no caption) ──
+    if album_images:
         try:
             media_group = [
                 InputMediaPhoto(media=url)
-                for url in image_urls[:MAX_IMAGES]
+                for url in album_images[:MAX_IMAGES - 1]
             ]
             await bot.send_media_group(
                 chat_id=chat_id,
@@ -1280,21 +1316,22 @@ async def _post_to_telegram(bot, chat_id, caption, image_urls):
             )
             print(
                 f"[INFO] Step 1: Album sent "
-                f"({len(media_group)} images, no caption)."
+                f"({len(media_group)} images, no caption). "
+                f"Note: images[0] excluded — reserved for caption post."
             )
         except Exception as e:
             print(f"[WARN] Step 1 album failed (non-fatal): {str(e)[:120]}")
     else:
         print(
-            f"[INFO] Step 1: Skipped "
-            f"({'1 image' if image_urls else 'no images'} — album needs ≥2)."
+            "[INFO] Step 1: Skipped "
+            f"(only {len(image_urls)} image(s) — album needs ≥2 total)."
         )
 
-    # Delay between album and caption post
-    if len(image_urls) >= 2:
+    # ── Delay between album and caption post ──
+    if album_images:
         await asyncio.sleep(0.8)
 
-    # Step 2: Captioned photo (primary post)
+    # ── Step 2: Captioned photo (images[0] only) ──
     try:
         if caption_image:
             await bot.send_photo(
@@ -1304,7 +1341,7 @@ async def _post_to_telegram(bot, chat_id, caption, image_urls):
                 parse_mode="HTML",
                 disable_notification=True,
             )
-            print("[INFO] Step 2: Caption photo sent.")
+            print("[INFO] Step 2: Caption photo sent (images[0] + caption).")
         else:
             await bot.send_message(
                 chat_id=chat_id,
@@ -1313,7 +1350,7 @@ async def _post_to_telegram(bot, chat_id, caption, image_urls):
                 link_preview_options=LinkPreviewOptions(is_disabled=True),
                 disable_notification=True,
             )
-            print("[INFO] Step 2: Text-only caption sent.")
+            print("[INFO] Step 2: Text-only caption sent (no images).")
         return True
 
     except Exception as e:
@@ -1365,10 +1402,6 @@ def _save_to_db(
     sdk_mode, title_hash, content_hash,
     category, trend_score, post_hour, domain_hash,
 ):
-    """
-    Returns True on success, False on failure.
-    Caller aborts posting on False.
-    """
     payload = _build_db_payload(
         link, title, feed_url, pub_date, source_type,
         title_hash, content_hash, category,
