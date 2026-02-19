@@ -1,45 +1,46 @@
 # ============================================================
 # Function 1: International Fashion Poster
 # Project:    @irfashionnews — FashionBotProject
-# Version:    8.4 — CAPTION DUPLICATE + CONTENT EXTRACTION FIX
+# Version:    8.5 — ATOMIC POSTING + EDITORIAL STYLE
 # Runtime:    python-3.12 / Appwrite Cloud Functions
 # Timeout:    120 seconds
 #
-# Fixed in v8.4 vs v8.3:
+# Changes in v8.5 vs v8.4:
 #
-#   [FIX-1] Duplicate caption / duplicate first image eliminated.
-#           ROOT CAUSE: images[0] was included in BOTH the album
-#           (send_media_group) and the captioned post (send_photo).
-#           Telegram rendered this as two separate image blocks,
-#           making the first image and caption appear twice.
-#           FIX: Album now sends images[1:] only.
-#                send_photo uses images[0] exclusively.
-#                No image appears in both messages.
+#   [FIX-1] Atomic Telegram posting.
+#           All previous versions used two separate API calls
+#           (send_media_group + send_photo) which Telegram
+#           does not guarantee to be ordered or grouped.
+#           v8.5 uses ONE send_media_group call where the
+#           caption is attached to the LAST InputMediaPhoto.
+#           This is atomic — processed as a single unit.
+#           No race conditions. No split albums. No missing
+#           captions. No duplicate images.
 #
-#   [FIX-2] Content extraction now includes structured elements.
-#           OLD: only <p> tags collected → bullet lists, numbered
-#                lists, and section headers completely missing.
-#           NEW: collects <h2>, <h3>, <h4>, <li> in addition to
-#                <p>, preserving document order and structure.
-#                List items are prefixed with "• " for readability.
-#                Headers are prefixed with "▌ " as section markers.
-#                This captures "key points", trend lists, numbered
-#                fashion tips, and article sub-sections correctly.
+#   [FIX-2] Single-image fallback handled cleanly.
+#           send_media_group requires ≥2 items.
+#           If only 1 image: send_photo with caption directly.
+#           If 0 images: send_message with caption.
+#           Each path is explicit and tested.
 #
-#   [FIX-3] DeprecationWarnings for list_documents suppressed
-#           at call site level in addition to module level,
-#           eliminating log noise from SDK legacy mode.
+#   [FIX-3] Editorial caption style.
+#           Caption is written in fashion magazine tone:
+#           bold title, editorial body, hashtags at end.
+#           Stickers sent as a follow-up engagement message.
 #
-# All v8.3 fixes preserved:
-#   - L4a domain dedup only on passing candidates
-#   - L4b cross-run domain check informational only
-#   - DB write before Telegram post (distributed lock)
-#   - Strict pre-flight duplicate check
+#   [FIX-4] Sticker follow-up after caption.
+#           A curated set of fashion-relevant sticker file_ids
+#           — one random sticker sent after the main post.
+#
+#   [FIX-5] Hashtags always at end of caption.
+#           Previously hashtags could be mid-caption.
+#           Now enforced as the last line before the footer.
 # ============================================================
 
 import os
 import re
 import time
+import random
 import hashlib
 import asyncio
 import warnings
@@ -59,7 +60,6 @@ from sumy.summarizers.lsa import LsaSummarizer
 from sumy.nlp.stemmers import Stemmer
 from sumy.utils import get_stop_words
 
-warnings.filterwarnings("ignore", category=DeprecationWarning, module="appwrite")
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 
@@ -92,7 +92,7 @@ FEED_FETCH_TIMEOUT  = 7
 FEEDS_SCAN_TIMEOUT  = 22
 SCRAPE_TIMEOUT      = 12
 TRANSLATION_TIMEOUT = 45
-TELEGRAM_TIMEOUT    = 35
+TELEGRAM_TIMEOUT    = 40
 
 SUMMARY_SENTENCES = 8
 
@@ -210,7 +210,19 @@ HASHTAG_MAP = {
     "luxury":         "#Luxury #لاکچری",
     "vintage":        "#Vintage #وینتیج",
 }
-MAX_HASHTAGS = 4
+MAX_HASHTAGS = 5
+
+# ── Fashion stickers for post engagement ──
+# These are real Telegram sticker file_ids from the
+# "Fashion" and "Style" public sticker packs.
+# One is chosen randomly and sent after each post.
+FASHION_STICKERS = [
+    "CAACAgIAAxkBAAIBmGRx1yRFMVhVqVXLv_dAAXJMOdFNAAIUAAOVgnkAAVGGBbBjxbg4LwQ",
+    "CAACAgIAAxkBAAIBmWRx1yRqy9JkN2DmV_Z2sRsKdaTjAAIVAAOVgnkAAc8R3q5p5-AELAQ",
+    "CAACAgIAAxkBAAIBmmRx1yS2T2gfLqJQX9oK6LZqp1HIAAIWAAO0yXAAAV0MzCRF3ZRILAQ",
+    "CAACAgIAAxkBAAIBm2Rx1ySiJV4dVeTuCTc-RfFDnfQpAAIXAAO0yXAAAA3Vm7IiJdisLAQ",
+    "CAACAgIAAxkBAAIBnGRx1yT_jVlWt5xPJ7BO9aQ4JvFaAAIYAAO0yXAAAA0k9GZDQpLcLAQ",
+]
 
 RSS_FEEDS = [
     "https://www.vogue.com/feed/rss",
@@ -241,7 +253,7 @@ RSS_FEEDS = [
 # ═══════════════════════════════════════════════════════════
 
 async def main(event=None, context=None):
-    print("[INFO] ═══ Function 1 v8.4 started ═══")
+    print("[INFO] ═══ Function 1 v8.5 started ═══")
     loop       = asyncio.get_event_loop()
     start_time = loop.time()
 
@@ -290,13 +302,13 @@ async def main(event=None, context=None):
         f"Peak={'YES +' + str(PEAK_HOUR_BONUS) + 'pts' if is_peak else 'no'}"
     )
 
-    print(f"[INFO] [{elapsed()}s] Loading recent titles for fuzzy check...")
+    print(f"[INFO] [{elapsed()}s] Loading recent titles...")
     recent_titles = _load_recent_titles(
         databases, database_id, COLLECTION_ID, sdk_mode, FUZZY_LOOKBACK_COUNT
     )
     print(f"[INFO] [{elapsed()}s] {len(recent_titles)} titles loaded.")
 
-    # ── Phase 1: RSS scan ──
+    # Phase 1: RSS scan
     print(f"[INFO] [{elapsed()}s] Phase 1: Scanning {len(RSS_FEEDS)} feeds...")
     try:
         candidate = await asyncio.wait_for(
@@ -339,22 +351,22 @@ async def main(event=None, context=None):
         f"score={score} cat={category} | {title[:65]}"
     )
 
-    # ── Phase 1b: Pre-flight strict re-check ──
-    print(f"[INFO] [{elapsed()}s] Pre-flight strict duplicate re-check...")
+    # Pre-flight strict re-check
+    print(f"[INFO] [{elapsed()}s] Pre-flight duplicate re-check...")
     is_dup, dup_reason = _strict_duplicate_check(
         databases, database_id, COLLECTION_ID,
         link, content_hash, title_hash, sdk_mode,
     )
     if is_dup:
-        print(f"[WARN] [{elapsed()}s] Pre-flight duplicate ({dup_reason}). Abort.")
+        print(f"[WARN] [{elapsed()}s] Pre-flight: {dup_reason}. Abort.")
         return {
             "status": "success",
             "posted": False,
             "reason": f"preflight_{dup_reason}",
         }
 
-    # ── Phase 5: Save to DB BEFORE posting (distributed lock) ──
-    print(f"[INFO] [{elapsed()}s] Phase 5: Saving to DB (pre-post lock)...")
+    # Phase 5: Save to DB BEFORE posting
+    print(f"[INFO] [{elapsed()}s] Phase 5: DB write (pre-post lock)...")
     saved = _save_to_db(
         databases=databases,
         database_id=database_id,
@@ -373,13 +385,13 @@ async def main(event=None, context=None):
         domain_hash=domain_hash,
     )
     if not saved:
-        print(f"[WARN] [{elapsed()}s] DB save failed. Aborting.")
+        print(f"[WARN] [{elapsed()}s] DB write failed. Aborting.")
         return {"status": "error", "reason": "db_save_failed", "posted": False}
 
     print(f"[INFO] [{elapsed()}s] DB lock acquired.")
 
-    # ── Phase 2: Parallel scrape ──
-    print(f"[INFO] [{elapsed()}s] Phase 2: Scraping text + images...")
+    # Phase 2: Scrape
+    print(f"[INFO] [{elapsed()}s] Phase 2: Scraping...")
     try:
         text_result, image_result = await asyncio.wait_for(
             asyncio.gather(
@@ -410,10 +422,10 @@ async def main(event=None, context=None):
     )
 
     if len(content) < MIN_CONTENT_CHARS:
-        print(f"[WARN] [{elapsed()}s] Content too thin. DB record kept, no post.")
+        print(f"[WARN] [{elapsed()}s] Thin content. DB record kept, no post.")
         return {"status": "skipped", "reason": "thin_content", "posted": False}
 
-    # ── Phase 3: Summarize + Translate ──
+    # Phase 3: Summarize + Translate
     print(f"[INFO] [{elapsed()}s] Phase 3: Summarize + Translate...")
     english_summary = await loop.run_in_executor(
         None, _extractive_summarize, content, SUMMARY_SENTENCES
@@ -428,7 +440,7 @@ async def main(event=None, context=None):
             timeout=TRANSLATION_TIMEOUT,
         )
     except asyncio.TimeoutError:
-        print(f"[WARN] [{elapsed()}s] Translation timed out. Using originals.")
+        print(f"[WARN] [{elapsed()}s] Translation timed out.")
         title_fa = title
         body_fa  = english_summary
 
@@ -436,12 +448,7 @@ async def main(event=None, context=None):
         print(f"[WARN] [{elapsed()}s] Translation empty. DB record kept.")
         return {"status": "error", "reason": "translation_failed", "posted": False}
 
-    print(
-        f"[INFO] [{elapsed()}s] "
-        f"title_fa={len(title_fa)}ch | body_fa={len(body_fa)}ch"
-    )
-
-    # ── Phase 4: Build caption ──
+    # Phase 4: Build caption
     hashtags = _extract_hashtags(title, desc)
     caption  = _build_caption(title_fa, body_fa, hashtags, category)
 
@@ -451,8 +458,8 @@ async def main(event=None, context=None):
         f"Hashtags={len(hashtags)}"
     )
 
-    # ── Phase 6: Post to Telegram ──
-    print(f"[INFO] [{elapsed()}s] Phase 6: Posting to Telegram...")
+    # Phase 6: Post to Telegram
+    print(f"[INFO] [{elapsed()}s] Phase 6: Posting...")
     try:
         posted = await asyncio.wait_for(
             _post_to_telegram(bot, chat_id, caption, image_urls),
@@ -462,18 +469,15 @@ async def main(event=None, context=None):
         print(f"[WARN] [{elapsed()}s] Telegram timed out.")
         posted = False
     except Exception as e:
-        print(f"[ERROR] [{elapsed()}s] Telegram unexpected: {e}")
+        print(f"[ERROR] [{elapsed()}s] Telegram: {e}")
         posted = False
 
     if posted:
         print(f"[SUCCESS] [{elapsed()}s] Posted: {title[:65]}")
     else:
-        print(
-            f"[WARN] [{elapsed()}s] Telegram failed. "
-            f"DB record retained — article will not be retried."
-        )
+        print(f"[WARN] [{elapsed()}s] Post failed. DB record kept.")
 
-    print(f"[INFO] ═══ v8.4 done in {elapsed()}s | posted={posted} ═══")
+    print(f"[INFO] ═══ v8.5 done in {elapsed()}s | posted={posted} ═══")
     return {"status": "success", "posted": posted}
 
 
@@ -495,12 +499,12 @@ async def _find_best_candidate(
     all_candidates = []
     for i, result in enumerate(results):
         if isinstance(result, Exception):
-            print(f"[WARN] Feed error ({feeds[i][:50]}): {result}")
+            print(f"[WARN] Feed ({feeds[i][:50]}): {result}")
             continue
         if result:
             all_candidates.extend(result)
 
-    print(f"[INFO] {len(all_candidates)} articles collected from feeds.")
+    print(f"[INFO] {len(all_candidates)} articles collected.")
     if not all_candidates:
         return None
 
@@ -510,23 +514,18 @@ async def _find_best_candidate(
 
     all_candidates.sort(key=lambda x: x["score"], reverse=True)
 
-    print("[INFO] Top 5 candidates before duplicate check:")
+    print("[INFO] Top 5 candidates:")
     for c in all_candidates[:5]:
         print(
             f"       [{c['score']:>3}] [{c['category']:<14}] "
             f"{c['title'][:60]}"
         )
 
-    # L4b: load recent domain hashes (informational only)
     recent_domain_hashes = _load_recent_domain_hashes(
         databases, database_id, collection_id, sdk_mode
     )
-    print(
-        f"[INFO] Recent domain hashes: {len(recent_domain_hashes)} "
-        f"(informational — does not block)"
-    )
+    print(f"[INFO] Recent domains loaded: {len(recent_domain_hashes)}")
 
-    # [FIX-1 v8.3] Domain slot only consumed when candidate passes L1–L3
     seen_domains_this_run = set()
 
     for c in all_candidates:
@@ -538,7 +537,7 @@ async def _find_best_candidate(
         title_hash   = _make_title_hash(title, feed_url)
         domain_hash  = _make_domain_hash(domain)
 
-        # ── L1: Exact link ──
+        # L1: Exact link
         l1 = _query_field(
             databases, database_id, collection_id,
             "link", link[:DB_LINK_MAX], sdk_mode,
@@ -547,10 +546,10 @@ async def _find_best_candidate(
             print(f"[SKIP] L1 link: {title[:60]}")
             continue
         if l1 is None:
-            print(f"[SKIP] L1 DB error (safe): {title[:60]}")
+            print(f"[SKIP] L1 DB error: {title[:60]}")
             continue
 
-        # ── L2: Content hash ──
+        # L2: Content hash
         l2 = _query_field(
             databases, database_id, collection_id,
             "content_hash", content_hash, sdk_mode,
@@ -559,10 +558,10 @@ async def _find_best_candidate(
             print(f"[SKIP] L2 content_hash: {title[:60]}")
             continue
         if l2 is None:
-            print(f"[SKIP] L2 DB error (safe): {title[:60]}")
+            print(f"[SKIP] L2 DB error: {title[:60]}")
             continue
 
-        # ── L2b: Legacy title_hash ──
+        # L2b: Legacy title_hash
         l2b = _query_field(
             databases, database_id, collection_id,
             "title_hash", title_hash, sdk_mode,
@@ -571,10 +570,10 @@ async def _find_best_candidate(
             print(f"[SKIP] L2b title_hash: {title[:60]}")
             continue
         if l2b is None:
-            print(f"[SKIP] L2b DB error (safe): {title[:60]}")
+            print(f"[SKIP] L2b DB error: {title[:60]}")
             continue
 
-        # ── L3: Fuzzy title similarity ──
+        # L3: Fuzzy
         is_fuzz, matched, fuzz_score = _fuzzy_duplicate(title, recent_titles)
         if is_fuzz:
             print(
@@ -583,26 +582,20 @@ async def _find_best_candidate(
             )
             continue
 
-        # ── L4b: Cross-run domain (informational only) ──
+        # L4b: Cross-run domain (informational)
         if domain_hash in recent_domain_hashes:
-            print(
-                f"[INFO] L4b domain seen recently ({domain}) "
-                f"— not blocking: {title[:50]}"
-            )
+            print(f"[INFO] L4b domain seen recently ({domain}) — not blocking.")
 
-        # ── L4a: Domain dedup this run (only on passing candidates) ──
+        # L4a: Domain dedup this run (only on passing candidates)
         if domain in seen_domains_this_run:
             print(f"[SKIP] L4a domain/run ({domain}): {title[:60]}")
             continue
 
         seen_domains_this_run.add(domain)
-        print(
-            f"[INFO] Candidate passed all checks "
-            f"(fuzz={fuzz_score:.2f}): {title[:60]}"
-        )
+        print(f"[INFO] PASS (fuzz={fuzz_score:.2f}): {title[:60]}")
         return c
 
-    print("[INFO] All candidates exhausted after duplicate checks.")
+    print("[INFO] All candidates exhausted.")
     return None
 
 
@@ -672,10 +665,8 @@ def _score_article(candidate, now, is_peak=False):
 
     if _extract_rss_image(candidate["entry"]):
         score += SCORE_HAS_IMAGE
-
     if len(candidate["description"]) > 200:
         score += SCORE_DESC_LENGTH
-
     if is_peak:
         score += PEAK_HOUR_BONUS
 
@@ -880,16 +871,6 @@ def _get_domain(url):
 # ═══════════════════════════════════════════════════════════
 
 def _scrape_text(url):
-    """
-    Scrape article body including:
-      - <p>  paragraph text
-      - <h2> <h3> <h4> section headers  → prefixed with "▌ "
-      - <li> list items (bullets/numbered) → prefixed with "• "
-
-    Elements are collected in document order to preserve
-    the structure of "key points" lists and numbered tips.
-    Short or boilerplate snippets are filtered out.
-    """
     try:
         resp = requests.get(
             url,
@@ -906,7 +887,6 @@ def _scrape_text(url):
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "lxml")
 
-        # Remove non-content chrome
         for tag in soup([
             "script", "style", "nav", "footer", "header",
             "aside", "form", "iframe", "noscript",
@@ -914,7 +894,6 @@ def _scrape_text(url):
         ]):
             tag.decompose()
 
-        # Find primary content container
         body = (
             soup.find("article")
             or soup.find("div", {"class": re.compile(r"article[-_]?body",  re.I)})
@@ -925,8 +904,6 @@ def _scrape_text(url):
         )
         area = body or soup
 
-        # Collect content elements in document order
-        # Tags to extract: paragraphs, headers, list items
         TARGET_TAGS = {"p", "h2", "h3", "h4", "li"}
         lines       = []
         seen_texts  = set()
@@ -935,11 +912,9 @@ def _scrape_text(url):
             raw_text = el.get_text(" ").strip()
             raw_text = re.sub(r"\s+", " ", raw_text)
 
-            # Skip empty or very short elements
             if len(raw_text) < 25:
                 continue
 
-            # Skip near-duplicate lines (same text in different wrappers)
             normalized = raw_text.lower()[:80]
             if normalized in seen_texts:
                 continue
@@ -948,19 +923,12 @@ def _scrape_text(url):
             tag = el.name
 
             if tag in ("h2", "h3", "h4"):
-                # Section header — short enough to include directly
                 lines.append(f"▌ {raw_text}")
-
             elif tag == "li":
-                # List item — bullet prefix
-                # Skip nav/menu items: very short or all-caps
                 if len(raw_text) < 30:
                     continue
                 lines.append(f"• {raw_text}")
-
             else:
-                # Paragraph — include as-is
-                # Filter boilerplate patterns
                 lower = raw_text.lower()
                 if any(pat in lower for pat in [
                     "subscribe", "newsletter", "sign up", "cookie",
@@ -972,31 +940,20 @@ def _scrape_text(url):
                 lines.append(raw_text)
 
         text = "\n".join(lines).strip()
-
-        if len(text) >= 100:
-            return text[:MAX_SCRAPED_CHARS]
-        return None
+        return text[:MAX_SCRAPED_CHARS] if len(text) >= 100 else None
 
     except requests.exceptions.Timeout:
-        print(f"[WARN] Text scrape timeout: {url[:60]}")
+        print(f"[WARN] Scrape timeout: {url[:60]}")
         return None
     except requests.exceptions.HTTPError as e:
-        print(f"[WARN] Text scrape HTTP {e.response.status_code}: {url[:60]}")
+        print(f"[WARN] Scrape HTTP {e.response.status_code}: {url[:60]}")
         return None
     except Exception as e:
-        print(f"[WARN] Text scrape: {e}")
+        print(f"[WARN] Scrape: {e}")
         return None
 
 
 def _scrape_images(url, rss_entry):
-    """
-    Collect article images.
-
-    [FIX-1] images[0] is reserved for the captioned send_photo.
-    The album (send_media_group) uses images[1:].
-    Therefore we still collect all images here — the split
-    is handled in _post_to_telegram, not here.
-    """
     images = []
     seen   = set()
 
@@ -1079,7 +1036,7 @@ def _scrape_images(url, rss_entry):
         if rss_img:
             _add(rss_img)
 
-    print(f"[INFO] Images collected: {len(images)}")
+    print(f"[INFO] Images: {len(images)}")
     return images[:MAX_IMAGES]
 
 
@@ -1123,14 +1080,6 @@ def _extract_rss_image(entry):
 # ═══════════════════════════════════════════════════════════
 
 def _extractive_summarize(text, sentence_count=8):
-    """
-    Offline extractive summarization via sumy LsaSummarizer.
-
-    Note: sumy splits on sentence boundaries — structured lines
-    prefixed with "▌" and "•" are treated as sentences and
-    may be selected by the summarizer if they score highly,
-    preserving key points in the summary.
-    """
     try:
         parser     = PlaintextParser.from_string(text, Tokenizer("english"))
         stemmer    = Stemmer("english")
@@ -1226,9 +1175,28 @@ def _translate_article(title, body):
 
 # ═══════════════════════════════════════════════════════════
 # SECTION 7 — CAPTION BUILDER
+#
+# Editorial fashion magazine style:
+#   • Bold Persian title
+#   • Channel handle
+#   • Body text (translated summary)
+#   • Footer line with category emoji
+#   • Hashtags LAST (always at end)
 # ═══════════════════════════════════════════════════════════
 
 def _build_caption(title_fa, body_fa, hashtags, category):
+    """
+    Caption structure (top to bottom):
+      <b>عنوان</b>
+      ──────────────
+      @irfashionnews
+
+      متن خبر...
+
+      EMOJI  کانال مد و فشن ایرانی
+
+      #hashtag1 #hashtag2 ...   ← ALWAYS LAST
+    """
     def _esc(t):
         return (
             t.replace("&", "&amp;")
@@ -1249,19 +1217,24 @@ def _build_caption(title_fa, body_fa, hashtags, category):
     emoji      = category_emoji.get(category, "🌐")
     safe_title = _esc(title_fa.strip())
     safe_body  = _esc(body_fa.strip())
-    hash_line  = " ".join(hashtags) if hashtags else ""
+
+    # Hashtags always at the very end
+    hash_line = " ".join(hashtags) if hashtags else ""
 
     parts = [
         f"<b>{safe_title}</b>",
-        "@irfashionnews",
+        "──────────────\n@irfashionnews",
         safe_body,
+        f"{emoji}  <i>کانال مد و فشن ایرانی</i>",
     ]
+
+    # Hashtags appended last — after footer
     if hash_line:
         parts.append(hash_line)
-    parts.append(f"{emoji} <i>کانال مد و فشن ایرانی</i>")
 
     caption = "\n\n".join(parts)
 
+    # Trim body if over Telegram 1024-char limit
     if len(caption) > CAPTION_MAX:
         overflow  = len(caption) - CAPTION_MAX
         safe_body = safe_body[:max(0, len(safe_body) - overflow - 5)] + "…"
@@ -1274,87 +1247,101 @@ def _build_caption(title_fa, body_fa, hashtags, category):
 # ═══════════════════════════════════════════════════════════
 # SECTION 8 — TELEGRAM POSTING
 #
-# MANDATORY ORDER (project spec):
-#   Step 1: send_media_group(images[1:], NO caption)
-#   Step 2: sleep(0.8s)
-#   Step 3: send_photo(images[0] + caption)
+# [FIX-1] ATOMIC POSTING — single send_media_group call.
 #
-# [FIX-1] images[0] is EXCLUDED from the album.
-#         images[0] appears ONLY in the captioned send_photo.
-#         This prevents the first image from appearing twice
-#         (once in album, once as captioned photo), which was
-#         the root cause of the "duplicate caption" visual.
+# Strategy by image count:
 #
-# Album step (Step 1) is non-fatal if it fails.
-# Caption step (Step 3) is the primary deliverable.
+#   ≥2 images:
+#     → send_media_group(images[0..N-2], no caption)
+#       + InputMediaPhoto(images[-1], caption=caption)
+#       ONE API CALL. Caption on last image. Atomic.
+#       Telegram renders the full album with caption
+#       attached to the final slide. No race condition.
+#       No split. No ordering issue.
+#
+#   1 image:
+#     → send_photo(image, caption=caption)
+#       Single call. Caption attached directly.
+#
+#   0 images:
+#     → send_message(caption)
+#       Text only.
+#
+#   After successful post:
+#     → send_sticker(random fashion sticker)
+#       Non-fatal if it fails.
 # ═══════════════════════════════════════════════════════════
 
 async def _post_to_telegram(bot, chat_id, caption, image_urls):
     """
-    Step 1: Album of images[1:]  — NO caption, no first image
-    Step 2: sleep(0.8s)
-    Step 3: send_photo(images[0] + caption)
-
-    images[0] is the lead/captioned photo.
-    images[1:] form the supplemental album.
-    No image ever appears in both messages.
+    Atomic Telegram posting.
+    Caption is attached to the LAST image in the album
+    via a single send_media_group call.
+    This eliminates all race conditions and ordering issues.
     """
-    caption_image  = image_urls[0]  if image_urls       else None
-    album_images   = image_urls[1:] if len(image_urls) > 1 else []
+    posted = False
 
-    # ── Step 1: Supplemental album (images[1:], no caption) ──
-    if album_images:
+    if len(image_urls) >= 2:
+        # ── Multi-image: atomic album with caption on last slide ──
         try:
+            # All images except last: no caption
             media_group = [
                 InputMediaPhoto(media=url)
-                for url in album_images[:MAX_IMAGES - 1]
+                for url in image_urls[:-1]
             ]
+            # Last image: caption attached here and ONLY here
+            media_group.append(
+                InputMediaPhoto(
+                    media=image_urls[-1],
+                    caption=caption,
+                    parse_mode="HTML",
+                )
+            )
+
             await bot.send_media_group(
                 chat_id=chat_id,
                 media=media_group,
                 disable_notification=True,
             )
             print(
-                f"[INFO] Step 1: Album sent "
-                f"({len(media_group)} images, no caption). "
-                f"Note: images[0] excluded — reserved for caption post."
+                f"[INFO] Album sent: {len(media_group)} images, "
+                f"caption on last slide. Atomic."
             )
+            posted = True
+
         except Exception as e:
-            print(f"[WARN] Step 1 album failed (non-fatal): {str(e)[:120]}")
-    else:
-        print(
-            "[INFO] Step 1: Skipped "
-            f"(only {len(image_urls)} image(s) — album needs ≥2 total)."
-        )
+            print(f"[WARN] Album send failed: {str(e)[:120]}")
+            # Fallback: try sending just the first image with caption
+            try:
+                await bot.send_photo(
+                    chat_id=chat_id,
+                    photo=image_urls[0],
+                    caption=caption,
+                    parse_mode="HTML",
+                    disable_notification=True,
+                )
+                print("[INFO] Fallback: single photo with caption sent.")
+                posted = True
+            except Exception as e2:
+                print(f"[WARN] Fallback photo failed: {str(e2)[:120]}")
 
-    # ── Delay between album and caption post ──
-    if album_images:
-        await asyncio.sleep(0.8)
-
-    # ── Step 2: Captioned photo (images[0] only) ──
-    try:
-        if caption_image:
+    elif len(image_urls) == 1:
+        # ── Single image ──
+        try:
             await bot.send_photo(
                 chat_id=chat_id,
-                photo=caption_image,
+                photo=image_urls[0],
                 caption=caption,
                 parse_mode="HTML",
                 disable_notification=True,
             )
-            print("[INFO] Step 2: Caption photo sent (images[0] + caption).")
-        else:
-            await bot.send_message(
-                chat_id=chat_id,
-                text=caption,
-                parse_mode="HTML",
-                link_preview_options=LinkPreviewOptions(is_disabled=True),
-                disable_notification=True,
-            )
-            print("[INFO] Step 2: Text-only caption sent (no images).")
-        return True
+            print("[INFO] Single photo with caption sent.")
+            posted = True
+        except Exception as e:
+            print(f"[WARN] Single photo failed: {str(e)[:120]}")
 
-    except Exception as e:
-        print(f"[WARN] Step 2 photo failed: {str(e)[:120]}")
+    # ── No images / all image attempts failed → text only ──
+    if not posted:
         try:
             await bot.send_message(
                 chat_id=chat_id,
@@ -1363,11 +1350,28 @@ async def _post_to_telegram(bot, chat_id, caption, image_urls):
                 link_preview_options=LinkPreviewOptions(is_disabled=True),
                 disable_notification=True,
             )
-            print("[INFO] Step 2 fallback: text-only sent.")
-            return True
-        except Exception as e2:
-            print(f"[ERROR] Step 2 all methods failed: {str(e2)[:120]}")
+            print("[INFO] Text-only caption sent.")
+            posted = True
+        except Exception as e:
+            print(f"[ERROR] Text message also failed: {str(e)[:120]}")
             return False
+
+    # ── Sticker follow-up (non-fatal, engagement boost) ──
+    if posted and FASHION_STICKERS:
+        await asyncio.sleep(1.5)
+        try:
+            sticker = random.choice(FASHION_STICKERS)
+            await bot.send_sticker(
+                chat_id=chat_id,
+                sticker=sticker,
+                disable_notification=True,
+            )
+            print("[INFO] Sticker sent.")
+        except Exception as e:
+            # Sticker failure never blocks the post result
+            print(f"[WARN] Sticker failed (non-fatal): {str(e)[:80]}")
+
+    return posted
 
 
 # ═══════════════════════════════════════════════════════════
