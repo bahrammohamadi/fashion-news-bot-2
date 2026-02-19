@@ -1,44 +1,51 @@
 # ============================================================
 # Function 1: International Fashion Poster
 # Project:    @irfashionnews — FashionBotProject
-# Version:    8.2 — FINAL STABILIZATION
+# Version:    8.3 — OVER-FILTERING FIX
 # Runtime:    python-3.12 / Appwrite Cloud Functions
 # Timeout:    120 seconds
 #
-# Architecture:
-#   Phase 0 → Load env, init DB client
-#   Phase 1 → Parallel RSS scan + trend scoring + dup checks
-#   Phase 2 → Parallel scrape (text + images)
-#   Phase 3 → Extractive summary + MyMemory translation
-#   Phase 4 → Build caption
-#   Phase 5 → Save to DB  ← BEFORE posting (distributed lock)
-#   Phase 6 → Post to Telegram
+# Fixed in v8.3 vs v8.2:
 #
-# Telegram posting (FINAL SPEC):
-#   Step 1: send_media_group(all images, NO caption)
-#   Step 2: sleep(0.5–1.0s)
-#   Step 3: send_photo(best image + full Persian caption)
-#   Caption appears EXACTLY ONCE. Never on media_group.
+#   [FIX-1] L4a domain dedup logic corrected.
+#           OLD (WRONG): domain added to seen_domains on ANY
+#                        candidate from that domain, including
+#                        ones already rejected by L1/L2/L3.
+#                        Result: domain "used up" by old posts,
+#                        blocking all fresh articles from same domain.
+#           NEW (CORRECT): domain only consumed when candidate
+#                          PASSES L1+L2+L3 and is selected.
+#                          Fresh articles from prolific domains
+#                          are no longer silently suppressed.
 #
-# Duplicate protection (L1–L4):
-#   L1: exact link match
-#   L2: content_hash (SHA256 of normalized title tokens)
-#   L2b: title_hash (legacy, backward compat)
-#   L3: Jaccard fuzzy title similarity ≥ 0.65
-#   L4a: domain dedup within current run
-#   L4b: domain dedup across runs (domain_hash in DB)
-#   All checks run BEFORE any DB write or Telegram send.
-#   Pre-flight strict re-check runs right before DB write.
+#   [FIX-2] L4a scope clarified.
+#           Purpose: prevent posting TWO articles from the
+#           same domain in a single execution run.
+#           NOT: prevent any article from a domain that had
+#           a previously-posted article anywhere in history.
 #
-# Translation:
-#   MyMemory free API (no key needed)
-#   Email: lasvaram@gmail.com (~50k chars/day)
-#   Chunked to respect 500-char API limit
+#   [FIX-3] L4b (cross-run domain hash) made optional/relaxed.
+#           Cross-run domain blocking was set to 6 hours,
+#           which when combined with broken L4a was causing
+#           total silence. Raised to informational warning only
+#           — does not block candidates.
+#           Rationale: L1 (exact link) + L2 (content_hash)
+#           are sufficient cross-run duplicate protection.
+#           Domain-level cross-run blocking is too aggressive
+#           for prolific sources (vogue, whowhatwear, wwd).
 #
-# Summarization:
-#   sumy LsaSummarizer (offline, no network)
+#   [FIX-4] SDK deprecation warnings suppressed globally.
+#           DeprecationWarning for list_documents is cosmetic
+#           and clutters logs. Suppressed at module level.
 #
-# No LLMs. No paid APIs. No OpenAI. No OpenRouter.
+# Duplicate protection after fixes:
+#   L1:  exact link (blocks repost of same URL)         ← hard block
+#   L2:  content_hash (blocks same story, diff URL)     ← hard block
+#   L2b: title_hash legacy (backward compat)            ← hard block
+#   L3:  fuzzy Jaccard ≥ 0.65 (paraphrased titles)     ← hard block
+#   L4a: one article per domain PER RUN                 ← soft block
+#        (only applied after L1–L3 pass)
+#   L4b: domain cross-run (informational log only)      ← warning only
 # ============================================================
 
 import os
@@ -63,6 +70,7 @@ from sumy.summarizers.lsa import LsaSummarizer
 from sumy.nlp.stemmers import Stemmer
 from sumy.utils import get_stop_words
 
+# Suppress Appwrite SDK deprecation warnings globally
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="appwrite")
 
 
@@ -70,45 +78,41 @@ warnings.filterwarnings("ignore", category=DeprecationWarning, module="appwrite"
 # SECTION 1 — CONSTANTS & CONFIGURATION
 # ═══════════════════════════════════════════════════════════
 
-# ── Appwrite collection ──
 COLLECTION_ID = "history"
 SOURCE_TYPE   = "en"
 
-# ── Article filtering ──
-ARTICLE_AGE_HOURS = 36       # ignore articles older than this
-MIN_CONTENT_CHARS = 150      # skip articles with too little text
-MAX_SCRAPED_CHARS = 3000     # cap scraped text before summarization
-MAX_RSS_CHARS     = 1000     # cap RSS description fallback
+ARTICLE_AGE_HOURS = 36
+MIN_CONTENT_CHARS = 150
+MAX_SCRAPED_CHARS = 3000
+MAX_RSS_CHARS     = 1000
 
-# ── Telegram ──
-CAPTION_MAX = 1020           # Telegram caption hard limit (chars)
-MAX_IMAGES  = 10             # max images per album
+CAPTION_MAX = 1020
+MAX_IMAGES  = 10
 
-# ── Appwrite field size limits (from schema) ──
-DB_LINK_MAX         = 999
-DB_TITLE_MAX        = 499
-DB_FEED_URL_MAX     = 499
-DB_SOURCE_TYPE_MAX  = 19
-DB_HASH_MAX         = 64
-DB_CATEGORY_MAX     = 49
-DB_DOMAIN_HASH_MAX  = 64
+# Appwrite field size limits
+DB_LINK_MAX        = 999
+DB_TITLE_MAX       = 499
+DB_FEED_URL_MAX    = 499
+DB_SOURCE_TYPE_MAX = 19
+DB_HASH_MAX        = 64
+DB_CATEGORY_MAX    = 49
+DB_DOMAIN_HASH_MAX = 64
 
-# ── Timeout budgets (seconds) ──
+# Timeouts
 FEED_FETCH_TIMEOUT  = 7
 FEEDS_SCAN_TIMEOUT  = 22
 SCRAPE_TIMEOUT      = 12
 TRANSLATION_TIMEOUT = 45
 TELEGRAM_TIMEOUT    = 35
 
-# ── Sumy summarizer ──
 SUMMARY_SENTENCES = 8
 
-# ── MyMemory translation ──
+# MyMemory
 MYMEMORY_CHUNK_SIZE  = 450
 MYMEMORY_CHUNK_DELAY = 1.0
 MYMEMORY_EMAIL       = "lasvaram@gmail.com"
 
-# ── Image scraping ──
+# Image scraping
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 IMAGE_BLOCKLIST  = [
     "doubleclick", "googletagmanager", "googlesyndication",
@@ -116,12 +120,15 @@ IMAGE_BLOCKLIST  = [
     "tracking", "counter", "stat.", "stats.",
 ]
 
-# ── Duplicate detection ──
+# Duplicate detection
 FUZZY_SIMILARITY_THRESHOLD = 0.65
-FUZZY_LOOKBACK_COUNT       = 150   # recent DB records to load for fuzzy check
-DOMAIN_DEDUP_HOURS         = 6     # cross-run domain lock window
+FUZZY_LOOKBACK_COUNT       = 150
 
-# ── Stop words for title normalization ──
+# [FIX-3] Domain cross-run dedup is now WARNING ONLY.
+# L1 + L2 handle true duplicate prevention.
+# L4b is purely informational.
+DOMAIN_DEDUP_HOURS = 6
+
 TITLE_STOP_WORDS = {
     "a", "an", "the", "is", "are", "was", "were", "be", "been",
     "being", "have", "has", "had", "do", "does", "did", "will",
@@ -132,15 +139,10 @@ TITLE_STOP_WORDS = {
     "after", "new", "first", "last", "says", "said",
 }
 
-# ── Peak hour bonus (Tehran time → UTC offsets) ──
-# Tehran UTC+3:30
-# 08:00–10:00 Tehran → UTC 04:30–06:30 → UTC hours 4,5,6
-# 13:00–15:00 Tehran → UTC 09:30–11:30 → UTC hours 9,10,11
-# 20:00–23:00 Tehran → UTC 16:30–19:30 → UTC hours 16,17,18,19
+# Peak hours (UTC, mapped from Tehran UTC+3:30)
 PEAK_HOURS_UTC  = {4, 5, 6, 9, 10, 11, 16, 17, 18, 19}
 PEAK_HOUR_BONUS = 15
 
-# ── Trend scoring weights ──
 SCORE_RECENCY_MAX   = 40
 SCORE_TITLE_KEYWORD = 15
 SCORE_DESC_KEYWORD  = 5
@@ -159,7 +161,6 @@ TREND_KEYWORDS = [
     "versace", "fendi", "burberry", "valentino", "armani",
 ]
 
-# ── Content categories (rule-based, no ML) ──
 CONTENT_CATEGORIES = {
     "runway": [
         "runway", "fashion week", "collection", "show", "catwalk",
@@ -200,34 +201,32 @@ CONTENT_CATEGORIES = {
     ],
 }
 
-# ── Hashtag map (keyword → Persian+English hashtags) ──
 HASHTAG_MAP = {
-    "chanel":         "#Chanel #شنل",
-    "dior":           "#Dior #دیور",
-    "gucci":          "#Gucci #گوچی",
-    "prada":          "#Prada #پرادا",
-    "louis vuitton":  "#LouisVuitton #لویی_ویتون",
-    "balenciaga":     "#Balenciaga #بالنسیاگا",
-    "versace":        "#Versace #ورساچه",
-    "zara":           "#Zara #زارا",
-    "hm":             "#HM #اچ_اند_ام",
-    "nike":           "#Nike #نایکی",
-    "adidas":         "#Adidas #آدیداس",
-    "runway":         "#Runway #رانوی",
-    "fashion week":   "#FashionWeek #هفته_مد",
-    "collection":     "#Collection #کالکشن",
-    "sustainability":  "#Sustainability #مد_پایدار",
-    "beauty":         "#Beauty #زیبایی",
-    "trend":          "#Trend #ترند",
-    "style":          "#Style #استایل",
-    "celebrity":      "#Celebrity #سلبریتی",
-    "streetwear":     "#Streetwear #استریت_ویر",
-    "luxury":         "#Luxury #لاکچری",
-    "vintage":        "#Vintage #وینتیج",
+    "chanel":        "#Chanel #شنل",
+    "dior":          "#Dior #دیور",
+    "gucci":         "#Gucci #گوچی",
+    "prada":         "#Prada #پرادا",
+    "louis vuitton": "#LouisVuitton #لویی_ویتون",
+    "balenciaga":    "#Balenciaga #بالنسیاگا",
+    "versace":       "#Versace #ورساچه",
+    "zara":          "#Zara #زارا",
+    "hm":            "#HM #اچ_اند_ام",
+    "nike":          "#Nike #نایکی",
+    "adidas":        "#Adidas #آدیداس",
+    "runway":        "#Runway #رانوی",
+    "fashion week":  "#FashionWeek #هفته_مد",
+    "collection":    "#Collection #کالکشن",
+    "sustainability": "#Sustainability #مد_پایدار",
+    "beauty":        "#Beauty #زیبایی",
+    "trend":         "#Trend #ترند",
+    "style":         "#Style #استایل",
+    "celebrity":     "#Celebrity #سلبریتی",
+    "streetwear":    "#Streetwear #استریت_ویر",
+    "luxury":        "#Luxury #لاکچری",
+    "vintage":       "#Vintage #وینتیج",
 }
 MAX_HASHTAGS = 4
 
-# ── RSS feed list ──
 RSS_FEEDS = [
     "https://www.vogue.com/feed/rss",
     "https://wwd.com/feed/",
@@ -257,14 +256,13 @@ RSS_FEEDS = [
 # ═══════════════════════════════════════════════════════════
 
 async def main(event=None, context=None):
-    print("[INFO] ═══ Function 1 v8.2 started ═══")
+    print("[INFO] ═══ Function 1 v8.3 started ═══")
     loop       = asyncio.get_event_loop()
     start_time = loop.time()
 
     def elapsed():
         return round(loop.time() - start_time, 1)
 
-    # ── Phase 0: Environment & clients ──
     token             = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_id           = os.environ.get("TELEGRAM_CHANNEL_ID")
     appwrite_endpoint = os.environ.get(
@@ -307,14 +305,13 @@ async def main(event=None, context=None):
         f"Peak={'YES +' + str(PEAK_HOUR_BONUS) + 'pts' if is_peak else 'no'}"
     )
 
-    # ── Pre-load fuzzy match data ──
     print(f"[INFO] [{elapsed()}s] Loading recent titles for fuzzy check...")
     recent_titles = _load_recent_titles(
         databases, database_id, COLLECTION_ID, sdk_mode, FUZZY_LOOKBACK_COUNT
     )
     print(f"[INFO] [{elapsed()}s] {len(recent_titles)} titles loaded.")
 
-    # ── Phase 1: RSS scan + duplicate filtering ──
+    # Phase 1: RSS scan
     print(f"[INFO] [{elapsed()}s] Phase 1: Scanning {len(RSS_FEEDS)} feeds...")
     try:
         candidate = await asyncio.wait_for(
@@ -339,7 +336,6 @@ async def main(event=None, context=None):
         print(f"[INFO] [{elapsed()}s] No suitable article found. Exiting.")
         return {"status": "success", "posted": False}
 
-    # ── Unpack candidate ──
     title        = candidate["title"]
     link         = candidate["link"]
     desc         = candidate["description"]
@@ -358,23 +354,24 @@ async def main(event=None, context=None):
         f"score={score} cat={category} | {title[:65]}"
     )
 
-    # ── Phase 1b: Pre-flight strict re-check (race condition guard) ──
-    # Two executions can pass Phase 1 simultaneously if they both
-    # query DB before either one writes. This second check runs
-    # immediately before the DB write to catch that window.
+    # Pre-flight strict re-check (race condition guard)
     print(f"[INFO] [{elapsed()}s] Pre-flight strict duplicate re-check...")
     is_dup, dup_reason = _strict_duplicate_check(
         databases, database_id, COLLECTION_ID,
         link, content_hash, title_hash, sdk_mode,
     )
     if is_dup:
-        print(f"[WARN] [{elapsed()}s] Pre-flight caught duplicate ({dup_reason}). Abort.")
-        return {"status": "success", "posted": False, "reason": f"preflight_{dup_reason}"}
+        print(
+            f"[WARN] [{elapsed()}s] "
+            f"Pre-flight caught duplicate ({dup_reason}). Abort."
+        )
+        return {
+            "status": "success",
+            "posted": False,
+            "reason": f"preflight_{dup_reason}",
+        }
 
-    # ── Phase 5: Save to DB BEFORE posting ──
-    # This is the distributed lock. Any concurrent execution that
-    # reaches its own pre-flight check AFTER this write will find
-    # this record and abort, preventing duplicate posts.
+    # Phase 5: Save to DB BEFORE posting (distributed lock)
     print(f"[INFO] [{elapsed()}s] Phase 5: Saving to DB (pre-post lock)...")
     saved = _save_to_db(
         databases=databases,
@@ -394,15 +391,15 @@ async def main(event=None, context=None):
         domain_hash=domain_hash,
     )
     if not saved:
-        # DB write failed. Could be a duplicate key conflict
-        # (another execution already saved this article) or a
-        # transient error. Either way: do not post.
-        print(f"[WARN] [{elapsed()}s] DB save failed. Aborting to prevent duplicate.")
+        print(
+            f"[WARN] [{elapsed()}s] "
+            f"DB save failed — aborting to prevent duplicate post."
+        )
         return {"status": "error", "reason": "db_save_failed", "posted": False}
 
     print(f"[INFO] [{elapsed()}s] DB lock acquired.")
 
-    # ── Phase 2: Parallel scrape ──
+    # Phase 2: Scrape
     print(f"[INFO] [{elapsed()}s] Phase 2: Scraping text + images...")
     try:
         text_result, image_result = await asyncio.wait_for(
@@ -434,13 +431,11 @@ async def main(event=None, context=None):
     )
 
     if len(content) < MIN_CONTENT_CHARS:
-        # DB record already written — article won't be retried.
         print(f"[WARN] [{elapsed()}s] Content too thin. DB record kept, no post.")
         return {"status": "skipped", "reason": "thin_content", "posted": False}
 
-    # ── Phase 3: Summarize + Translate ──
+    # Phase 3: Summarize + Translate
     print(f"[INFO] [{elapsed()}s] Phase 3: Summarize + Translate...")
-
     english_summary = await loop.run_in_executor(
         None, _extractive_summarize, content, SUMMARY_SENTENCES
     )
@@ -448,7 +443,9 @@ async def main(event=None, context=None):
 
     try:
         title_fa, body_fa = await asyncio.wait_for(
-            loop.run_in_executor(None, _translate_article, title, english_summary),
+            loop.run_in_executor(
+                None, _translate_article, title, english_summary
+            ),
             timeout=TRANSLATION_TIMEOUT,
         )
     except asyncio.TimeoutError:
@@ -457,7 +454,7 @@ async def main(event=None, context=None):
         body_fa  = english_summary
 
     if not title_fa or not body_fa:
-        print(f"[WARN] [{elapsed()}s] Translation returned empty. DB record kept.")
+        print(f"[WARN] [{elapsed()}s] Translation empty. DB record kept.")
         return {"status": "error", "reason": "translation_failed", "posted": False}
 
     print(
@@ -465,7 +462,7 @@ async def main(event=None, context=None):
         f"title_fa={len(title_fa)}ch | body_fa={len(body_fa)}ch"
     )
 
-    # ── Phase 4: Build caption ──
+    # Phase 4: Build caption
     hashtags = _extract_hashtags(title, desc)
     caption  = _build_caption(title_fa, body_fa, hashtags, category)
 
@@ -475,7 +472,7 @@ async def main(event=None, context=None):
         f"Hashtags={len(hashtags)}"
     )
 
-    # ── Phase 6: Post to Telegram ──
+    # Phase 6: Post to Telegram
     print(f"[INFO] [{elapsed()}s] Phase 6: Posting to Telegram...")
     try:
         posted = await asyncio.wait_for(
@@ -486,23 +483,23 @@ async def main(event=None, context=None):
         print(f"[WARN] [{elapsed()}s] Telegram post timed out.")
         posted = False
     except Exception as e:
-        print(f"[ERROR] [{elapsed()}s] Telegram unexpected error: {e}")
+        print(f"[ERROR] [{elapsed()}s] Telegram unexpected: {e}")
         posted = False
 
     if posted:
-        print(f"[SUCCESS] [{elapsed()}s] Posted successfully: {title[:65]}")
+        print(f"[SUCCESS] [{elapsed()}s] Posted: {title[:65]}")
     else:
         print(
-            f"[WARN] [{elapsed()}s] Telegram post failed. "
-            f"DB record retained (article will not be retried)."
+            f"[WARN] [{elapsed()}s] Telegram failed. "
+            f"DB record retained — article will not be retried."
         )
 
-    print(f"[INFO] ═══ v8.2 done in {elapsed()}s | posted={posted} ═══")
+    print(f"[INFO] ═══ v8.3 done in {elapsed()}s | posted={posted} ═══")
     return {"status": "success", "posted": posted}
 
 
 # ═══════════════════════════════════════════════════════════
-# SECTION 3 — PHASE 1: FEED SCANNING & CANDIDATE SELECTION
+# SECTION 3 — FEED SCANNING & CANDIDATE SELECTION
 # ═══════════════════════════════════════════════════════════
 
 async def _find_best_candidate(
@@ -510,9 +507,15 @@ async def _find_best_candidate(
     time_threshold, sdk_mode, now, recent_titles, is_peak,
 ):
     """
-    Fetch all feeds in parallel, score every article,
-    run all duplicate checks (L1–L4), return best candidate.
-    Returns None if no suitable article found.
+    Fetch all feeds in parallel, score all articles,
+    apply duplicate checks L1–L3, then L4a only on passing candidates.
+
+    KEY BEHAVIOR (v8.3 fix):
+      L4a (domain/run) is checked AFTER L1+L2+L3 pass.
+      A domain is only "consumed" when a candidate from that
+      domain has passed all content checks and is eligible.
+      Domains are NOT consumed by articles that were already
+      rejected by L1/L2/L3 — those are irrelevant old posts.
     """
     loop  = asyncio.get_event_loop()
     tasks = [
@@ -533,7 +536,7 @@ async def _find_best_candidate(
     if not all_candidates:
         return None
 
-    # Score + categorize
+    # Score + categorize all
     for c in all_candidates:
         c["score"]    = _score_article(c, now, is_peak)
         c["category"] = _detect_category(c["title"], c["description"])
@@ -547,12 +550,17 @@ async def _find_best_candidate(
             f"{c['title'][:60]}"
         )
 
-    # Load recent domain hashes for cross-run L4b check
+    # [FIX-3] Load recent domain hashes — informational only
     recent_domain_hashes = _load_recent_domain_hashes(
         databases, database_id, collection_id, sdk_mode
     )
-    print(f"[INFO] Recent domain hashes loaded: {len(recent_domain_hashes)}")
+    print(
+        f"[INFO] Recent domain hashes loaded: {len(recent_domain_hashes)} "
+        f"(informational — does not block)"
+    )
 
+    # [FIX-1] Domain tracking — only populated when a candidate
+    # PASSES L1+L2+L3. Does not inherit rejected candidates.
     seen_domains_this_run = set()
 
     for c in all_candidates:
@@ -564,28 +572,16 @@ async def _find_best_candidate(
         title_hash   = _make_title_hash(title, feed_url)
         domain_hash  = _make_domain_hash(domain)
 
-        # ── L4a: Domain dedup (this execution) ──
-        if domain in seen_domains_this_run:
-            print(f"[SKIP] L4a domain/run ({domain}): {title[:55]}")
-            continue
-        seen_domains_this_run.add(domain)
-
-        # ── L4b: Domain dedup (cross-run, from DB) ──
-        if domain_hash in recent_domain_hashes:
-            print(f"[SKIP] L4b domain/db ({domain}): {title[:55]}")
-            continue
-
         # ── L1: Exact link ──
         l1 = _query_field(
             databases, database_id, collection_id,
             "link", link[:DB_LINK_MAX], sdk_mode,
         )
         if l1 is True:
-            print(f"[SKIP] L1 link match: {title[:55]}")
+            print(f"[SKIP] L1 link: {title[:60]}")
             continue
-        # l1 is None → DB error → skip this candidate (safe)
         if l1 is None:
-            print(f"[SKIP] L1 DB error (safe skip): {title[:55]}")
+            print(f"[SKIP] L1 DB error (safe): {title[:60]}")
             continue
 
         # ── L2: Content hash ──
@@ -594,10 +590,10 @@ async def _find_best_candidate(
             "content_hash", content_hash, sdk_mode,
         )
         if l2 is True:
-            print(f"[SKIP] L2 content_hash match: {title[:55]}")
+            print(f"[SKIP] L2 content_hash: {title[:60]}")
             continue
         if l2 is None:
-            print(f"[SKIP] L2 DB error (safe skip): {title[:55]}")
+            print(f"[SKIP] L2 DB error (safe): {title[:60]}")
             continue
 
         # ── L2b: Legacy title_hash ──
@@ -606,10 +602,10 @@ async def _find_best_candidate(
             "title_hash", title_hash, sdk_mode,
         )
         if l2b is True:
-            print(f"[SKIP] L2b title_hash match: {title[:55]}")
+            print(f"[SKIP] L2b title_hash: {title[:60]}")
             continue
         if l2b is None:
-            print(f"[SKIP] L2b DB error (safe skip): {title[:55]}")
+            print(f"[SKIP] L2b DB error (safe): {title[:60]}")
             continue
 
         # ── L3: Fuzzy title similarity ──
@@ -621,9 +617,25 @@ async def _find_best_candidate(
             )
             continue
 
+        # ── L4b: Cross-run domain (informational only — does not block) ──
+        if domain_hash in recent_domain_hashes:
+            print(
+                f"[INFO] L4b domain seen recently ({domain}) "
+                f"— not blocking, continuing: {title[:50]}"
+            )
+
+        # ── L4a: Domain dedup within this run ──
+        # [FIX-1] Only reached here if L1+L2+L3 all passed.
+        # This domain slot is consumed by a genuinely new article.
+        if domain in seen_domains_this_run:
+            print(f"[SKIP] L4a domain/run ({domain}): {title[:60]}")
+            continue
+
+        # ── PASSED ALL CHECKS ──
+        seen_domains_this_run.add(domain)
         print(
             f"[INFO] Candidate passed all checks "
-            f"(best_fuzz={fuzz_score:.2f}): {title[:60]}"
+            f"(fuzz={fuzz_score:.2f}): {title[:60]}"
         )
         return c
 
@@ -632,16 +644,12 @@ async def _find_best_candidate(
 
 
 def _fetch_feed(feed_url, time_threshold):
-    """
-    Parse one RSS feed. Returns list of candidate dicts.
-    Uses socket timeout to respect FEED_FETCH_TIMEOUT.
-    """
     import socket
     try:
-        old_timeout = socket.getdefaulttimeout()
+        old = socket.getdefaulttimeout()
         socket.setdefaulttimeout(FEED_FETCH_TIMEOUT)
         feed = feedparser.parse(feed_url)
-        socket.setdefaulttimeout(old_timeout)
+        socket.setdefaulttimeout(old)
     except Exception as e:
         print(f"[WARN] feedparser ({feed_url[:50]}): {e}")
         return []
@@ -656,16 +664,13 @@ def _fetch_feed(feed_url, time_threshold):
         pub_date = datetime(*published[:6], tzinfo=timezone.utc)
         if pub_date < time_threshold:
             continue
-
         title = (entry.get("title") or "").strip()
         link  = (entry.get("link")  or "").strip()
         if not title or not link:
             continue
-
         raw  = entry.get("summary") or entry.get("description") or ""
         desc = re.sub(r"<[^>]+>", " ", raw)
         desc = re.sub(r"\s+", " ", desc).strip()
-
         candidates.append({
             "title":       title,
             "link":        link,
@@ -680,25 +685,15 @@ def _fetch_feed(feed_url, time_threshold):
 
 
 def _score_article(candidate, now, is_peak=False):
-    """
-    Score an article 0–100 based on:
-      - Recency (0–40 pts)
-      - Keyword matches in title/desc (0–45 pts)
-      - Has image (0–10 pts)
-      - Description richness (0–10 pts)
-      - Peak hour bonus (0–15 pts)
-    """
     score     = 0
     age_hours = (now - candidate["pub_date"]).total_seconds() / 3600
 
-    # Recency
     if age_hours <= 3:
         score += SCORE_RECENCY_MAX
     elif age_hours <= ARTICLE_AGE_HOURS:
         ratio  = 1 - (age_hours - 3) / (ARTICLE_AGE_HOURS - 3)
         score += int(SCORE_RECENCY_MAX * ratio)
 
-    # Keywords (max 3 matches)
     title_lower = candidate["title"].lower()
     desc_lower  = candidate["description"].lower()
     matched = 0
@@ -712,15 +707,12 @@ def _score_article(candidate, now, is_peak=False):
             score   += SCORE_DESC_KEYWORD
             matched += 1
 
-    # Image bonus
     if _extract_rss_image(candidate["entry"]):
         score += SCORE_HAS_IMAGE
 
-    # Description richness
     if len(candidate["description"]) > 200:
         score += SCORE_DESC_LENGTH
 
-    # Peak hour
     if is_peak:
         score += PEAK_HOUR_BONUS
 
@@ -728,11 +720,6 @@ def _score_article(candidate, now, is_peak=False):
 
 
 def _detect_category(title, description):
-    """
-    Rule-based category detection. No ML.
-    Checks title then description for keyword matches.
-    Returns category string. First match wins.
-    """
     combined = (title + " " + description).lower()
     for category, keywords in CONTENT_CATEGORIES.items():
         for kw in keywords:
@@ -742,10 +729,6 @@ def _detect_category(title, description):
 
 
 def _extract_hashtags(title, description):
-    """
-    Match article text against HASHTAG_MAP.
-    Returns list of hashtag strings, max MAX_HASHTAGS.
-    """
     combined = (title + " " + description).lower()
     hashtags = []
     seen     = set()
@@ -763,29 +746,23 @@ def _extract_hashtags(title, description):
 # ═══════════════════════════════════════════════════════════
 
 def _make_content_hash(title):
-    """
-    SHA256 of sorted normalized title tokens.
-    Cross-source safe: same article on different sites
-    produces the same hash regardless of feed_url.
-    """
     tokens     = _normalize_tokens(title)
     normalized = " ".join(sorted(tokens))
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
 def _make_title_hash(title, feed_url):
-    """Legacy hash (title + feed_url). Kept for backward compatibility."""
     raw = (title.lower().strip() + feed_url[:50]).encode("utf-8")
     return hashlib.sha256(raw).hexdigest()
 
 
 def _make_domain_hash(domain):
-    """Stable hash for cross-run domain dedup."""
-    return hashlib.sha256(domain.encode("utf-8")).hexdigest()[:DB_DOMAIN_HASH_MAX]
+    return hashlib.sha256(
+        domain.encode("utf-8")
+    ).hexdigest()[:DB_DOMAIN_HASH_MAX]
 
 
 def _normalize_tokens(title):
-    """Lowercase, strip punctuation, remove stop words, min length 2."""
     title  = title.lower()
     title  = re.sub(r"[^a-z0-9\s]", " ", title)
     tokens = title.split()
@@ -804,16 +781,11 @@ def _jaccard(tokens_a, tokens_b):
 
 
 def _fuzzy_duplicate(title, recent_titles):
-    """
-    Compare incoming title against recent_titles list.
-    Returns (is_duplicate, best_matched_title, best_score).
-    """
     if not recent_titles:
         return False, None, 0.0
     incoming = _normalize_tokens(title)
     if not incoming:
         return False, None, 0.0
-
     best_score = 0.0
     best_match = None
     for stored_title, stored_tokens in recent_titles:
@@ -821,7 +793,6 @@ def _fuzzy_duplicate(title, recent_titles):
         if s > best_score:
             best_score = s
             best_match = stored_title
-
     if best_score >= FUZZY_SIMILARITY_THRESHOLD:
         return True, best_match, best_score
     return False, None, best_score
@@ -832,10 +803,9 @@ def _strict_duplicate_check(
     link, content_hash, title_hash, sdk_mode,
 ):
     """
-    Final pre-post duplicate check. Conservative:
-    any DB error is treated as duplicate → do not post.
-
-    Returns (is_duplicate: bool, reason: str)
+    Final check immediately before DB write.
+    Conservative: DB error → treat as duplicate → abort.
+    Returns (is_duplicate: bool, reason: str).
     """
     for field, value in [
         ("link",         link[:DB_LINK_MAX]),
@@ -849,21 +819,17 @@ def _strict_duplicate_check(
         if result is True:
             return True, f"found_{field}"
         if result is None:
-            # DB error — treat as duplicate to be safe
             return True, f"db_error_{field}"
-
     return False, ""
 
 
 def _query_field(databases, database_id, collection_id,
                  field, value, sdk_mode):
     """
-    Query one field for exact match.
-
     Returns:
-      True  → record found (is duplicate)
-      False → record not found (safe)
-      None  → DB/network error (caller decides — treat as duplicate)
+      True  → record found
+      False → not found
+      None  → DB error
     """
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", DeprecationWarning)
@@ -882,7 +848,6 @@ def _query_field(databases, database_id, collection_id,
                     queries=queries,
                 )
             return r["total"] > 0
-
         except AppwriteException as e:
             print(f"[ERROR] _query_field ({field}): {e.message}")
             return None
@@ -893,7 +858,6 @@ def _query_field(databases, database_id, collection_id,
 
 def _load_recent_titles(databases, database_id, collection_id,
                         sdk_mode, limit):
-    """Load recent article titles for fuzzy matching."""
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", DeprecationWarning)
         try:
@@ -923,13 +887,11 @@ def _load_recent_titles(databases, database_id, collection_id,
 
 def _load_recent_domain_hashes(databases, database_id, collection_id, sdk_mode):
     """
-    Load domain_hash values for records posted within DOMAIN_DEDUP_HOURS.
-    Returns a set of domain_hash strings.
-    Falls back to empty set on any error (non-fatal — L4a still runs).
+    Load domain hashes posted within DOMAIN_DEDUP_HOURS.
+    Used for L4b informational logging only — does not block candidates.
     """
     cutoff     = datetime.now(timezone.utc) - timedelta(hours=DOMAIN_DEDUP_HOURS)
     cutoff_str = cutoff.strftime("%Y-%m-%dT%H:%M:%S.000+00:00")
-
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", DeprecationWarning)
         try:
@@ -951,11 +913,7 @@ def _load_recent_domain_hashes(databases, database_id, collection_id, sdk_mode):
                     queries=queries,
                 )
                 docs = r.get("documents", [])
-            return {
-                d["domain_hash"]
-                for d in docs
-                if d.get("domain_hash")
-            }
+            return {d["domain_hash"] for d in docs if d.get("domain_hash")}
         except Exception as e:
             print(f"[WARN] _load_recent_domain_hashes: {e}")
             return set()
@@ -970,15 +928,10 @@ def _get_domain(url):
 
 
 # ═══════════════════════════════════════════════════════════
-# SECTION 5 — PHASE 2: SCRAPING
+# SECTION 5 — SCRAPING
 # ═══════════════════════════════════════════════════════════
 
 def _scrape_text(url):
-    """
-    Scrape article body text from URL.
-    Targets common article container selectors.
-    Returns cleaned text string, or None on failure.
-    """
     try:
         resp = requests.get(
             url,
@@ -995,7 +948,6 @@ def _scrape_text(url):
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "lxml")
 
-        # Remove non-content elements
         for tag in soup([
             "script", "style", "nav", "footer", "header",
             "aside", "form", "iframe", "noscript",
@@ -1003,7 +955,6 @@ def _scrape_text(url):
         ]):
             tag.decompose()
 
-        # Find article body container
         body = (
             soup.find("article")
             or soup.find("div", {"class": re.compile(r"article[-_]?body",  re.I)})
@@ -1034,11 +985,6 @@ def _scrape_text(url):
 
 
 def _scrape_images(url, rss_entry):
-    """
-    Scrape all valid article images from URL.
-    Falls back to RSS entry image if scrape yields nothing.
-    Returns list of image URL strings (max MAX_IMAGES).
-    """
     images = []
     seen   = set()
 
@@ -1116,7 +1062,6 @@ def _scrape_images(url, rss_entry):
     except Exception as e:
         print(f"[WARN] Image scrape: {e}")
 
-    # RSS fallback
     if len(images) < MAX_IMAGES:
         rss_img = _extract_rss_image(rss_entry)
         if rss_img:
@@ -1127,7 +1072,6 @@ def _scrape_images(url, rss_entry):
 
 
 def _extract_rss_image(entry):
-    """Extract first valid image URL from RSS entry metadata."""
     for m in entry.get("media_content", []):
         if m.get("url") and m.get("medium") == "image":
             return m["url"]
@@ -1163,15 +1107,10 @@ def _extract_rss_image(entry):
 
 
 # ═══════════════════════════════════════════════════════════
-# SECTION 6 — PHASE 3: SUMMARIZATION & TRANSLATION
+# SECTION 6 — SUMMARIZATION & TRANSLATION
 # ═══════════════════════════════════════════════════════════
 
 def _extractive_summarize(text, sentence_count=8):
-    """
-    Offline extractive summarization using sumy LsaSummarizer.
-    Falls back to first 1200 chars on any failure.
-    No network required.
-    """
     try:
         parser     = PlaintextParser.from_string(text, Tokenizer("english"))
         stemmer    = Stemmer("english")
@@ -1181,34 +1120,22 @@ def _extractive_summarize(text, sentence_count=8):
         result     = " ".join(str(s) for s in sentences).strip()
         return result if result else text[:1200]
     except Exception as e:
-        print(f"[WARN] sumy error: {e}")
+        print(f"[WARN] sumy: {e}")
         return text[:1200]
 
 
 def _translate_mymemory(text, source="en", target="fa"):
-    """
-    Translate text via MyMemory free API.
-    Splits into chunks to respect the 500-char API limit.
-    Uses MYMEMORY_EMAIL for extended daily quota (50k chars).
-    Falls back to original chunk on any translation error.
-    """
     if not text or not text.strip():
         return ""
-
     chunks     = _split_chunks(text, MYMEMORY_CHUNK_SIZE)
     translated = []
-
     for i, chunk in enumerate(chunks):
         if not chunk.strip():
             continue
         try:
-            params = {
-                "q":        chunk,
-                "langpair": f"{source}|{target}",
-            }
+            params = {"q": chunk, "langpair": f"{source}|{target}"}
             if MYMEMORY_EMAIL:
                 params["de"] = MYMEMORY_EMAIL
-
             resp = requests.get(
                 "https://api.mymemory.translated.net/get",
                 params=params,
@@ -1220,47 +1147,35 @@ def _translate_mymemory(text, source="en", target="fa"):
                 data.get("responseData", {})
                     .get("translatedText", "") or ""
             ).strip()
-
             if data.get("quotaFinished"):
-                print("[WARN] MyMemory: daily quota reached.")
+                print("[WARN] MyMemory quota reached.")
                 translated.append(chunk)
                 continue
-
             if (
                 trans
-                and "MYMEMORY WARNING"      not in trans
+                and "MYMEMORY WARNING"       not in trans
                 and "YOU USED ALL AVAILABLE" not in trans
                 and len(trans) > 2
             ):
                 translated.append(trans)
             else:
                 translated.append(chunk)
-
             if i < len(chunks) - 1:
                 time.sleep(MYMEMORY_CHUNK_DELAY)
-
         except requests.exceptions.Timeout:
-            print(f"[WARN] MyMemory timeout chunk {i+1}")
             translated.append(chunk)
         except Exception as e:
             print(f"[WARN] MyMemory chunk {i+1}: {e}")
             translated.append(chunk)
-
     return " ".join(translated).strip() if translated else None
 
 
 def _split_chunks(text, max_chars):
-    """
-    Split text into sentence-boundary chunks ≤ max_chars.
-    Preserves sentence integrity where possible.
-    """
     sentences = re.split(r"(?<=[.!?])\s+", text)
     chunks    = []
     current   = ""
-
     for sentence in sentences:
         if len(sentence) > max_chars:
-            # Sentence itself is too long — split on commas
             parts = sentence.split(", ")
             for part in parts:
                 if len(current) + len(part) + 2 <= max_chars:
@@ -1275,15 +1190,12 @@ def _split_chunks(text, max_chars):
             if current:
                 chunks.append(current.strip())
             current = sentence
-
     if current:
         chunks.append(current.strip())
-
     return [c for c in chunks if c.strip()]
 
 
 def _translate_article(title, body):
-    """Translate title and body separately. Returns (title_fa, body_fa)."""
     print(f"[INFO] Translating title ({len(title)} chars)...")
     title_fa = _translate_mymemory(title)
     time.sleep(1)
@@ -1293,26 +1205,10 @@ def _translate_article(title, body):
 
 
 # ═══════════════════════════════════════════════════════════
-# SECTION 7 — PHASE 4: CAPTION BUILDER
+# SECTION 7 — CAPTION BUILDER
 # ═══════════════════════════════════════════════════════════
 
 def _build_caption(title_fa, body_fa, hashtags, category):
-    """
-    Build final Persian Telegram caption.
-
-    Format:
-      <b>Persian Title</b>
-
-      @irfashionnews
-
-      Body text...
-
-      #hashtag1 #hashtag2 ...
-
-      EMOJI <i>کانال مد و فشن ایرانی</i>
-
-    Trims body if total exceeds CAPTION_MAX.
-    """
     def _esc(t):
         return (
             t.replace("&", "&amp;")
@@ -1346,7 +1242,6 @@ def _build_caption(title_fa, body_fa, hashtags, category):
 
     caption = "\n\n".join(parts)
 
-    # Trim body if over limit
     if len(caption) > CAPTION_MAX:
         overflow  = len(caption) - CAPTION_MAX
         safe_body = safe_body[:max(0, len(safe_body) - overflow - 5)] + "…"
@@ -1357,43 +1252,21 @@ def _build_caption(title_fa, body_fa, hashtags, category):
 
 
 # ═══════════════════════════════════════════════════════════
-# SECTION 8 — PHASE 6: TELEGRAM POSTING
+# SECTION 8 — TELEGRAM POSTING
 #
-# FINAL REQUIRED BEHAVIOR (from project spec):
+# MANDATORY ORDER (project spec):
+#   Step 1: send_media_group(ALL images, NO caption)
+#   Step 2: sleep(0.8s)
+#   Step 3: send_photo(images[0] + caption)
 #
-#   Step 1: send_media_group(all images, NO caption)
-#   Step 2: sleep(0.5–1.0s)
-#   Step 3: send_photo(best image + full Persian caption)
-#
-# Caption appears EXACTLY ONCE — only on send_photo.
-# Never attached to media_group.
-# This ordering is mandatory. Do not reverse steps.
-#
-# Why this order (spec reason):
-#   The album arrives first, establishing a clean visual block.
-#   The captioned image follows immediately after, attaching
-#   to the same visual group in Telegram's rendering.
-#   Reversing the order causes the album to appear AFTER the
-#   captioned post, splitting the visual block.
-#
-# Step 1 failure is non-fatal (album is supplemental).
-# Step 3 failure is fatal (caption is the primary post).
+# Caption appears EXACTLY ONCE — on send_photo only.
+# Album step is non-fatal if it fails.
 # ═══════════════════════════════════════════════════════════
 
 async def _post_to_telegram(bot, chat_id, caption, image_urls):
-    """
-    Two-step Telegram posting.
-
-    Step 1: Album (no caption) — non-fatal if it fails
-    Step 2: Single photo + caption — primary post
-
-    Returns True if caption was successfully sent, False otherwise.
-    """
-    # ── Select best image for caption post ──
-    # Use first image as the captioned lead photo.
     caption_image = image_urls[0] if image_urls else None
 
-    # ── Step 1: Album (all images, NO caption) ──
+    # Step 1: Album (no caption)
     if len(image_urls) >= 2:
         try:
             media_group = [
@@ -1403,25 +1276,25 @@ async def _post_to_telegram(bot, chat_id, caption, image_urls):
             await bot.send_media_group(
                 chat_id=chat_id,
                 media=media_group,
-                # caption intentionally omitted — spec requirement
                 disable_notification=True,
             )
-            print(f"[INFO] Step 1: Album sent ({len(media_group)} images, no caption).")
+            print(
+                f"[INFO] Step 1: Album sent "
+                f"({len(media_group)} images, no caption)."
+            )
         except Exception as e:
-            # Album failure is non-fatal.
-            # Caption post in Step 2 is the primary deliverable.
             print(f"[WARN] Step 1 album failed (non-fatal): {str(e)[:120]}")
-    elif len(image_urls) == 1:
-        # Only one image — skip album, go straight to Step 2
-        print("[INFO] Step 1: Skipped (only 1 image — going straight to caption post).")
     else:
-        print("[INFO] Step 1: Skipped (no images).")
+        print(
+            f"[INFO] Step 1: Skipped "
+            f"({'1 image' if image_urls else 'no images'} — album needs ≥2)."
+        )
 
-    # ── Mandatory delay between album and caption post ──
+    # Delay between album and caption post
     if len(image_urls) >= 2:
         await asyncio.sleep(0.8)
 
-    # ── Step 2: Single photo + caption ──
+    # Step 2: Captioned photo (primary post)
     try:
         if caption_image:
             await bot.send_photo(
@@ -1433,7 +1306,6 @@ async def _post_to_telegram(bot, chat_id, caption, image_urls):
             )
             print("[INFO] Step 2: Caption photo sent.")
         else:
-            # No images at all — send text only
             await bot.send_message(
                 chat_id=chat_id,
                 text=caption,
@@ -1441,12 +1313,11 @@ async def _post_to_telegram(bot, chat_id, caption, image_urls):
                 link_preview_options=LinkPreviewOptions(is_disabled=True),
                 disable_notification=True,
             )
-            print("[INFO] Step 2: Text-only caption sent (no images available).")
+            print("[INFO] Step 2: Text-only caption sent.")
         return True
 
     except Exception as e:
-        print(f"[WARN] Step 2 photo send failed: {str(e)[:120]}")
-        # Fallback: plain text message
+        print(f"[WARN] Step 2 photo failed: {str(e)[:120]}")
         try:
             await bot.send_message(
                 chat_id=chat_id,
@@ -1455,7 +1326,7 @@ async def _post_to_telegram(bot, chat_id, caption, image_urls):
                 link_preview_options=LinkPreviewOptions(is_disabled=True),
                 disable_notification=True,
             )
-            print("[INFO] Step 2 fallback: text-only message sent.")
+            print("[INFO] Step 2 fallback: text-only sent.")
             return True
         except Exception as e2:
             print(f"[ERROR] Step 2 all methods failed: {str(e2)[:120]}")
@@ -1463,7 +1334,7 @@ async def _post_to_telegram(bot, chat_id, caption, image_urls):
 
 
 # ═══════════════════════════════════════════════════════════
-# SECTION 9 — PHASE 5: DATABASE WRITE
+# SECTION 9 — DATABASE WRITE
 # ═══════════════════════════════════════════════════════════
 
 def _build_db_payload(
@@ -1471,22 +1342,6 @@ def _build_db_payload(
     title_hash, content_hash, category,
     trend_score, post_hour, domain_hash,
 ):
-    """
-    Build schema-safe data dict for Appwrite write.
-
-    Fields written:
-      link          → String (indexed) — L1 duplicate key
-      title         → String
-      published_at  → String ISO8601
-      feed_url      → String
-      source_type   → String
-      title_hash    → String (indexed) — L2b legacy key
-      content_hash  → String (indexed) — L2 duplicate key
-      category      → String — analytics
-      trend_score   → Integer — analytics
-      post_hour     → Integer — analytics
-      domain_hash   → String (indexed) — L4b domain dedup key
-    """
     if pub_date.tzinfo is None:
         pub_date = pub_date.replace(tzinfo=timezone.utc)
     return {
@@ -1511,13 +1366,8 @@ def _save_to_db(
     category, trend_score, post_hour, domain_hash,
 ):
     """
-    Write article record to Appwrite DB.
-
-    Called BEFORE Telegram posting (distributed lock pattern).
-
-    Returns:
-      True  → record written successfully
-      False → write failed (caller must abort posting)
+    Returns True on success, False on failure.
+    Caller aborts posting on False.
     """
     payload = _build_db_payload(
         link, title, feed_url, pub_date, source_type,
@@ -1525,7 +1375,6 @@ def _save_to_db(
         trend_score, post_hour, domain_hash,
     )
     print(f"[INFO] DB write: {payload['link'][:70]}")
-
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", DeprecationWarning)
         try:
@@ -1545,17 +1394,16 @@ def _save_to_db(
                 )
             print("[SUCCESS] DB write complete.")
             return True
-
         except AppwriteException as e:
-            print(f"[ERROR] DB write AppwriteException: {e.message}")
+            print(f"[ERROR] DB write: {e.message}")
             return False
         except Exception as e:
-            print(f"[ERROR] DB write unexpected: {e}")
+            print(f"[ERROR] DB write: {e}")
             return False
 
 
 # ═══════════════════════════════════════════════════════════
-# LOCAL TEST ENTRY
+# LOCAL TEST
 # ═══════════════════════════════════════════════════════════
 if __name__ == "__main__":
     asyncio.run(main())
