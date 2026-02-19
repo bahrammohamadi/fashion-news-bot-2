@@ -1,34 +1,44 @@
 # ============================================================
 # Function 1: International Fashion Poster
 # Project:    @irfashionnews — FashionBotProject
-# Version:    6.0 — PRODUCTION STABLE
+# Version:    7.0 — NO EXTERNAL LLM
 # Runtime:    python-3.12 / Appwrite Cloud Functions
-# Timeout:    120 seconds (Appwrite free plan setting)
+# Timeout:    120 seconds
 #
-# What's new in v6.0:
-#   [1] Trend-aware article selection
-#       Scores each article by freshness + title signals
-#       Picks highest-scored unposted article, not just newest
-#   [2] Verified free OpenRouter model fallback chain
-#       Primary:  deepseek/deepseek-chat:free
-#       Fallback: mistralai/mistral-7b-instruct:free
-#       Last:     qwen/qwen-2-7b-instruct:free
-#   [3] Content quality gate
-#       Skips articles with < 150 chars of usable content
-#   [4] Cleaner prompt — reduces DeepSeek token usage
-#   [5] All syntax errors fixed (no triple-quote f-strings)
-#   [6] Appwrite SDK auto-detection preserved
-#   [7] Full deprecation warning suppression
+# Translation stack (fully free, no LLM API):
 #
-# Flow:
-#   RSS scan (parallel) → score + select → scrape →
-#   quality gate → LLM → caption → Telegram → DB save
+#   Step 1: Scrape full article (BeautifulSoup)
+#   Step 2: Extract key sentences (sumy LSA — 100% offline)
+#   Step 3: Translate via MyMemory free API
+#              - Official API, no key required
+#              - Free tier: 5000 chars/day
+#              - With email param: 50000 chars/day
+#              - Endpoint: api.mymemory.translated.net
+#   Step 4: Format as clean Persian caption
+#   Step 5: Post to Telegram
+#
+# What was REMOVED:
+#   - openai library
+#   - OpenRouter calls
+#   - deepseek / mistral / qwen models
+#   - All external LLM dependencies
+#
+# What was ADDED:
+#   - sumy (offline extractive summarizer)
+#   - MyMemory translation (free official API)
+#   - nltk punkt tokenizer (for sumy)
+#
+# Quality note:
+#   Output will be clean, readable Persian translation.
+#   It will NOT be magazine-style rewriting.
+#   That requires an LLM — no free local alternative exists.
 #
 # Schedule: Every 45 minutes
 # ============================================================
 
 import os
 import re
+import time
 import asyncio
 import warnings
 import feedparser
@@ -40,7 +50,15 @@ from appwrite.client import Client
 from appwrite.services.databases import Databases
 from appwrite.exception import AppwriteException
 from appwrite.query import Query
-from openai import AsyncOpenAI
+
+# sumy — offline extractive summarizer
+# Selects most important sentences from English text
+# before sending to translation API
+from sumy.parsers.plaintext import PlaintextParser
+from sumy.nlp.tokenizers import Tokenizer
+from sumy.summarizers.lsa import LsaSummarizer
+from sumy.nlp.stemmers import Stemmer
+from sumy.utils import get_stop_words
 
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="appwrite")
 
@@ -51,61 +69,56 @@ warnings.filterwarnings("ignore", category=DeprecationWarning, module="appwrite"
 
 COLLECTION_ID     = "history"
 SOURCE_TYPE       = "en"
-ARTICLE_AGE_HOURS = 36      # scan window — wider = more candidates to score
-CAPTION_MAX       = 1020    # Telegram caption hard limit
-MAX_SCRAPED_CHARS = 2500
-MAX_RSS_CHARS     = 900
-MIN_CONTENT_CHARS = 150     # quality gate — skip thin articles
+ARTICLE_AGE_HOURS = 36
+CAPTION_MAX       = 1020
+MAX_SCRAPED_CHARS = 3000
+MAX_RSS_CHARS     = 1000
+MIN_CONTENT_CHARS = 150
 
-# Appwrite schema field limits (1 under max)
+# Appwrite schema field limits
 DB_LINK_MAX        = 999
 DB_TITLE_MAX       = 499
 DB_FEED_URL_MAX    = 499
 DB_SOURCE_TYPE_MAX = 19
 
 # Timeout budgets (seconds)
-# Total budget: 120s (Appwrite timeout setting)
-FEED_FETCH_TIMEOUT = 7      # per-feed socket timeout
-FEEDS_SCAN_TIMEOUT = 20     # parallel scan hard cap
-SCRAPE_TIMEOUT     = 10     # article scrape hard cap
-LLM_TIMEOUT        = 55     # per-model attempt cap
-TELEGRAM_TIMEOUT   = 10     # Telegram send hard cap
+FEED_FETCH_TIMEOUT    = 7
+FEEDS_SCAN_TIMEOUT    = 20
+SCRAPE_TIMEOUT        = 10
+TRANSLATION_TIMEOUT   = 40   # MyMemory can be slow for multiple chunks
+TELEGRAM_TIMEOUT      = 10
 
-# ── Trend scoring weights ──
-# Used to rank articles by interest level
-SCORE_RECENCY_MAX   = 40    # max points for freshness
-SCORE_TITLE_KEYWORD = 15    # per matching trend keyword in title
-SCORE_HAS_IMAGE     = 10    # bonus if RSS entry has image
-SCORE_DESC_LENGTH   = 10    # bonus if description is rich
+# Summarizer settings
+SUMMARY_SENTENCES = 8        # extract 8 key sentences before translating
 
-# ── High-interest fashion keywords for scoring ──
+# MyMemory settings
+MYMEMORY_CHUNK_SIZE  = 450   # chars per API request (API limit ~500)
+MYMEMORY_CHUNK_DELAY = 1.0   # seconds between chunk requests
+# Optional: add your email for 50000 chars/day instead of 5000
+# Leave empty string for anonymous 5000 chars/day
+MYMEMORY_EMAIL = "lasvaram@gmail.com"
+
+# Trend scoring
+SCORE_RECENCY_MAX   = 40
+SCORE_TITLE_KEYWORD = 15
+SCORE_HAS_IMAGE     = 10
+SCORE_DESC_LENGTH   = 10
+
 TREND_KEYWORDS = [
-    # Business signals
     "launches", "unveils", "debuts", "announces", "names",
     "acquires", "appoints", "partners", "expands", "opens",
-    # Trend signals
     "trend", "collection", "season", "runway", "fashion week",
     "capsule", "collab", "collaboration", "limited edition",
-    # Engagement signals
     "viral", "popular", "iconic", "exclusive", "first look",
     "top", "best", "most", "new", "latest",
-    # Brand signals (high interest)
     "chanel", "dior", "gucci", "prada", "louis vuitton",
     "zara", "h&m", "nike", "adidas", "balenciaga",
     "versace", "fendi", "burberry", "valentino", "armani",
 ]
 
-# ── Verified free OpenRouter models (Feb 2026) ──
-# Tried in order — first success wins
-LLM_MODELS = [
-    "deepseek/deepseek-chat:free",
-    "mistralai/mistral-7b-instruct:free",
-    "qwen/qwen-2-7b-instruct:free",
-]
-
 
 # ─────────────────────────────────────────────
-# RSS FEEDS — International Fashion
+# RSS FEEDS
 # ─────────────────────────────────────────────
 
 RSS_FEEDS = [
@@ -137,7 +150,7 @@ RSS_FEEDS = [
 # ─────────────────────────────────────────────
 
 async def main(event=None, context=None):
-    print("[INFO] ═══ Function 1 v6.0 started ═══")
+    print("[INFO] ═══ Function 1 v7.0 (No-LLM) started ═══")
     loop       = asyncio.get_event_loop()
     start_time = loop.time()
 
@@ -153,7 +166,6 @@ async def main(event=None, context=None):
     appwrite_project  = os.environ.get("APPWRITE_PROJECT_ID")
     appwrite_key      = os.environ.get("APPWRITE_API_KEY")
     database_id       = os.environ.get("APPWRITE_DATABASE_ID")
-    openrouter_key    = os.environ.get("OPENROUTER_API_KEY")
 
     missing = [
         k for k, v in {
@@ -162,7 +174,6 @@ async def main(event=None, context=None):
             "APPWRITE_PROJECT_ID":  appwrite_project,
             "APPWRITE_API_KEY":     appwrite_key,
             "APPWRITE_DATABASE_ID": database_id,
-            "OPENROUTER_API_KEY":   openrouter_key,
         }.items() if not v
     ]
     if missing:
@@ -170,15 +181,6 @@ async def main(event=None, context=None):
         return {"status": "error", "missing_vars": missing}
 
     # ── Clients ──
-    llm = AsyncOpenAI(
-        api_key=openrouter_key,
-        base_url="https://openrouter.ai/api/v1",
-        default_headers={
-            "HTTP-Referer": "https://t.me/irfashionnews",
-            "X-Title":      "IrFashionNews Bot",
-        },
-    )
-
     bot = Bot(token=token)
 
     aw_client = Client()
@@ -188,16 +190,14 @@ async def main(event=None, context=None):
     databases = Databases(aw_client)
     sdk_mode  = "new" if hasattr(databases, "list_rows") else "legacy"
 
-    print(f"[INFO] SDK mode: {sdk_mode} | Models: {LLM_MODELS}")
+    print(f"[INFO] SDK mode: {sdk_mode}")
+    print(f"[INFO] Translation: MyMemory API (free, no key)")
 
     now            = datetime.now(timezone.utc)
     time_threshold = now - timedelta(hours=ARTICLE_AGE_HOURS)
 
     # ════════════════════════════════════════════════
     # PHASE 1 — PARALLEL RSS SCAN + TREND SCORING
-    # Fetch all feeds simultaneously.
-    # Score every article by interest signals.
-    # Pick the highest-scored unposted article.
     # Budget: 20 seconds
     # ════════════════════════════════════════════════
     print(
@@ -237,8 +237,8 @@ async def main(event=None, context=None):
     score    = candidate["score"]
 
     print(
-        f"[INFO] [{elapsed()}s] Selected (score={score}): "
-        f"{title[:65]}"
+        f"[INFO] [{elapsed()}s] "
+        f"Selected (score={score}): {title[:65]}"
     )
 
     # ════════════════════════════════════════════════
@@ -259,7 +259,6 @@ async def main(event=None, context=None):
         print(f"[WARN] [{elapsed()}s] Scrape error: {e}")
         full_text = None
 
-    # Use richest available text
     content = (
         full_text
         if full_text and len(full_text) > len(desc)
@@ -267,84 +266,74 @@ async def main(event=None, context=None):
     )
 
     print(
-        f"[INFO] [{elapsed()}s] Content: "
+        f"[INFO] [{elapsed()}s] "
         f"{'scraped' if full_text else 'rss-summary'} "
         f"({len(content)} chars)"
     )
 
-    # ── Quality gate ──
-    # If we have almost no content, the LLM will produce a
-    # thin article. Skip and mark as posted to avoid retry.
     if len(content) < MIN_CONTENT_CHARS:
-        print(
-            f"[WARN] [{elapsed()}s] Content too thin "
-            f"({len(content)} chars < {MIN_CONTENT_CHARS}). "
-            "Skipping — saving to DB."
+        print(f"[WARN] [{elapsed()}s] Content too thin. Skipping.")
+        save_to_db(
+            databases, database_id, COLLECTION_ID,
+            link, title, feed_url, pub_date, SOURCE_TYPE, sdk_mode,
         )
+        return {"status": "skipped", "reason": "thin_content", "posted": False}
+
+    # ════════════════════════════════════════════════
+    # PHASE 3 — OFFLINE SUMMARIZE + FREE TRANSLATE
+    #
+    # Step A: Extract key sentences with sumy (offline, instant)
+    # Step B: Translate title separately (MyMemory API)
+    # Step C: Translate summary body (MyMemory API, chunked)
+    #
+    # Budget: 40 seconds
+    # ════════════════════════════════════════════════
+    print(f"[INFO] [{elapsed()}s] Phase 3: Summarize + Translate...")
+
+    # Step A — Offline extractive summarization
+    english_summary = await loop.run_in_executor(
+        None,
+        extractive_summarize,
+        content,
+        SUMMARY_SENTENCES,
+    )
+    print(
+        f"[INFO] [{elapsed()}s] Summary: {len(english_summary)} chars "
+        f"from {len(content)} chars"
+    )
+
+    # Step B+C — Translate via MyMemory (free official API)
+    try:
+        title_fa, body_fa = await asyncio.wait_for(
+            loop.run_in_executor(
+                None,
+                translate_article,
+                title,
+                english_summary,
+            ),
+            timeout=TRANSLATION_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        print(f"[WARN] [{elapsed()}s] Translation timed out.")
+        title_fa = title     # fallback: keep English title
+        body_fa  = english_summary  # fallback: keep English body
+
+    if not title_fa or not body_fa:
+        print(f"[WARN] [{elapsed()}s] Translation returned empty.")
         save_to_db(
             databases, database_id, COLLECTION_ID,
             link, title, feed_url, pub_date, SOURCE_TYPE, sdk_mode,
         )
         return {
-            "status": "skipped",
-            "reason": "content_too_thin",
+            "status": "error",
+            "reason": "translation_failed",
             "posted": False,
         }
 
-    # ════════════════════════════════════════════════
-    # PHASE 3 — LLM CASCADE
-    # Try each model in order until one succeeds.
-    # Each attempt gets a fair time slice.
-    # Budget: 55 seconds total across all attempts
-    # ════════════════════════════════════════════════
-    print(f"[INFO] [{elapsed()}s] Phase 3: LLM translation...")
-
-    prompt          = build_prompt(title, desc, content, pub_date)
-    persian_article = None
-    llm_start       = loop.time()
-    time_per_model  = LLM_TIMEOUT / len(LLM_MODELS)
-
-    for model in LLM_MODELS:
-        if persian_article:
-            break
-
-        time_used = loop.time() - llm_start
-        remaining = LLM_TIMEOUT - time_used
-        if remaining < 5:
-            print(f"[WARN] [{elapsed()}s] LLM budget exhausted.")
-            break
-
-        attempt_budget = min(time_per_model, remaining)
-        print(
-            f"[INFO] [{elapsed()}s] Trying {model} "
-            f"({attempt_budget:.0f}s budget)..."
-        )
-
-        try:
-            persian_article = await asyncio.wait_for(
-                call_llm(llm, prompt, model),
-                timeout=attempt_budget,
-            )
-            if persian_article:
-                print(
-                    f"[SUCCESS] [{elapsed()}s] "
-                    f"{model}: {len(persian_article)} chars"
-                )
-        except asyncio.TimeoutError:
-            print(f"[WARN] [{elapsed()}s] {model} timed out.")
-        except Exception as e:
-            print(f"[WARN] [{elapsed()}s] {model} error: {e}")
-
-    if not persian_article:
-        print(
-            f"[ERROR] [{elapsed()}s] All LLMs failed. "
-            "Saving link to prevent retry loop."
-        )
-        save_to_db(
-            databases, database_id, COLLECTION_ID,
-            link, title, feed_url, pub_date, SOURCE_TYPE, sdk_mode,
-        )
-        return {"status": "error", "reason": "llm_failed", "posted": False}
+    print(
+        f"[INFO] [{elapsed()}s] Translation done: "
+        f"title={len(title_fa)} chars, body={len(body_fa)} chars"
+    )
 
     # ════════════════════════════════════════════════
     # PHASE 4 — CAPTION + TELEGRAM POST
@@ -352,7 +341,7 @@ async def main(event=None, context=None):
     # ════════════════════════════════════════════════
     print(f"[INFO] [{elapsed()}s] Phase 4: Posting...")
 
-    caption   = build_caption(persian_article)
+    caption   = build_caption(title_fa, body_fa)
     image_url = extract_image(entry)
 
     print(
@@ -370,7 +359,7 @@ async def main(event=None, context=None):
         print(f"[WARN] [{elapsed()}s] Telegram timed out.")
         posted = False
     except Exception as e:
-        print(f"[ERROR] [{elapsed()}s] Telegram error: {e}")
+        print(f"[ERROR] [{elapsed()}s] Telegram: {e}")
         posted = False
 
     if posted:
@@ -380,37 +369,25 @@ async def main(event=None, context=None):
             link, title, feed_url, pub_date, SOURCE_TYPE, sdk_mode,
         )
     else:
-        print(
-            f"[ERROR] [{elapsed()}s] "
-            "Telegram failed — not saving (will retry next run)."
-        )
+        print(f"[ERROR] [{elapsed()}s] Telegram failed.")
 
     print(
-        f"[INFO] ═══ v6.0 done in {elapsed()}s "
-        f"| posted={posted} ═══"
+        f"[INFO] ═══ v7.0 done in {elapsed()}s | posted={posted} ═══"
     )
     return {"status": "success", "posted": posted}
 
 
 # ─────────────────────────────────────────────
-# PHASE 1 — TREND-AWARE CANDIDATE SELECTION
+# PHASE 1 — CANDIDATE SELECTION
 # ─────────────────────────────────────────────
 
 async def find_best_candidate(
     feeds, databases, database_id, collection_id,
     time_threshold, sdk_mode, now,
 ):
-    """
-    Fetch all RSS feeds in parallel.
-    Score every recent article by interest signals.
-    Check duplicates only for top candidates (saves DB calls).
-    Return highest-scored unposted article or None.
-    """
     loop  = asyncio.get_event_loop()
     tasks = [
-        loop.run_in_executor(
-            None, fetch_feed_entries, url, time_threshold
-        )
+        loop.run_in_executor(None, fetch_feed_entries, url, time_threshold)
         for url in feeds
     ]
     results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -418,89 +395,66 @@ async def find_best_candidate(
     all_candidates = []
     for i, result in enumerate(results):
         if isinstance(result, Exception):
-            print(f"[WARN] Feed error ({feeds[i][:45]}): {result}")
+            print(f"[WARN] Feed ({feeds[i][:45]}): {result}")
             continue
         if result:
             all_candidates.extend(result)
 
     print(f"[INFO] {len(all_candidates)} recent articles collected.")
-
     if not all_candidates:
         return None
 
-    # Score every candidate
     for c in all_candidates:
         c["score"] = score_article(c, now)
 
-    # Sort by score descending
     all_candidates.sort(key=lambda x: x["score"], reverse=True)
 
-    # Log top 5 for visibility
-    print("[INFO] Top candidates by score:")
+    print("[INFO] Top candidates:")
     for c in all_candidates[:5]:
-        print(
-            f"       score={c['score']:>3} | "
-            f"{c['title'][:55]}"
-        )
+        print(f"       [{c['score']:>3}] {c['title'][:60]}")
 
-    # Check duplicates — return first unposted from top of list
     for c in all_candidates:
         if not is_duplicate(
             databases, database_id, collection_id, c["link"], sdk_mode
         ):
             return c
-        print(f"[INFO] Duplicate: {c['title'][:50]}")
+        print(f"[INFO] Duplicate: {c['title'][:55]}")
 
     return None
 
 
 def score_article(candidate, now):
-    """
-    Score an article 0–100 based on free signals only.
-    Higher = more likely to be interesting to readers.
-
-    Signals used:
-      - Recency (up to 40 points)
-      - Trend keyword matches in title (up to 45 points)
-      - Has image in RSS (10 points)
-      - Description richness (10 points)
-    """
-    score = 0
-
-    # ── Recency score (0–40) ──
-    # Articles from last 3 hours get full points
-    # Older articles decay linearly
+    score     = 0
     age_hours = (now - candidate["pub_date"]).total_seconds() / 3600
-    if age_hours <= 3:
-        recency = SCORE_RECENCY_MAX
-    elif age_hours <= ARTICLE_AGE_HOURS:
-        recency = int(
-            SCORE_RECENCY_MAX * (1 - (age_hours - 3) / (ARTICLE_AGE_HOURS - 3))
-        )
-    else:
-        recency = 0
-    score += recency
 
-    # ── Keyword score ──
+    # Recency (0–40)
+    if age_hours <= 3:
+        score += SCORE_RECENCY_MAX
+    elif age_hours <= ARTICLE_AGE_HOURS:
+        score += int(
+            SCORE_RECENCY_MAX
+            * (1 - (age_hours - 3) / (ARTICLE_AGE_HOURS - 3))
+        )
+
+    # Keywords
     title_lower = candidate["title"].lower()
     desc_lower  = candidate["description"].lower()
-
     matched = 0
     for kw in TREND_KEYWORDS:
+        if matched >= 3:
+            break
         if kw in title_lower:
             score   += SCORE_TITLE_KEYWORD
             matched += 1
         elif kw in desc_lower:
-            score   += 5   # description match worth less
+            score   += 5
             matched += 1
-        if matched >= 3:   # cap keyword bonus
-            break
 
-    # ── Image bonus ──
+    # Image bonus
     if extract_image(candidate["entry"]):
         score += SCORE_HAS_IMAGE
 
-    # ── Description richness bonus ──
+    # Description length bonus
     if len(candidate["description"]) > 200:
         score += SCORE_DESC_LENGTH
 
@@ -508,10 +462,6 @@ def score_article(candidate, now):
 
 
 def fetch_feed_entries(feed_url, time_threshold):
-    """
-    Synchronous RSS parser — runs in thread pool.
-    Returns list of article candidate dicts.
-    """
     import socket
     try:
         old = socket.getdefaulttimeout()
@@ -529,20 +479,16 @@ def fetch_feed_entries(feed_url, time_threshold):
         )
         if not published:
             continue
-
         pub_date = datetime(*published[:6], tzinfo=timezone.utc)
         if pub_date < time_threshold:
             continue
-
         title = (entry.get("title") or "").strip()
         link  = (entry.get("link") or "").strip()
         if not title or not link:
             continue
-
         raw  = entry.get("summary") or entry.get("description") or ""
         desc = re.sub(r"<[^>]+>", " ", raw)
         desc = re.sub(r"\s+", " ", desc).strip()
-
         candidates.append({
             "title":       title,
             "link":        link,
@@ -552,20 +498,14 @@ def fetch_feed_entries(feed_url, time_threshold):
             "entry":       entry,
             "score":       0,
         })
-
     return candidates
 
 
 # ─────────────────────────────────────────────
-# PHASE 2 — ARTICLE SCRAPER
+# PHASE 2 — SCRAPER
 # ─────────────────────────────────────────────
 
 def scrape_article(url):
-    """
-    Fetch article and extract clean paragraph text.
-    Synchronous — called via run_in_executor.
-    Returns plain text string or None.
-    """
     try:
         resp = requests.get(
             url,
@@ -580,7 +520,6 @@ def scrape_article(url):
             timeout=SCRAPE_TIMEOUT - 2,
         )
         resp.raise_for_status()
-
         soup = BeautifulSoup(resp.text, "lxml")
 
         for tag in soup([
@@ -606,14 +545,13 @@ def scrape_article(url):
             if len(p.get_text().strip()) > 40
         )
         text = re.sub(r"\s+", " ", text).strip()
-
         return text[:MAX_SCRAPED_CHARS] if len(text) >= 100 else None
 
     except requests.exceptions.Timeout:
         print(f"[WARN] Scrape timeout: {url[:60]}")
         return None
     except requests.exceptions.HTTPError as e:
-        print(f"[WARN] Scrape HTTP {e.response.status_code}: {url[:60]}")
+        print(f"[WARN] HTTP {e.response.status_code}: {url[:60]}")
         return None
     except Exception as e:
         print(f"[WARN] Scrape: {e}")
@@ -621,131 +559,172 @@ def scrape_article(url):
 
 
 # ─────────────────────────────────────────────
-# PHASE 3 — LLM PROMPT + CALL
+# PHASE 3A — OFFLINE EXTRACTIVE SUMMARIZER
+# Uses sumy LSA algorithm — no internet, no API
+# Reduces text to most important sentences
+# before sending to translation API
 # ─────────────────────────────────────────────
 
-def build_prompt(title, description, content, pub_date):
+def extractive_summarize(text, sentence_count=8):
     """
-    Persian magazine rewrite prompt.
-    Uses explicit string concatenation — no triple-quote f-string.
-    """
-    date_str = pub_date.strftime("%Y-%m-%d")
-    d        = description[:400]
-    c        = content[:1600]
-
-    return (
-        "You are a senior Persian fashion magazine editor at a prestigious Iranian publication.\n"
-        "Your task: translate and rewrite the following English fashion news\n"
-        "into a fluent, elegant Persian article.\n"
-        "\n"
-        "SOURCE ARTICLE:\n"
-        f"Title:   {title}\n"
-        f"Summary: {d}\n"
-        f"Content: {c}\n"
-        f"Date:    {date_str}\n"
-        "\n"
-        "WRITING RULES:\n"
-        "1. Write entirely in Persian (Farsi).\n"
-        "2. Keep proper nouns in original language:\n"
-        "   brand names, designer names, city names, event names.\n"
-        "   Examples: Chanel, Dior, Gucci, Milan, Paris Fashion Week\n"
-        "3. Do NOT add section labels (no Headline, Lead, Body, etc.).\n"
-        "4. Article structure:\n"
-        "   - Line 1: Strong Persian headline (8-12 words)\n"
-        "   - Blank line\n"
-        "   - Lead paragraph: 2 sentences, the most important fact\n"
-        "   - Blank line\n"
-        "   - Body: 2 to 3 paragraphs with smooth logical flow\n"
-        "   - Blank line\n"
-        "   - Closing: 2 sentences of neutral industry perspective\n"
-        "5. Tone: formal, elegant, journalistic.\n"
-        "   Write as if publishing in a top Iranian fashion magazine.\n"
-        "6. Target length: 200 to 280 words.\n"
-        "7. Use ONLY facts stated in the source. No invented details.\n"
-        "\n"
-        "Output ONLY the Persian article text.\n"
-        "Do not include any English commentary, labels, or preamble.\n"
-        "Start directly with the Persian headline:"
-    )
-
-
-async def call_llm(llm, prompt, model):
-    """
-    Call one OpenRouter model.
-    Cleans response of artifacts.
-    Returns Persian text string or None.
+    Extract the N most important sentences from English text.
+    100% offline — uses sumy LSA algorithm.
+    Returns joined sentence string.
     """
     try:
-        response = await llm.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.65,
-            max_tokens=850,
-        )
-
-        text = (response.choices[0].message.content or "").strip()
-
-        # Remove DeepSeek chain-of-thought blocks
-        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
-
-        # Remove markdown fences
-        text = re.sub(r"^```[\w]*\n?", "", text).strip()
-        text = re.sub(r"\n?```$", "", text).strip()
-
-        if not text:
-            print(f"[WARN] {model}: empty response.")
-            return None
-
-        return text
-
+        parser     = PlaintextParser.from_string(text, Tokenizer("english"))
+        stemmer    = Stemmer("english")
+        summarizer = LsaSummarizer(stemmer)
+        summarizer.stop_words = get_stop_words("english")
+        sentences  = summarizer(parser.document, sentence_count)
+        result     = " ".join(str(s) for s in sentences).strip()
+        return result if result else text[:1200]
     except Exception as e:
-        err = str(e)
-        if "429" in err:
-            print(f"[WARN] {model}: rate limited.")
-        elif "404" in err:
-            print(f"[WARN] {model}: not found.")
+        print(f"[WARN] sumy error: {e}")
+        return text[:1200]
+
+
+# ─────────────────────────────────────────────
+# PHASE 3B — MYMEMORY FREE TRANSLATION API
+#
+# Official free API by Translated.net
+# No API key required for 5000 chars/day
+# Add MYMEMORY_EMAIL for 50000 chars/day
+# Docs: https://mymemory.translated.net/doc/spec.php
+# ─────────────────────────────────────────────
+
+def translate_mymemory(text, source="en", target="fa"):
+    """
+    Translate text using MyMemory free API.
+    Splits into chunks to respect per-request limits.
+    Returns translated string or None on failure.
+    """
+    if not text or not text.strip():
+        return ""
+
+    chunks     = split_into_chunks(text, MYMEMORY_CHUNK_SIZE)
+    translated = []
+
+    for i, chunk in enumerate(chunks):
+        if not chunk.strip():
+            continue
+        try:
+            params = {
+                "q":        chunk,
+                "langpair": f"{source}|{target}",
+            }
+            if MYMEMORY_EMAIL:
+                params["de"] = MYMEMORY_EMAIL
+
+            resp = requests.get(
+                "https://api.mymemory.translated.net/get",
+                params=params,
+                timeout=12,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+            result    = data.get("responseData", {})
+            trans     = (result.get("translatedText") or "").strip()
+            quota_msg = data.get("quotaFinished", False)
+
+            if quota_msg:
+                print("[WARN] MyMemory: daily quota reached.")
+                translated.append(chunk)   # keep English for this chunk
+                continue
+
+            if (
+                trans
+                and "MYMEMORY WARNING" not in trans
+                and "YOU USED ALL AVAILABLE" not in trans
+                and len(trans) > 2
+            ):
+                translated.append(trans)
+            else:
+                print(f"[WARN] MyMemory chunk {i+1}: bad response — {trans[:60]}")
+                translated.append(chunk)  # keep English
+
+            # Rate limit protection
+            if i < len(chunks) - 1:
+                time.sleep(MYMEMORY_CHUNK_DELAY)
+
+        except requests.exceptions.Timeout:
+            print(f"[WARN] MyMemory timeout chunk {i+1}")
+            translated.append(chunk)
+        except Exception as e:
+            print(f"[WARN] MyMemory chunk {i+1}: {e}")
+            translated.append(chunk)
+
+    return " ".join(translated).strip() if translated else None
+
+
+def split_into_chunks(text, max_chars):
+    """
+    Split text at sentence boundaries to respect API char limits.
+    Never splits mid-sentence.
+    """
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    chunks    = []
+    current   = ""
+
+    for sentence in sentences:
+        if len(sentence) > max_chars:
+            # Single sentence too long — split on comma
+            parts = sentence.split(", ")
+            for part in parts:
+                if len(current) + len(part) + 2 <= max_chars:
+                    current += ("" if not current else ", ") + part
+                else:
+                    if current:
+                        chunks.append(current.strip())
+                    current = part
+        elif len(current) + len(sentence) + 1 <= max_chars:
+            current += ("" if not current else " ") + sentence
         else:
-            print(f"[WARN] {model}: {err[:120]}")
-        return None
+            if current:
+                chunks.append(current.strip())
+            current = sentence
+
+    if current:
+        chunks.append(current.strip())
+
+    return [c for c in chunks if c.strip()]
+
+
+def translate_article(title, body):
+    """
+    Translate title and body separately.
+    Returns (title_fa, body_fa) tuple.
+    Runs synchronously — call via run_in_executor.
+    """
+    print(f"[INFO] Translating title ({len(title)} chars)...")
+    title_fa = translate_mymemory(title)
+    time.sleep(1)
+
+    print(f"[INFO] Translating body ({len(body)} chars)...")
+    body_fa = translate_mymemory(body)
+
+    return title_fa or title, body_fa or body
 
 
 # ─────────────────────────────────────────────
 # PHASE 4 — CAPTION BUILDER
 # ─────────────────────────────────────────────
 
-def build_caption(persian_article):
+def build_caption(title_fa, body_fa):
     """
-    Build Telegram caption:
+    Build Telegram caption in exact format:
 
-    <b>Persian headline</b>
+    <b>Persian Title</b>
 
     @irfashionnews
 
-    Body text...
+    Persian body text...
 
     Channel signature
 
-    Hard limit: 1024 chars (Telegram caption maximum).
+    Enforces 1024-char Telegram hard limit.
     """
-    lines       = persian_article.strip().split("\n")
-    title_line  = ""
-    body_lines  = []
-    found_title = False
-
-    for line in lines:
-        s = line.strip().strip("*").strip("#").strip("_").strip()
-        if not s:
-            if found_title:
-                body_lines.append("")
-            continue
-        if not found_title:
-            title_line  = s
-            found_title = True
-        else:
-            body_lines.append(s)
-
-    body_text = "\n".join(body_lines).strip()
-
     def esc(t):
         return (
             t.replace("&", "&amp;")
@@ -753,24 +732,24 @@ def build_caption(persian_article):
              .replace(">", "&gt;")
         )
 
-    parts = []
-    if title_line:
-        parts.append(f"<b>{esc(title_line)}</b>")
-    parts.append("@irfashionnews")
-    if body_text:
-        parts.append(esc(body_text))
-    parts.append("🌐 <i>کانال مد و فشن ایرانی</i>")
+    safe_title = esc(title_fa.strip())
+    safe_body  = esc(body_fa.strip())
+
+    parts = [
+        f"<b>{safe_title}</b>",
+        "@irfashionnews",
+        safe_body,
+        "🌐 <i>کانال مد و فشن ایرانی</i>",
+    ]
 
     caption = "\n\n".join(parts)
 
+    # Trim body if over Telegram limit
     if len(caption) > CAPTION_MAX:
-        overflow  = len(caption) - CAPTION_MAX
-        safe_body = esc(body_text)
-        trimmed   = safe_body[:max(0, len(safe_body) - overflow - 5)] + "…"
-        idx       = 2 if title_line else 1
-        if idx < len(parts):
-            parts[idx] = trimmed
-            caption    = "\n\n".join(parts)
+        overflow   = len(caption) - CAPTION_MAX
+        safe_body  = safe_body[:max(0, len(safe_body) - overflow - 5)] + "…"
+        parts[2]   = safe_body
+        caption    = "\n\n".join(parts)
 
     return caption
 
@@ -780,10 +759,6 @@ def build_caption(persian_article):
 # ─────────────────────────────────────────────
 
 async def send_to_telegram(bot, chat_id, caption, image_url):
-    """
-    Send photo + caption or text-only message.
-    Returns True on success.
-    """
     try:
         if image_url:
             await bot.send_photo(
@@ -810,16 +785,13 @@ async def send_to_telegram(bot, chat_id, caption, image_url):
 
 
 # ─────────────────────────────────────────────
-# IMAGE EXTRACTOR — 6 methods in priority order
+# IMAGE EXTRACTOR
 # ─────────────────────────────────────────────
 
 def extract_image(entry):
-    # 1. media:content explicit image medium
     for m in entry.get("media_content", []):
         if m.get("url") and m.get("medium") == "image":
             return m["url"]
-
-    # 2. media:content image file extension
     for m in entry.get("media_content", []):
         url = m.get("url", "")
         if url and any(
@@ -827,20 +799,14 @@ def extract_image(entry):
             for e in [".jpg", ".jpeg", ".png", ".webp"]
         ):
             return url
-
-    # 3. enclosure
     enc = entry.get("enclosure")
     if enc:
         url = enc.get("href") or enc.get("url", "")
         if url and enc.get("type", "").startswith("image/"):
             return url
-
-    # 4. media:thumbnail
     thumbs = entry.get("media_thumbnail", [])
     if thumbs and thumbs[0].get("url"):
         return thumbs[0]["url"]
-
-    # 5. img tag in summary/description HTML
     for field in ["summary", "description"]:
         html = entry.get(field, "")
         if html:
@@ -849,8 +815,6 @@ def extract_image(entry):
                 src = img.get("src", "")
                 if src.startswith("http"):
                     return src
-
-    # 6. content:encoded
     if hasattr(entry, "content") and entry.content:
         html = entry.content[0].get("value", "")
         if html:
@@ -859,16 +823,14 @@ def extract_image(entry):
                 src = img.get("src", "")
                 if src.startswith("http"):
                     return src
-
     return None
 
 
 # ─────────────────────────────────────────────
-# APPWRITE DATABASE HELPERS
+# APPWRITE HELPERS
 # ─────────────────────────────────────────────
 
 def _build_db_data(link, title, feed_url, pub_date, source_type):
-    """Build schema-safe data dict. No auto fields included."""
     if pub_date.tzinfo is None:
         pub_date = pub_date.replace(tzinfo=timezone.utc)
     return {
