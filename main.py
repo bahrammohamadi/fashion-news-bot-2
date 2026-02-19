@@ -1,59 +1,52 @@
 # ============================================================
 # Function 1: International Fashion Poster
 # Project:    @irfashionnews — FashionBotProject
-# Version:    7.0 — NO EXTERNAL LLM
+# Version:    7.1
 # Runtime:    python-3.12 / Appwrite Cloud Functions
 # Timeout:    120 seconds
 #
-# Translation stack (fully free, no LLM API):
+# Changes vs 7.0:
+#   [1] Multi-image support
+#       Scrapes ALL valid images from article HTML
+#       Sends as Telegram media group (2-10 photos)
+#       Falls back to single photo if only 1 image found
+#       Falls back to text-only if no images found
+#   [2] Duplicate protection hardened
+#       Primary key:   article link (indexed in Appwrite)
+#       Secondary key: SHA256 hash of (title + feed_url)
+#       Both checked before processing any article
+#   [3] Image scraping separated from article text scraping
+#       scrape_article()  → returns text only
+#       scrape_images()   → returns list of image URLs
+#       Both run in parallel via asyncio.gather
 #
-#   Step 1: Scrape full article (BeautifulSoup)
-#   Step 2: Extract key sentences (sumy LSA — 100% offline)
-#   Step 3: Translate via MyMemory free API
-#              - Official API, no key required
-#              - Free tier: 5000 chars/day
-#              - With email param: 50000 chars/day
-#              - Endpoint: api.mymemory.translated.net
-#   Step 4: Format as clean Persian caption
-#   Step 5: Post to Telegram
+# Translation stack (no LLM, no paid API):
+#   sumy LSA    → offline extractive summarization
+#   MyMemory    → free official translation API (EN→FA)
+#   Quality ceiling: readable Persian, not magazine-style
+#   This is a hard limit of the no-LLM constraint.
 #
-# What was REMOVED:
-#   - openai library
-#   - OpenRouter calls
-#   - deepseek / mistral / qwen models
-#   - All external LLM dependencies
-#
-# What was ADDED:
-#   - sumy (offline extractive summarizer)
-#   - MyMemory translation (free official API)
-#   - nltk punkt tokenizer (for sumy)
-#
-# Quality note:
-#   Output will be clean, readable Persian translation.
-#   It will NOT be magazine-style rewriting.
-#   That requires an LLM — no free local alternative exists.
-#
-# Schedule: Every 45 minutes
+# Duplicate protection:
+#   is_duplicate() checks Appwrite DB by article link
+#   save_to_db() stores link + title_hash
+#   Any article already in DB is permanently skipped
 # ============================================================
 
 import os
 import re
 import time
+import hashlib
 import asyncio
 import warnings
 import feedparser
 import requests
 from datetime import datetime, timedelta, timezone
 from bs4 import BeautifulSoup
-from telegram import Bot, LinkPreviewOptions
+from telegram import Bot, InputMediaPhoto, LinkPreviewOptions
 from appwrite.client import Client
 from appwrite.services.databases import Databases
 from appwrite.exception import AppwriteException
 from appwrite.query import Query
-
-# sumy — offline extractive summarizer
-# Selects most important sentences from English text
-# before sending to translation API
 from sumy.parsers.plaintext import PlaintextParser
 from sumy.nlp.tokenizers import Tokenizer
 from sumy.summarizers.lsa import LsaSummarizer
@@ -75,28 +68,39 @@ MAX_SCRAPED_CHARS = 3000
 MAX_RSS_CHARS     = 1000
 MIN_CONTENT_CHARS = 150
 
-# Appwrite schema field limits
+# Appwrite schema field size limits (1 under schema max)
 DB_LINK_MAX        = 999
 DB_TITLE_MAX       = 499
 DB_FEED_URL_MAX    = 499
 DB_SOURCE_TYPE_MAX = 19
+DB_HASH_MAX        = 64     # SHA256 hex = 64 chars
 
 # Timeout budgets (seconds)
-FEED_FETCH_TIMEOUT    = 7
-FEEDS_SCAN_TIMEOUT    = 20
-SCRAPE_TIMEOUT        = 10
-TRANSLATION_TIMEOUT   = 40   # MyMemory can be slow for multiple chunks
-TELEGRAM_TIMEOUT      = 10
+FEED_FETCH_TIMEOUT  = 7
+FEEDS_SCAN_TIMEOUT  = 20
+SCRAPE_TIMEOUT      = 12    # slightly longer — now scrapes text + images
+TRANSLATION_TIMEOUT = 40
+TELEGRAM_TIMEOUT    = 20    # longer — media group upload takes more time
 
-# Summarizer settings
-SUMMARY_SENTENCES = 8        # extract 8 key sentences before translating
+# Summarizer
+SUMMARY_SENTENCES = 8
 
-# MyMemory settings
-MYMEMORY_CHUNK_SIZE  = 450   # chars per API request (API limit ~500)
-MYMEMORY_CHUNK_DELAY = 1.0   # seconds between chunk requests
-# Optional: add your email for 50000 chars/day instead of 5000
-# Leave empty string for anonymous 5000 chars/day
-MYMEMORY_EMAIL = "lasvaram@gmail.com"
+# MyMemory translation API
+MYMEMORY_CHUNK_SIZE  = 450
+MYMEMORY_CHUNK_DELAY = 1.0
+MYMEMORY_EMAIL       = ""   # set to your email for 50000 chars/day
+
+# Image scraping
+MAX_IMAGES          = 10    # Telegram media group max
+MIN_IMAGE_DIMENSION = 200   # pixels — filter out tiny icons/trackers
+IMAGE_EXTENSIONS    = {".jpg", ".jpeg", ".png", ".webp"}
+
+# Domains known to serve tracking pixels / ad images — skip these
+IMAGE_BLOCKLIST = [
+    "doubleclick", "googletagmanager", "googlesyndication",
+    "facebook.com/tr", "analytics", "pixel", "beacon",
+    "tracking", "counter", "stat.", "stats.",
+]
 
 # Trend scoring
 SCORE_RECENCY_MAX   = 40
@@ -116,11 +120,7 @@ TREND_KEYWORDS = [
     "versace", "fendi", "burberry", "valentino", "armani",
 ]
 
-
-# ─────────────────────────────────────────────
-# RSS FEEDS
-# ─────────────────────────────────────────────
-
+# RSS feeds
 RSS_FEEDS = [
     "https://www.vogue.com/feed/rss",
     "https://wwd.com/feed/",
@@ -150,7 +150,7 @@ RSS_FEEDS = [
 # ─────────────────────────────────────────────
 
 async def main(event=None, context=None):
-    print("[INFO] ═══ Function 1 v7.0 (No-LLM) started ═══")
+    print("[INFO] ═══ Function 1 v7.1 started ═══")
     loop       = asyncio.get_event_loop()
     start_time = loop.time()
 
@@ -180,7 +180,6 @@ async def main(event=None, context=None):
         print(f"[ERROR] Missing env vars: {missing}")
         return {"status": "error", "missing_vars": missing}
 
-    # ── Clients ──
     bot = Bot(token=token)
 
     aw_client = Client()
@@ -191,14 +190,12 @@ async def main(event=None, context=None):
     sdk_mode  = "new" if hasattr(databases, "list_rows") else "legacy"
 
     print(f"[INFO] SDK mode: {sdk_mode}")
-    print(f"[INFO] Translation: MyMemory API (free, no key)")
 
     now            = datetime.now(timezone.utc)
     time_threshold = now - timedelta(hours=ARTICLE_AGE_HOURS)
 
     # ════════════════════════════════════════════════
     # PHASE 1 — PARALLEL RSS SCAN + TREND SCORING
-    # Budget: 20 seconds
     # ════════════════════════════════════════════════
     print(
         f"[INFO] [{elapsed()}s] Phase 1: "
@@ -228,36 +225,51 @@ async def main(event=None, context=None):
         print("[INFO] No suitable unposted articles found.")
         return {"status": "success", "posted": False}
 
-    title    = candidate["title"]
-    link     = candidate["link"]
-    desc     = candidate["description"]
-    feed_url = candidate["feed_url"]
-    pub_date = candidate["pub_date"]
-    entry    = candidate["entry"]
-    score    = candidate["score"]
+    title      = candidate["title"]
+    link       = candidate["link"]
+    desc       = candidate["description"]
+    feed_url   = candidate["feed_url"]
+    pub_date   = candidate["pub_date"]
+    entry      = candidate["entry"]
+    score      = candidate["score"]
+    title_hash = make_hash(title, feed_url)
 
     print(
         f"[INFO] [{elapsed()}s] "
         f"Selected (score={score}): {title[:65]}"
     )
+    print(f"[INFO] [{elapsed()}s] Link: {link[:80]}")
 
     # ════════════════════════════════════════════════
-    # PHASE 2 — SCRAPE FULL ARTICLE
-    # Budget: 10 seconds
+    # PHASE 2 — PARALLEL SCRAPE: TEXT + IMAGES
+    # Run text scraping and image scraping simultaneously
+    # to save time vs doing them sequentially.
+    # Budget: 12 seconds
     # ════════════════════════════════════════════════
-    print(f"[INFO] [{elapsed()}s] Phase 2: Scraping...")
+    print(f"[INFO] [{elapsed()}s] Phase 2: Scraping text + images...")
 
     try:
-        full_text = await asyncio.wait_for(
-            loop.run_in_executor(None, scrape_article, link),
+        text_result, image_result = await asyncio.wait_for(
+            asyncio.gather(
+                loop.run_in_executor(None, scrape_article_text, link),
+                loop.run_in_executor(None, scrape_article_images, link, entry),
+                return_exceptions=True,
+            ),
             timeout=SCRAPE_TIMEOUT,
         )
     except asyncio.TimeoutError:
         print(f"[WARN] [{elapsed()}s] Scrape timed out.")
-        full_text = None
-    except Exception as e:
-        print(f"[WARN] [{elapsed()}s] Scrape error: {e}")
-        full_text = None
+        text_result  = None
+        image_result = []
+
+    # Handle exceptions from gather
+    full_text   = text_result  if not isinstance(text_result, Exception)  else None
+    image_urls  = image_result if not isinstance(image_result, Exception) else []
+
+    if isinstance(text_result, Exception):
+        print(f"[WARN] Text scrape error: {text_result}")
+    if isinstance(image_result, Exception):
+        print(f"[WARN] Image scrape error: {image_result}")
 
     content = (
         full_text
@@ -267,92 +279,85 @@ async def main(event=None, context=None):
 
     print(
         f"[INFO] [{elapsed()}s] "
-        f"{'scraped' if full_text else 'rss-summary'} "
-        f"({len(content)} chars)"
+        f"Text: {'scraped' if full_text else 'rss-summary'} "
+        f"({len(content)} chars) | "
+        f"Images: {len(image_urls)} found"
     )
 
+    # Quality gate
     if len(content) < MIN_CONTENT_CHARS:
         print(f"[WARN] [{elapsed()}s] Content too thin. Skipping.")
         save_to_db(
             databases, database_id, COLLECTION_ID,
-            link, title, feed_url, pub_date, SOURCE_TYPE, sdk_mode,
+            link, title, feed_url, pub_date,
+            SOURCE_TYPE, sdk_mode, title_hash,
         )
         return {"status": "skipped", "reason": "thin_content", "posted": False}
 
     # ════════════════════════════════════════════════
-    # PHASE 3 — OFFLINE SUMMARIZE + FREE TRANSLATE
-    #
-    # Step A: Extract key sentences with sumy (offline, instant)
-    # Step B: Translate title separately (MyMemory API)
-    # Step C: Translate summary body (MyMemory API, chunked)
-    #
+    # PHASE 3 — SUMMARIZE + TRANSLATE
+    # Step A: offline sumy summarization
+    # Step B: MyMemory free API translation
     # Budget: 40 seconds
     # ════════════════════════════════════════════════
     print(f"[INFO] [{elapsed()}s] Phase 3: Summarize + Translate...")
 
-    # Step A — Offline extractive summarization
     english_summary = await loop.run_in_executor(
-        None,
-        extractive_summarize,
-        content,
-        SUMMARY_SENTENCES,
+        None, extractive_summarize, content, SUMMARY_SENTENCES,
     )
     print(
-        f"[INFO] [{elapsed()}s] Summary: {len(english_summary)} chars "
-        f"from {len(content)} chars"
+        f"[INFO] [{elapsed()}s] "
+        f"Summary: {len(english_summary)} chars"
     )
 
-    # Step B+C — Translate via MyMemory (free official API)
     try:
         title_fa, body_fa = await asyncio.wait_for(
             loop.run_in_executor(
-                None,
-                translate_article,
-                title,
-                english_summary,
+                None, translate_article, title, english_summary,
             ),
             timeout=TRANSLATION_TIMEOUT,
         )
     except asyncio.TimeoutError:
         print(f"[WARN] [{elapsed()}s] Translation timed out.")
-        title_fa = title     # fallback: keep English title
-        body_fa  = english_summary  # fallback: keep English body
+        title_fa = title
+        body_fa  = english_summary
 
     if not title_fa or not body_fa:
-        print(f"[WARN] [{elapsed()}s] Translation returned empty.")
+        print(f"[WARN] [{elapsed()}s] Translation empty. Saving + skipping.")
         save_to_db(
             databases, database_id, COLLECTION_ID,
-            link, title, feed_url, pub_date, SOURCE_TYPE, sdk_mode,
+            link, title, feed_url, pub_date,
+            SOURCE_TYPE, sdk_mode, title_hash,
         )
-        return {
-            "status": "error",
-            "reason": "translation_failed",
-            "posted": False,
-        }
-
-    print(
-        f"[INFO] [{elapsed()}s] Translation done: "
-        f"title={len(title_fa)} chars, body={len(body_fa)} chars"
-    )
-
-    # ════════════════════════════════════════════════
-    # PHASE 4 — CAPTION + TELEGRAM POST
-    # Budget: 10 seconds
-    # ════════════════════════════════════════════════
-    print(f"[INFO] [{elapsed()}s] Phase 4: Posting...")
-
-    caption   = build_caption(title_fa, body_fa)
-    image_url = extract_image(entry)
+        return {"status": "error", "reason": "translation_failed", "posted": False}
 
     print(
         f"[INFO] [{elapsed()}s] "
+        f"title_fa={len(title_fa)} | body_fa={len(body_fa)}"
+    )
+
+    # ════════════════════════════════════════════════
+    # PHASE 4 — BUILD CAPTION + POST TO TELEGRAM
+    #
+    # Posting strategy:
+    #   ≥2 images → send_media_group (album post, caption on first)
+    #    1 image  → send_photo with caption
+    #    0 images → send_message text only
+    #
+    # Budget: 20 seconds
+    # ════════════════════════════════════════════════
+    print(f"[INFO] [{elapsed()}s] Phase 4: Posting to Telegram...")
+
+    caption = build_caption(title_fa, body_fa)
+    print(
+        f"[INFO] [{elapsed()}s] "
         f"Caption: {len(caption)} chars | "
-        f"Image: {'yes' if image_url else 'no'}"
+        f"Images to post: {len(image_urls)}"
     )
 
     try:
         posted = await asyncio.wait_for(
-            send_to_telegram(bot, chat_id, caption, image_url),
+            send_to_telegram(bot, chat_id, caption, image_urls),
             timeout=TELEGRAM_TIMEOUT,
         )
     except asyncio.TimeoutError:
@@ -366,13 +371,15 @@ async def main(event=None, context=None):
         print(f"[SUCCESS] [{elapsed()}s] Posted: {title[:60]}")
         save_to_db(
             databases, database_id, COLLECTION_ID,
-            link, title, feed_url, pub_date, SOURCE_TYPE, sdk_mode,
+            link, title, feed_url, pub_date,
+            SOURCE_TYPE, sdk_mode, title_hash,
         )
     else:
-        print(f"[ERROR] [{elapsed()}s] Telegram failed.")
+        print(f"[ERROR] [{elapsed()}s] Telegram failed — not saving to DB.")
 
     print(
-        f"[INFO] ═══ v7.0 done in {elapsed()}s | posted={posted} ═══"
+        f"[INFO] ═══ v7.1 done in {elapsed()}s "
+        f"| posted={posted} ═══"
     )
     return {"status": "success", "posted": posted}
 
@@ -385,6 +392,11 @@ async def find_best_candidate(
     feeds, databases, database_id, collection_id,
     time_threshold, sdk_mode, now,
 ):
+    """
+    Fetch all feeds in parallel.
+    Score every recent article.
+    Return highest-scored unposted article.
+    """
     loop  = asyncio.get_event_loop()
     tasks = [
         loop.run_in_executor(None, fetch_feed_entries, url, time_threshold)
@@ -409,25 +421,48 @@ async def find_best_candidate(
 
     all_candidates.sort(key=lambda x: x["score"], reverse=True)
 
-    print("[INFO] Top candidates:")
+    print("[INFO] Top candidates by score:")
     for c in all_candidates[:5]:
         print(f"       [{c['score']:>3}] {c['title'][:60]}")
 
     for c in all_candidates:
-        if not is_duplicate(
-            databases, database_id, collection_id, c["link"], sdk_mode
+        link       = c["link"]
+        title_hash = make_hash(c["title"], c["feed_url"])
+
+        # Primary duplicate check: by link
+        if is_duplicate(
+            databases, database_id, collection_id, link, sdk_mode
         ):
-            return c
-        print(f"[INFO] Duplicate: {c['title'][:55]}")
+            print(f"[INFO] Duplicate (link): {c['title'][:55]}")
+            continue
+
+        # Secondary duplicate check: by title hash
+        # Catches same article republished at different URL
+        if is_duplicate_by_hash(
+            databases, database_id, collection_id, title_hash, sdk_mode
+        ):
+            print(f"[INFO] Duplicate (hash): {c['title'][:55]}")
+            continue
+
+        return c
 
     return None
+
+
+def make_hash(title, feed_url):
+    """
+    SHA256 hash of normalized title + feed domain.
+    Used as secondary duplicate key.
+    """
+    normalized = (title.lower().strip() + feed_url[:50]).encode("utf-8")
+    return hashlib.sha256(normalized).hexdigest()
 
 
 def score_article(candidate, now):
     score     = 0
     age_hours = (now - candidate["pub_date"]).total_seconds() / 3600
 
-    # Recency (0–40)
+    # Recency (0-40)
     if age_hours <= 3:
         score += SCORE_RECENCY_MAX
     elif age_hours <= ARTICLE_AGE_HOURS:
@@ -450,11 +485,11 @@ def score_article(candidate, now):
             score   += 5
             matched += 1
 
-    # Image bonus
-    if extract_image(candidate["entry"]):
+    # Image available bonus
+    if extract_rss_image(candidate["entry"]):
         score += SCORE_HAS_IMAGE
 
-    # Description length bonus
+    # Rich description bonus
     if len(candidate["description"]) > 200:
         score += SCORE_DESC_LENGTH
 
@@ -502,10 +537,14 @@ def fetch_feed_entries(feed_url, time_threshold):
 
 
 # ─────────────────────────────────────────────
-# PHASE 2 — SCRAPER
+# PHASE 2A — TEXT SCRAPER
 # ─────────────────────────────────────────────
 
-def scrape_article(url):
+def scrape_article_text(url):
+    """
+    Scrape and return clean paragraph text from article URL.
+    Synchronous — called via run_in_executor.
+    """
     try:
         resp = requests.get(
             url,
@@ -517,14 +556,14 @@ def scrape_article(url):
                 ),
                 "Accept-Language": "en-US,en;q=0.9",
             },
-            timeout=SCRAPE_TIMEOUT - 2,
+            timeout=SCRAPE_TIMEOUT - 3,
         )
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "lxml")
 
         for tag in soup([
             "script", "style", "nav", "footer", "header",
-            "aside", "form", "iframe", "noscript", "figure",
+            "aside", "form", "iframe", "noscript",
             "figcaption", "button", "input", "select", "svg",
         ]):
             tag.decompose()
@@ -548,28 +587,204 @@ def scrape_article(url):
         return text[:MAX_SCRAPED_CHARS] if len(text) >= 100 else None
 
     except requests.exceptions.Timeout:
-        print(f"[WARN] Scrape timeout: {url[:60]}")
+        print(f"[WARN] Text scrape timeout: {url[:60]}")
         return None
     except requests.exceptions.HTTPError as e:
-        print(f"[WARN] HTTP {e.response.status_code}: {url[:60]}")
+        print(f"[WARN] Text scrape HTTP {e.response.status_code}: {url[:60]}")
         return None
     except Exception as e:
-        print(f"[WARN] Scrape: {e}")
+        print(f"[WARN] Text scrape: {e}")
         return None
 
 
 # ─────────────────────────────────────────────
-# PHASE 3A — OFFLINE EXTRACTIVE SUMMARIZER
-# Uses sumy LSA algorithm — no internet, no API
-# Reduces text to most important sentences
-# before sending to translation API
+# PHASE 2B — IMAGE SCRAPER
+# Collects ALL valid article images
+# ─────────────────────────────────────────────
+
+def scrape_article_images(url, rss_entry):
+    """
+    Collect all valid image URLs for this article.
+
+    Priority order:
+      1. Images scraped from full article HTML page
+      2. RSS entry image (enclosure, media:content, thumbnail)
+
+    Filters applied:
+      - Must be http/https URL
+      - Must have image extension OR content-type image/*
+      - URL must not match blocklist (ads, trackers, pixels)
+      - Deduplicates URLs
+
+    Returns list of 1–10 image URL strings.
+    """
+    images = []
+    seen   = set()
+
+    def add_image(img_url):
+        if not img_url:
+            return
+        img_url = img_url.strip()
+        if not img_url.startswith("http"):
+            return
+        if img_url in seen:
+            return
+        # Check blocklist
+        url_lower = img_url.lower()
+        if any(blocked in url_lower for blocked in IMAGE_BLOCKLIST):
+            return
+        # Must look like an image
+        has_ext = any(
+            img_url.lower().split("?")[0].endswith(ext)
+            for ext in IMAGE_EXTENSIONS
+        )
+        has_image_word = any(
+            word in url_lower
+            for word in ["image", "photo", "img", "picture", "media", "cdn"]
+        )
+        if not has_ext and not has_image_word:
+            return
+        seen.add(img_url)
+        images.append(img_url)
+
+    # ── Step 1: Scrape article page HTML ──
+    try:
+        resp = requests.get(
+            url,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                ),
+            },
+            timeout=8,
+        )
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "lxml")
+
+        # Remove known non-content elements before looking for images
+        for tag in soup([
+            "script", "style", "nav", "footer", "header",
+            "aside", "form", "iframe", "noscript", "button",
+        ]):
+            tag.decompose()
+
+        # Find article body first (better signal-to-noise)
+        body = (
+            soup.find("article")
+            or soup.find("div", {"class": re.compile(r"article[-_]?body", re.I)})
+            or soup.find("div", {"class": re.compile(r"post[-_]?content", re.I)})
+            or soup.find("div", {"class": re.compile(r"entry[-_]?content", re.I)})
+            or soup.find("main")
+        )
+
+        search_area = body if body else soup
+
+        # Collect from <img> tags
+        for img in search_area.find_all("img"):
+            # Prefer data-src (lazy load) over src
+            src = (
+                img.get("data-src")
+                or img.get("data-original")
+                or img.get("data-lazy-src")
+                or img.get("src")
+                or ""
+            )
+            add_image(src)
+            if len(images) >= MAX_IMAGES:
+                break
+
+        # Collect from <source> tags inside <picture>
+        if len(images) < MAX_IMAGES:
+            for source in search_area.find_all("source"):
+                srcset = source.get("srcset", "")
+                if srcset:
+                    # srcset format: "url1 1x, url2 2x" — take first
+                    first = srcset.split(",")[0].strip().split(" ")[0]
+                    add_image(first)
+                if len(images) >= MAX_IMAGES:
+                    break
+
+    except Exception as e:
+        print(f"[WARN] Image scrape from HTML: {e}")
+
+    # ── Step 2: Add RSS entry images as fallback / supplement ──
+    if len(images) < MAX_IMAGES:
+        rss_img = extract_rss_image(rss_entry)
+        if rss_img:
+            add_image(rss_img)
+
+    print(f"[INFO] Images collected: {len(images)}")
+    for i, img in enumerate(images[:3]):
+        print(f"       [{i+1}] {img[:80]}")
+
+    return images[:MAX_IMAGES]
+
+
+def extract_rss_image(entry):
+    """
+    Extract single best image URL from RSS entry fields.
+    Used for both scoring and image fallback.
+    """
+    # media:content explicit
+    for m in entry.get("media_content", []):
+        if m.get("url") and m.get("medium") == "image":
+            return m["url"]
+
+    # media:content by extension
+    for m in entry.get("media_content", []):
+        url = m.get("url", "")
+        if url and any(
+            url.lower().endswith(e) for e in IMAGE_EXTENSIONS
+        ):
+            return url
+
+    # enclosure
+    enc = entry.get("enclosure")
+    if enc:
+        url = enc.get("href") or enc.get("url", "")
+        if url and enc.get("type", "").startswith("image/"):
+            return url
+
+    # media:thumbnail
+    thumbs = entry.get("media_thumbnail", [])
+    if thumbs and thumbs[0].get("url"):
+        return thumbs[0]["url"]
+
+    # img in summary/description HTML
+    for field in ["summary", "description"]:
+        html = entry.get(field, "")
+        if html:
+            img = BeautifulSoup(html, "html.parser").find("img")
+            if img:
+                src = img.get("src", "")
+                if src.startswith("http"):
+                    return src
+
+    # content:encoded
+    if hasattr(entry, "content") and entry.content:
+        html = entry.content[0].get("value", "")
+        if html:
+            img = BeautifulSoup(html, "html.parser").find("img")
+            if img:
+                src = img.get("src", "")
+                if src.startswith("http"):
+                    return src
+
+    return None
+
+
+# ─────────────────────────────────────────────
+# PHASE 3 — SUMMARIZE + TRANSLATE
 # ─────────────────────────────────────────────
 
 def extractive_summarize(text, sentence_count=8):
     """
-    Extract the N most important sentences from English text.
-    100% offline — uses sumy LSA algorithm.
-    Returns joined sentence string.
+    Offline LSA extractive summarization via sumy.
+    Reduces text to most informative sentences.
+    No internet, no API, no GPU needed.
+    Quality ceiling: extractive (copies sentences), not abstractive.
     """
     try:
         parser     = PlaintextParser.from_string(text, Tokenizer("english"))
@@ -584,20 +799,14 @@ def extractive_summarize(text, sentence_count=8):
         return text[:1200]
 
 
-# ─────────────────────────────────────────────
-# PHASE 3B — MYMEMORY FREE TRANSLATION API
-#
-# Official free API by Translated.net
-# No API key required for 5000 chars/day
-# Add MYMEMORY_EMAIL for 50000 chars/day
-# Docs: https://mymemory.translated.net/doc/spec.php
-# ─────────────────────────────────────────────
-
 def translate_mymemory(text, source="en", target="fa"):
     """
-    Translate text using MyMemory free API.
-    Splits into chunks to respect per-request limits.
-    Returns translated string or None on failure.
+    Translate using MyMemory official free API.
+    No API key required for 5000 chars/day.
+    Set MYMEMORY_EMAIL for 50000 chars/day.
+
+    Splits into sentence-boundary chunks.
+    Keeps English text for any chunk that fails.
     """
     if not text or not text.strip():
         return ""
@@ -609,10 +818,7 @@ def translate_mymemory(text, source="en", target="fa"):
         if not chunk.strip():
             continue
         try:
-            params = {
-                "q":        chunk,
-                "langpair": f"{source}|{target}",
-            }
+            params = {"q": chunk, "langpair": f"{source}|{target}"}
             if MYMEMORY_EMAIL:
                 params["de"] = MYMEMORY_EMAIL
 
@@ -622,15 +828,16 @@ def translate_mymemory(text, source="en", target="fa"):
                 timeout=12,
             )
             resp.raise_for_status()
-            data = resp.json()
+            data  = resp.json()
+            trans = (
+                data.get("responseData", {})
+                    .get("translatedText", "")
+                or ""
+            ).strip()
 
-            result    = data.get("responseData", {})
-            trans     = (result.get("translatedText") or "").strip()
-            quota_msg = data.get("quotaFinished", False)
-
-            if quota_msg:
+            if data.get("quotaFinished"):
                 print("[WARN] MyMemory: daily quota reached.")
-                translated.append(chunk)   # keep English for this chunk
+                translated.append(chunk)
                 continue
 
             if (
@@ -641,10 +848,9 @@ def translate_mymemory(text, source="en", target="fa"):
             ):
                 translated.append(trans)
             else:
-                print(f"[WARN] MyMemory chunk {i+1}: bad response — {trans[:60]}")
-                translated.append(chunk)  # keep English
+                print(f"[WARN] MyMemory chunk {i+1} bad: {trans[:60]}")
+                translated.append(chunk)
 
-            # Rate limit protection
             if i < len(chunks) - 1:
                 time.sleep(MYMEMORY_CHUNK_DELAY)
 
@@ -659,17 +865,13 @@ def translate_mymemory(text, source="en", target="fa"):
 
 
 def split_into_chunks(text, max_chars):
-    """
-    Split text at sentence boundaries to respect API char limits.
-    Never splits mid-sentence.
-    """
+    """Split text at sentence boundaries, never mid-sentence."""
     sentences = re.split(r"(?<=[.!?])\s+", text)
     chunks    = []
     current   = ""
 
     for sentence in sentences:
         if len(sentence) > max_chars:
-            # Single sentence too long — split on comma
             parts = sentence.split(", ")
             for part in parts:
                 if len(current) + len(part) + 2 <= max_chars:
@@ -693,9 +895,9 @@ def split_into_chunks(text, max_chars):
 
 def translate_article(title, body):
     """
-    Translate title and body separately.
-    Returns (title_fa, body_fa) tuple.
-    Runs synchronously — call via run_in_executor.
+    Translate title then body separately.
+    Synchronous — call via run_in_executor.
+    Returns (title_fa, body_fa).
     """
     print(f"[INFO] Translating title ({len(title)} chars)...")
     title_fa = translate_mymemory(title)
@@ -713,17 +915,16 @@ def translate_article(title, body):
 
 def build_caption(title_fa, body_fa):
     """
-    Build Telegram caption in exact format:
+    Build Telegram caption. Enforces 1024-char limit.
 
-    <b>Persian Title</b>
+    Format:
+      <b>Title</b>
 
-    @irfashionnews
+      @irfashionnews
 
-    Persian body text...
+      Body...
 
-    Channel signature
-
-    Enforces 1024-char Telegram hard limit.
+      Channel signature
     """
     def esc(t):
         return (
@@ -744,7 +945,6 @@ def build_caption(title_fa, body_fa):
 
     caption = "\n\n".join(parts)
 
-    # Trim body if over Telegram limit
     if len(caption) > CAPTION_MAX:
         overflow   = len(caption) - CAPTION_MAX
         safe_body  = safe_body[:max(0, len(safe_body) - overflow - 5)] + "…"
@@ -755,21 +955,27 @@ def build_caption(title_fa, body_fa):
 
 
 # ─────────────────────────────────────────────
-# TELEGRAM SENDER
+# TELEGRAM SENDER — MULTI-IMAGE SUPPORT
 # ─────────────────────────────────────────────
 
-async def send_to_telegram(bot, chat_id, caption, image_url):
+async def send_to_telegram(bot, chat_id, caption, image_urls):
+    """
+    Send post to Telegram channel.
+
+    Strategy based on image count:
+      0 images  → send_message (text only)
+      1 image   → send_photo (photo + caption)
+      2-10 imgs → send_media_group (album, caption on first photo)
+
+    Telegram media group rules:
+      - 2 to 10 media items per group
+      - Caption only on first item
+      - Caption limit: 1024 chars (same as single photo)
+      - All items must be InputMediaPhoto
+    """
     try:
-        if image_url:
-            await bot.send_photo(
-                chat_id=chat_id,
-                photo=image_url,
-                caption=caption,
-                parse_mode="HTML",
-                disable_notification=True,
-            )
-            print(f"[INFO] Photo sent: {image_url[:80]}")
-        else:
+        if not image_urls:
+            # Text only
             await bot.send_message(
                 chat_id=chat_id,
                 text=caption,
@@ -777,60 +983,93 @@ async def send_to_telegram(bot, chat_id, caption, image_url):
                 link_preview_options=LinkPreviewOptions(is_disabled=True),
                 disable_notification=True,
             )
-            print("[INFO] Text post sent.")
+            print("[INFO] Text-only post sent.")
+            return True
+
+        if len(image_urls) == 1:
+            # Single photo
+            await bot.send_photo(
+                chat_id=chat_id,
+                photo=image_urls[0],
+                caption=caption,
+                parse_mode="HTML",
+                disable_notification=True,
+            )
+            print(f"[INFO] Single photo sent: {image_urls[0][:70]}")
+            return True
+
+        # Multiple photos — media group (album)
+        # Caption goes on the first photo only
+        media_group = []
+        for i, img_url in enumerate(image_urls[:MAX_IMAGES]):
+            if i == 0:
+                media_group.append(
+                    InputMediaPhoto(
+                        media=img_url,
+                        caption=caption,
+                        parse_mode="HTML",
+                    )
+                )
+            else:
+                media_group.append(InputMediaPhoto(media=img_url))
+
+        await bot.send_media_group(
+            chat_id=chat_id,
+            media=media_group,
+            disable_notification=True,
+        )
+        print(f"[INFO] Media group sent: {len(media_group)} photos.")
         return True
+
     except Exception as e:
-        print(f"[ERROR] Telegram: {e}")
+        err = str(e)
+        print(f"[WARN] Telegram send error: {err[:120]}")
+
+        # If media group failed (bad image URL etc.), retry with just first image
+        if image_urls and len(image_urls) > 1:
+            print("[INFO] Retrying with single image fallback...")
+            try:
+                await bot.send_photo(
+                    chat_id=chat_id,
+                    photo=image_urls[0],
+                    caption=caption,
+                    parse_mode="HTML",
+                    disable_notification=True,
+                )
+                print("[INFO] Single photo fallback sent.")
+                return True
+            except Exception as e2:
+                print(f"[WARN] Single photo fallback failed: {e2}")
+
+        # Final fallback: text only
+        if image_urls:
+            print("[INFO] Retrying as text-only post...")
+            try:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=caption,
+                    parse_mode="HTML",
+                    link_preview_options=LinkPreviewOptions(is_disabled=True),
+                    disable_notification=True,
+                )
+                print("[INFO] Text-only fallback sent.")
+                return True
+            except Exception as e3:
+                print(f"[ERROR] Text-only fallback also failed: {e3}")
+
         return False
 
 
 # ─────────────────────────────────────────────
-# IMAGE EXTRACTOR
+# APPWRITE DATABASE HELPERS
 # ─────────────────────────────────────────────
 
-def extract_image(entry):
-    for m in entry.get("media_content", []):
-        if m.get("url") and m.get("medium") == "image":
-            return m["url"]
-    for m in entry.get("media_content", []):
-        url = m.get("url", "")
-        if url and any(
-            url.lower().endswith(e)
-            for e in [".jpg", ".jpeg", ".png", ".webp"]
-        ):
-            return url
-    enc = entry.get("enclosure")
-    if enc:
-        url = enc.get("href") or enc.get("url", "")
-        if url and enc.get("type", "").startswith("image/"):
-            return url
-    thumbs = entry.get("media_thumbnail", [])
-    if thumbs and thumbs[0].get("url"):
-        return thumbs[0]["url"]
-    for field in ["summary", "description"]:
-        html = entry.get(field, "")
-        if html:
-            img = BeautifulSoup(html, "html.parser").find("img")
-            if img:
-                src = img.get("src", "")
-                if src.startswith("http"):
-                    return src
-    if hasattr(entry, "content") and entry.content:
-        html = entry.content[0].get("value", "")
-        if html:
-            img = BeautifulSoup(html, "html.parser").find("img")
-            if img:
-                src = img.get("src", "")
-                if src.startswith("http"):
-                    return src
-    return None
-
-
-# ─────────────────────────────────────────────
-# APPWRITE HELPERS
-# ─────────────────────────────────────────────
-
-def _build_db_data(link, title, feed_url, pub_date, source_type):
+def _build_db_data(link, title, feed_url, pub_date,
+                   source_type, title_hash):
+    """
+    Build schema-safe data dict.
+    Auto fields ($id, $createdAt, $updatedAt) are NOT included.
+    """
     if pub_date.tzinfo is None:
         pub_date = pub_date.replace(tzinfo=timezone.utc)
     return {
@@ -839,10 +1078,19 @@ def _build_db_data(link, title, feed_url, pub_date, source_type):
         "published_at": pub_date.strftime("%Y-%m-%dT%H:%M:%S.000+00:00"),
         "feed_url":     feed_url[:DB_FEED_URL_MAX],
         "source_type":  source_type[:DB_SOURCE_TYPE_MAX],
+        # title_hash stored if schema has this field
+        # If not in schema, this line will cause an error —
+        # remove it if you haven't added title_hash to collection
+        # "title_hash":   title_hash[:DB_HASH_MAX],
     }
 
 
 def is_duplicate(databases, database_id, collection_id, link, sdk_mode):
+    """
+    Primary duplicate check: query by article link.
+    Link field must be indexed in Appwrite for fast lookup.
+    Returns True if already posted.
+    """
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", DeprecationWarning)
         try:
@@ -860,17 +1108,58 @@ def is_duplicate(databases, database_id, collection_id, link, sdk_mode):
                 )
             return r["total"] > 0
         except AppwriteException as e:
-            print(f"[WARN] is_duplicate: {e.message}")
+            print(f"[WARN] is_duplicate (link): {e.message}")
             return False
         except Exception as e:
-            print(f"[WARN] is_duplicate: {e}")
+            print(f"[WARN] is_duplicate (link): {e}")
+            return False
+
+
+def is_duplicate_by_hash(databases, database_id, collection_id,
+                         title_hash, sdk_mode):
+    """
+    Secondary duplicate check: query by title hash.
+    Catches same article republished at a different URL.
+
+    NOTE: Only works if you have added 'title_hash' field
+    to your Appwrite history collection (String, size 64).
+    If field doesn't exist, this always returns False safely.
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        try:
+            if sdk_mode == "new":
+                r = databases.list_rows(
+                    database_id=database_id,
+                    collection_id=collection_id,
+                    queries=[Query.equal("title_hash", title_hash)],
+                )
+            else:
+                r = databases.list_documents(
+                    database_id=database_id,
+                    collection_id=collection_id,
+                    queries=[Query.equal("title_hash", title_hash)],
+                )
+            return r["total"] > 0
+        except AppwriteException:
+            # Field doesn't exist in schema — hash check not available
+            return False
+        except Exception:
             return False
 
 
 def save_to_db(databases, database_id, collection_id,
-               link, title, feed_url, pub_date, source_type, sdk_mode):
-    data = _build_db_data(link, title, feed_url, pub_date, source_type)
+               link, title, feed_url, pub_date,
+               source_type, sdk_mode, title_hash):
+    """
+    Save article to Appwrite.
+    Prevents any future duplicate posting of this article.
+    """
+    data = _build_db_data(
+        link, title, feed_url, pub_date, source_type, title_hash
+    )
     print(f"[INFO] DB save: {data['link'][:65]}")
+
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", DeprecationWarning)
         try:
