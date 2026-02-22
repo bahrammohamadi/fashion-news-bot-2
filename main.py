@@ -1,61 +1,50 @@
 # ============================================================
 # Function 1: International Fashion Poster
 # Project:    @irfashionnews — FashionBotProject
-# Version:    11.0 — Mehrjameh Editorial Engine
+# Version:    11.1 — Schema-Adaptive + Model Fixes
 # Runtime:    python-3.12 / Appwrite Cloud Functions
 # Timeout:    120 seconds
 #
-# WHAT CHANGED FROM v10.1:
-#   ADDED:
-#     - Mehrjameh editorial voice and caption structure
-#     - Styling tip generation (Iranian-culture-aware)
-#     - 5-candidate batch selection from DB
-#     - context.log() / context.error() throughout
-#     - _generate_styling_tip() — cultural style advisor
-#     - _build_mehrjameh_caption() — new caption format
-#     - _build_ai_prompt_body() — editorial Persian prompt
-#     - _build_ai_prompt_title() — title translation prompt
-#     - _build_ai_prompt_tip() — styling tip prompt
-#     - Structured JSON output per article
-#     - SDK deprecation fix: list_rows with legacy fallback
+# FIXES FROM v11.0:
 #
-#   CAPTION STRUCTURE (Mehrjameh editorial format):
-#   ┌──────────────────────────────────────────┐
-#   │  [images sent first as media group]      │
-#   │                                          │
-#   │  **عنوان فارسی**                         │
-#   │  ─────────────                           │
-#   │  مد و فشن ایرانی                        │
-#   │                                          │
-#   │  خلاصه خبر (summary)                    │
-#   │                                          │
-#   │  💡 نکته استایلی (styling tip)           │
-#   │                                          │
-#   │  EMOJI  کانال مد و فشن ایرانی           │
-#   │                                          │
-#   │  #hashtag1 #hashtag2 ...                │
-#   └──────────────────────────────────────────┘
+#   FIX 1 — SCHEMA ADAPTATION:
+#     Problem: "posted" field missing → all dedup queries fail
+#     Solution:
+#       - _detect_schema_fields() runs at startup
+#       - Detects which fields exist in the collection
+#       - _query_field_safe() uses only fields that exist
+#       - When "posted" absent → falls back to link-only dedup
+#       - Schema migration utility added (_migrate_schema)
+#       - All dedup functions accept has_posted_field flag
 #
-#   PIPELINE:
-#   Phase 1: Load 5 unposted candidates from DB
-#   Phase 2: Score + select best candidate
-#   Phase 3: Light dedup (posted=true only)
-#   Phase 4: Parallel scrape (text + images)
-#   Phase 5: Parallel AI race (summary + title + tip)
-#   Phase 6: Build Mehrjameh caption
-#   Phase 7: Soft lock write (status=locked, TTL=10min)
-#   Phase 8: Post to Telegram (images first, then caption)
-#   Phase 9: Update DB (posted=true OR status=failed)
+#   FIX 2 — GROQ MODEL UPDATE:
+#     Problem: llama3-70b-8192 decommissioned → HTTP 400
+#     Solution:
+#       - Primary:  llama-3.3-70b-versatile
+#       - Fallback: llama-3.1-8b-instant (if primary 400s)
+#       - Model tried in order, first success wins
 #
-#   AI PROVIDERS (parallel race, first-valid wins):
-#     1. Groq       (llama3-70b-8192)     — PRIMARY
-#     2. OpenRouter (mistral-7b-instruct) — SECONDARY
+#   FIX 3 — OPENROUTER KEY VALIDATION:
+#     Problem: 401 "User not found" → silent failure
+#     Solution:
+#       - Key validated at startup with lightweight probe
+#       - Invalid key → provider skipped cleanly
+#       - Free model fallback: meta-llama/llama-3.1-8b-instruct:free
+#       - Paid model: mistralai/mistral-7b-instruct
 #
-#   CULTURAL NOTES:
-#   - Styling tips respect Iranian dress code context
-#   - Language is literary, calm, and editorial (Mehrjameh tone)
-#   - Brand names kept in Latin; Persian prose around them
-#   - No reference to "Mehrjameh" brand name in output
+#   FIX 4 — SDK DEPRECATION WARNINGS:
+#     Problem: list_documents deprecated since 1.8.0
+#     Solution:
+#       - All DB calls use _db_list() wrapper
+#       - _db_list() tries list_rows first, falls back to list_documents
+#       - Deprecation warnings suppressed cleanly
+#
+# SCHEMA MIGRATION (run once if posted field is missing):
+#   python main.py --migrate
+#   Adds posted/status/locked_at/posted_at/fail_reason fields.
+#
+# ONE-TIME CLEANUP (run once to clear unposted records):
+#   python main.py --cleanup
 # ============================================================
 
 
@@ -65,7 +54,6 @@
 
 import os
 import re
-import time
 import random
 import hashlib
 import asyncio
@@ -89,14 +77,8 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 # SECTION 1 — CONFIGURATION
 # ═══════════════════════════════════════════════════════════
 
-# ── Appwrite ──
 COLLECTION_ID = "history"
 SOURCE_TYPE   = "en"
-
-# ── Candidate batch size ──
-# How many unposted articles to fetch from DB per run
-# for scoring + selection.
-CANDIDATE_BATCH_SIZE = 5
 
 # ── Article filtering ──
 ARTICLE_AGE_HOURS = 36
@@ -120,32 +102,39 @@ DB_CATEGORY_MAX    = 49
 DB_DOMAIN_HASH_MAX = 64
 DB_REASON_MAX      = 499
 
-# ── Operation timeouts (seconds) ──
-FEED_FETCH_TIMEOUT  = 7
-FEEDS_SCAN_TIMEOUT  = 22
-SCRAPE_TIMEOUT      = 12
-TELEGRAM_TIMEOUT    = 50
-
-# ── Parallel AI race timeouts ──
+# ── Timeouts ──
+FEED_FETCH_TIMEOUT = 7
+FEEDS_SCAN_TIMEOUT = 22
+SCRAPE_TIMEOUT     = 12
+TELEGRAM_TIMEOUT   = 50
 AI_PER_API_TIMEOUT = 20
 AI_RACE_TIMEOUT    = 35
 AI_TITLE_TIMEOUT   = 15
 AI_TIP_TIMEOUT     = 15
 
-# ── Persian response validation ──
+# ── Persian validation ──
 MIN_PERSIAN_CHARS = 30
 
-# ── Groq ──
-GROQ_MODEL       = "llama3-70b-8192"
+# ── Groq — updated model chain (FIX 2) ──
+# Models tried in order. First to succeed wins.
+GROQ_MODELS = [
+    "llama-3.3-70b-versatile",   # primary — current flagship
+    "llama-3.1-8b-instant",      # fallback — fast, always available
+    "gemma2-9b-it",              # last resort
+]
 GROQ_MAX_TOKENS  = 700
 GROQ_TEMPERATURE = 0.4
 
-# ── OpenRouter ──
-OPENROUTER_MODEL       = "mistralai/mistral-7b-instruct"
+# ── OpenRouter (FIX 3) ──
+# Free model tried first, paid model as fallback.
+OPENROUTER_MODELS = [
+    "meta-llama/llama-3.1-8b-instruct:free",  # free tier
+    "mistralai/mistral-7b-instruct",           # paid fallback
+]
 OPENROUTER_MAX_TOKENS  = 700
 OPENROUTER_TEMPERATURE = 0.4
 
-# ── Deduplication / lock ──
+# ── Lock / dedup ──
 LOCK_TTL_SECONDS           = 600
 FUZZY_SIMILARITY_THRESHOLD = 0.65
 FUZZY_LOOKBACK_COUNT       = 150
@@ -156,11 +145,9 @@ STATUS_LOCKED = "locked"
 STATUS_POSTED = "posted"
 STATUS_FAILED = "failed"
 
-# ── Peak hours UTC (Tehran = UTC+3:30) ──
-PEAK_HOURS_UTC  = {4, 5, 6, 9, 10, 11, 16, 17, 18, 19}
-PEAK_HOUR_BONUS = 15
-
-# ── Scoring weights ──
+# ── Scoring ──
+PEAK_HOURS_UTC          = {4, 5, 6, 9, 10, 11, 16, 17, 18, 19}
+PEAK_HOUR_BONUS         = 15
 SCORE_RECENCY_MAX       = 40
 SCORE_TITLE_KEYWORD     = 15
 SCORE_DESC_KEYWORD      = 5
@@ -168,7 +155,6 @@ SCORE_HAS_IMAGE         = 10
 SCORE_DESC_LENGTH       = 10
 SCORE_FASHION_RELEVANCE = 20
 
-# ── Fashion relevance keywords ──
 FASHION_RELEVANCE_KEYWORDS = {
     "chanel", "dior", "gucci", "prada", "louis vuitton", "lv",
     "balenciaga", "versace", "fendi", "burberry", "valentino",
@@ -189,7 +175,6 @@ FASHION_RELEVANCE_KEYWORDS = {
     "creative director", "fashion",
 }
 
-# ── Trend keywords ──
 TREND_KEYWORDS = [
     "launches", "unveils", "debuts", "announces", "names",
     "acquires", "appoints", "partners", "expands", "opens",
@@ -202,7 +187,6 @@ TREND_KEYWORDS = [
     "versace", "fendi", "burberry", "valentino", "armani",
 ]
 
-# ── Content categories ──
 CONTENT_CATEGORIES = {
     "runway": [
         "runway", "fashion week", "collection", "show", "catwalk",
@@ -243,7 +227,6 @@ CONTENT_CATEGORIES = {
     ],
 }
 
-# ── Hashtag map ──
 HASHTAG_MAP = {
     "chanel":         "#Chanel #شنل",
     "dior":           "#Dior #دیور",
@@ -274,7 +257,6 @@ HASHTAG_MAP = {
 }
 MAX_HASHTAGS = 5
 
-# ── Fashion stickers ──
 FASHION_STICKERS = [
     "CAACAgIAAxkBAAIBmGRx1yRFMVhVqVXLv_dAAXJMOdFNAAIUAAOVgnkAAVGGBbBjxbg4LwQ",
     "CAACAgIAAxkBAAIBmWRx1yRqy9JkN2DmV_Z2sRsKdaTjAAIVAAOVgnkAAc8R3q5p5-AELAQ",
@@ -283,7 +265,6 @@ FASHION_STICKERS = [
     "CAACAgIAAxkBAAIBnGRx1yT_jVlWt5xPJ7BO9aQ4JvFaAAIYAAO0yXAAAA0k9GZDQpLcLAQ",
 ]
 
-# ── RSS feeds ──
 RSS_FEEDS = [
     "https://www.vogue.com/feed/rss",
     "https://wwd.com/feed/",
@@ -307,7 +288,6 @@ RSS_FEEDS = [
     "https://fashionmagazine.com/feed/",
 ]
 
-# ── Boilerplate patterns ──
 BOILERPLATE_PATTERNS = [
     "subscribe", "newsletter", "sign up", "cookie",
     "privacy policy", "all rights reserved", "terms of service",
@@ -316,7 +296,6 @@ BOILERPLATE_PATTERNS = [
     "download the app", "get the app",
 ]
 
-# ── Image constants ──
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 IMAGE_BLOCKLIST  = [
     "doubleclick", "googletagmanager", "googlesyndication",
@@ -324,7 +303,6 @@ IMAGE_BLOCKLIST  = [
     "tracking", "counter", "stat.", "stats.",
 ]
 
-# ── Stop words ──
 TITLE_STOP_WORDS = {
     "a", "an", "the", "is", "are", "was", "were", "be", "been",
     "being", "have", "has", "had", "do", "does", "did", "will",
@@ -337,23 +315,20 @@ TITLE_STOP_WORDS = {
 
 
 # ═══════════════════════════════════════════════════════════
-# SECTION 2 — AI PROMPT TEMPLATES (Mehrjameh editorial voice)
+# SECTION 2 — AI PROMPT TEMPLATES
 # ═══════════════════════════════════════════════════════════
 
 _PROMPT_BODY = """\
-تو یک روزنامه‌نگار مد ایرانی هستی که برای یک کانال تلگرام فارسی‌زبان \
-به نام «مد و فشن ایرانی» می‌نویسی.
+تو یک روزنامه‌نگار مد ایرانی هستی که برای کانال تلگرام «مد و فشن ایرانی» می‌نویسی.
 
-وظیفه:
-متن خبر مد انگلیسی زیر را بخوان و یک خلاصه کوتاه و روان فارسی بنویس.
+وظیفه: متن خبر مد انگلیسی زیر را بخوان و یک خلاصه کوتاه و روان فارسی بنویس.
 
 قوانین:
-- فارسی روان و ادبی بنویس. ترجمه تحت‌اللفظی نکن.
-- حداکثر ۵ جمله. هر جمله باید مفید باشد.
-- بگو: چه اتفاقی افتاده، چه کسی درگیر است، چرا برای مد اهمیت دارد.
-- نثر روان بنویس. از بولت‌پوینت یا شماره‌گذاری استفاده نکن.
-- هیچ کلمه انگلیسی در خروجی نباشد (نام برندها مستثنی هستند).
-- هیچ توضیح، عنوان یا مقدمه‌ای اضافه نکن.
+- فارسی روان و ادبی. ترجمه تحت‌اللفظی نکن.
+- حداکثر ۵ جمله مفید.
+- بگو: چه اتفاقی افتاده، چه کسی درگیر است، چرا اهمیت دارد.
+- نثر روان. بدون بولت‌پوینت یا شماره.
+- نام برندها به لاتین بماند. بقیه فارسی.
 - فقط متن خلاصه فارسی را بنویس.
 
 خبر:
@@ -364,34 +339,28 @@ _PROMPT_BODY = """\
 خلاصه فارسی:"""
 
 _PROMPT_TITLE = """\
-تو یک مترجم حرفه‌ای برای یک کانال اخبار مد ایرانی هستی.
+تو مترجم حرفه‌ای برای کانال اخبار مد ایرانی هستی.
 
-وظیفه:
-عنوان انگلیسی مقاله مد زیر را به فارسی روان و طبیعی ترجمه کن.
+وظیفه: عنوان انگلیسی زیر را به فارسی روان ترجمه کن.
 
 قوانین:
-- فقط ترجمه فارسی عنوان را بنویس.
-- هیچ انگلیسی، توضیح، نقل قول یا مقدمه نداشته باشد.
-- نام برندها را به خط لاتین نگه دار.
-- مثل یک تیتر واقعی رسانه مد ایرانی به نظر برسد.
+- فقط ترجمه فارسی عنوان. بدون توضیح یا مقدمه.
+- نام برندها به لاتین بماند.
+- مثل تیتر رسانه مد ایرانی.
 
-عنوان انگلیسی: {input_text}
+عنوان: {input_text}
 
 عنوان فارسی:"""
 
 _PROMPT_TIP = """\
-تو یک مشاور استایل ایرانی هستی که برای مخاطبان ایرانی می‌نویسی.
+تو مشاور استایل ایرانی هستی.
 
-وظیفه:
-با توجه به خبر مد زیر، یک نکته استایلی کوتاه و کاربردی بنویس \
-که برای زنان ایرانی مناسب و قابل استفاده باشد.
+وظیفه: با توجه به خبر زیر، یک نکته استایلی کوتاه برای زنان ایرانی بنویس.
 
 قوانین:
-- فقط یک جمله یا دو جمله کوتاه بنویس.
-- نکته باید عملی، الهام‌بخش و با فرهنگ ایرانی همخوان باشد.
-- می‌توانی درباره رنگ، پارچه، لایه‌بندی، اکسسوری یا ترکیب لباس صحبت کنی.
-- لحن آرام، صمیمی و ادبی داشته باشد.
-- هیچ مقدمه یا توضیح اضافه نداشته باشد.
+- یک یا دو جمله کوتاه. عملی و الهام‌بخش.
+- با فرهنگ ایرانی همخوان باشد.
+- لحن آرام و ادبی.
 - فقط نکته استایلی را بنویس.
 
 خبر:
@@ -403,18 +372,219 @@ _PROMPT_TIP = """\
 
 
 # ═══════════════════════════════════════════════════════════
-# SECTION 3 — AI VALIDATION & EXTRACTION
+# SECTION 3 — SCHEMA DETECTION (FIX 1)
+#
+# Detects which fields exist in the Appwrite collection.
+# All dedup functions use this to avoid querying missing fields.
+# ═══════════════════════════════════════════════════════════
+
+class SchemaInfo:
+    """Holds detected schema capabilities for this run."""
+    def __init__(self):
+        self.has_posted      = False   # posted (boolean) field exists
+        self.has_status      = False   # status (string) field exists
+        self.has_locked_at   = False   # locked_at field exists
+        self.has_posted_at   = False   # posted_at field exists
+        self.has_fail_reason = False   # fail_reason field exists
+        self.has_content_hash = False  # content_hash field exists
+        self.has_title_hash   = False  # title_hash field exists
+        self.has_domain_hash  = False  # domain_hash field exists
+
+    @property
+    def is_v11(self) -> bool:
+        """True if all v11 state fields are present."""
+        return (
+            self.has_posted
+            and self.has_status
+            and self.has_locked_at
+        )
+
+    def __str__(self) -> str:
+        return (
+            f"SchemaInfo("
+            f"posted={self.has_posted}, "
+            f"status={self.has_status}, "
+            f"locked_at={self.has_locked_at}, "
+            f"content_hash={self.has_content_hash}, "
+            f"title_hash={self.has_title_hash})"
+        )
+
+
+def _detect_schema(
+    databases,
+    database_id: str,
+    collection_id: str,
+    sdk_mode: str,
+    log_fn=print,
+) -> SchemaInfo:
+    """
+    Probe the Appwrite collection schema by attempting
+    lightweight test queries for each optional field.
+
+    Returns SchemaInfo with boolean flags for each field.
+    Never raises — returns minimal SchemaInfo on any error.
+    """
+    info = SchemaInfo()
+
+    def _probe(field: str, value) -> bool:
+        """Returns True if field exists in schema."""
+        try:
+            queries = [Query.equal(field, value), Query.limit(1)]
+            _db_list(databases, database_id, collection_id,
+                     queries, sdk_mode)
+            return True
+        except AppwriteException as e:
+            msg = str(e.message).lower()
+            # "attribute not found" = field does not exist
+            if "attribute not found" in msg:
+                return False
+            # Other error = field probably exists, DB issue
+            return True
+        except Exception:
+            return False
+
+    info.has_posted       = _probe("posted",       True)
+    info.has_status       = _probe("status",       STATUS_POSTED)
+    info.has_locked_at    = _probe("locked_at",    "")
+    info.has_posted_at    = _probe("posted_at",    "")
+    info.has_fail_reason  = _probe("fail_reason",  "")
+    info.has_content_hash = _probe("content_hash", "x")
+    info.has_title_hash   = _probe("title_hash",   "x")
+    info.has_domain_hash  = _probe("domain_hash",  "x")
+
+    log_fn(f"[schema] Detected: {info}")
+    if not info.is_v11:
+        log_fn(
+            "[schema] WARNING: v11 state fields missing. "
+            "Run --migrate to add them. "
+            "Falling back to link-only dedup."
+        )
+    return info
+
+
+# ═══════════════════════════════════════════════════════════
+# SECTION 4 — DB WRAPPER (FIX 4 — deprecation)
+# ═══════════════════════════════════════════════════════════
+
+def _db_list(
+    databases,
+    database_id: str,
+    collection_id: str,
+    queries: list,
+    sdk_mode: str,
+) -> dict:
+    """
+    Unified DB list call. Tries list_rows (new SDK) first,
+    falls back to list_documents (legacy SDK).
+    Suppresses DeprecationWarning on legacy path.
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        if sdk_mode == "new":
+            try:
+                return databases.list_rows(
+                    database_id=database_id,
+                    collection_id=collection_id,
+                    queries=queries,
+                )
+            except AttributeError:
+                pass
+        return databases.list_documents(
+            database_id=database_id,
+            collection_id=collection_id,
+            queries=queries,
+        )
+
+
+def _db_create(
+    databases,
+    database_id: str,
+    collection_id: str,
+    data: dict,
+    sdk_mode: str,
+) -> dict:
+    """Unified DB create call."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        if sdk_mode == "new":
+            try:
+                return databases.create_row(
+                    database_id=database_id,
+                    collection_id=collection_id,
+                    row_id="unique()",
+                    data=data,
+                )
+            except AttributeError:
+                pass
+        return databases.create_document(
+            database_id=database_id,
+            collection_id=collection_id,
+            document_id="unique()",
+            data=data,
+        )
+
+
+def _db_update(
+    databases,
+    database_id: str,
+    collection_id: str,
+    doc_id: str,
+    data: dict,
+    sdk_mode: str,
+) -> dict:
+    """Unified DB update call."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        if sdk_mode == "new":
+            try:
+                return databases.update_row(
+                    database_id=database_id,
+                    collection_id=collection_id,
+                    row_id=doc_id,
+                    data=data,
+                )
+            except AttributeError:
+                pass
+        return databases.update_document(
+            database_id=database_id,
+            collection_id=collection_id,
+            document_id=doc_id,
+            data=data,
+        )
+
+
+def _db_delete(
+    databases,
+    database_id: str,
+    collection_id: str,
+    doc_id: str,
+    sdk_mode: str,
+) -> None:
+    """Unified DB delete call."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        if sdk_mode == "new":
+            try:
+                databases.delete_row(
+                    database_id=database_id,
+                    collection_id=collection_id,
+                    row_id=doc_id,
+                )
+                return
+            except AttributeError:
+                pass
+        databases.delete_document(
+            database_id=database_id,
+            collection_id=collection_id,
+            document_id=doc_id,
+        )
+
+
+# ═══════════════════════════════════════════════════════════
+# SECTION 5 — AI VALIDATION
 # ═══════════════════════════════════════════════════════════
 
 def _is_valid_persian(text: str | None) -> bool:
-    """
-    Validate genuine usable Persian text.
-    All four conditions must pass:
-      1. Not None, not empty, is a string
-      2. Length >= MIN_PERSIAN_CHARS after stripping
-      3. Contains at least one Persian Unicode character
-      4. Does not contain known API error markers
-    """
     if not text or not isinstance(text, str):
         return False
     stripped = text.strip()
@@ -433,6 +603,7 @@ def _is_valid_persian(text: str | None) -> bool:
         "model_not_found", "context_length_exceeded", "bad request",
         "unauthorized", "forbidden", "too many requests",
         "service unavailable", "internal server error",
+        "user not found",
     )
     if any(m in stripped.lower() for m in _ERROR_MARKERS):
         return False
@@ -440,21 +611,67 @@ def _is_valid_persian(text: str | None) -> bool:
 
 
 def _extract_openai_content(data: dict) -> str | None:
-    """Extract content from OpenAI-compatible chat completion response."""
     try:
         return (
-            data
-            .get("choices", [{}])[0]
+            data.get("choices", [{}])[0]
             .get("message", {})
-            .get("content", "")
-            or ""
+            .get("content", "") or ""
         ).strip() or None
     except (IndexError, AttributeError, TypeError):
         return None
 
 
 # ═══════════════════════════════════════════════════════════
-# SECTION 4 — PARALLEL AI RACE ENGINE
+# SECTION 6 — AI PROVIDER VALIDATION (FIX 2 & 3)
+# ═══════════════════════════════════════════════════════════
+
+async def _validate_groq_key(log_fn=print) -> bool:
+    """Quick probe to verify Groq key is valid."""
+    api_key = os.environ.get("GROQ_API_KEY", "").strip()
+    if not api_key:
+        return False
+    try:
+        connector = aiohttp.TCPConnector(ssl=False)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            async with session.get(
+                "https://api.groq.com/openai/v1/models",
+                headers={"Authorization": f"Bearer {api_key}"},
+                timeout=aiohttp.ClientTimeout(total=5),
+            ) as resp:
+                valid = resp.status == 200
+                log_fn(f"[startup] Groq key valid={valid} (HTTP {resp.status})")
+                return valid
+    except Exception as e:
+        log_fn(f"[startup] Groq key probe failed: {e}")
+        return False
+
+
+async def _validate_openrouter_key(log_fn=print) -> bool:
+    """Quick probe to verify OpenRouter key is valid."""
+    api_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
+    if not api_key:
+        return False
+    try:
+        connector = aiohttp.TCPConnector(ssl=False)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            async with session.get(
+                "https://openrouter.ai/api/v1/models",
+                headers={"Authorization": f"Bearer {api_key}"},
+                timeout=aiohttp.ClientTimeout(total=5),
+            ) as resp:
+                valid = resp.status == 200
+                log_fn(
+                    f"[startup] OpenRouter key valid={valid} "
+                    f"(HTTP {resp.status})"
+                )
+                return valid
+    except Exception as e:
+        log_fn(f"[startup] OpenRouter key probe failed: {e}")
+        return False
+
+
+# ═══════════════════════════════════════════════════════════
+# SECTION 7 — PARALLEL AI RACE ENGINE (FIX 2 & 3)
 # ═══════════════════════════════════════════════════════════
 
 async def _call_groq(
@@ -462,51 +679,83 @@ async def _call_groq(
     prompt: str,
     log_fn=print,
 ) -> str | None:
-    """Groq API caller. Returns valid Persian or None."""
+    """
+    Groq API caller with model fallback chain.
+    Tries each model in GROQ_MODELS until one succeeds.
+    Skips decommissioned models (HTTP 400 with decommission msg).
+    """
     api_key = os.environ.get("GROQ_API_KEY", "").strip()
     if not api_key:
-        log_fn("[race] Groq: GROQ_API_KEY not set — skipping.")
+        log_fn("[race] Groq: no key — skipping.")
         return None
 
-    payload = {
-        "model":       GROQ_MODEL,
-        "messages":    [{"role": "user", "content": prompt}],
-        "temperature": GROQ_TEMPERATURE,
-        "max_tokens":  GROQ_MAX_TOKENS,
-    }
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type":  "application/json",
     }
-    try:
-        async with session.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            json=payload,
-            headers=headers,
-            timeout=aiohttp.ClientTimeout(total=AI_PER_API_TIMEOUT),
-        ) as resp:
-            if resp.status != 200:
-                body = await resp.text()
-                log_fn(f"[race] Groq HTTP {resp.status}: {body[:120]}")
-                return None
-            data   = await resp.json()
-            result = _extract_openai_content(data)
-            valid  = _is_valid_persian(result)
-            log_fn(
-                f"[race] Groq responded: "
-                f"{len(result or '')}ch | valid={valid}"
-            )
-            return result if valid else None
 
-    except asyncio.CancelledError:
-        log_fn("[race] Groq: cancelled (race won).")
-        raise
-    except aiohttp.ClientError as e:
-        log_fn(f"[race] Groq network error: {e}")
-        return None
-    except Exception as e:
-        log_fn(f"[race] Groq error: {type(e).__name__}: {e}")
-        return None
+    for model in GROQ_MODELS:
+        payload = {
+            "model":       model,
+            "messages":    [{"role": "user", "content": prompt}],
+            "temperature": GROQ_TEMPERATURE,
+            "max_tokens":  GROQ_MAX_TOKENS,
+        }
+        try:
+            async with session.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                json=payload,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=AI_PER_API_TIMEOUT),
+            ) as resp:
+                body_text = await resp.text()
+
+                if resp.status == 400:
+                    # Check if this is a decommissioned model error
+                    if "decommission" in body_text.lower():
+                        log_fn(
+                            f"[race] Groq model {model} decommissioned — "
+                            f"trying next."
+                        )
+                        continue
+                    log_fn(
+                        f"[race] Groq/{model} HTTP 400: "
+                        f"{body_text[:120]}"
+                    )
+                    continue
+
+                if resp.status != 200:
+                    log_fn(
+                        f"[race] Groq/{model} HTTP {resp.status}: "
+                        f"{body_text[:120]}"
+                    )
+                    continue
+
+                import json as _json
+                data   = _json.loads(body_text)
+                result = _extract_openai_content(data)
+                valid  = _is_valid_persian(result)
+                log_fn(
+                    f"[race] Groq/{model}: "
+                    f"{len(result or '')}ch | valid={valid}"
+                )
+                if valid:
+                    return result
+                # Invalid result — try next model
+                continue
+
+        except asyncio.CancelledError:
+            log_fn(f"[race] Groq/{model}: cancelled.")
+            raise
+        except aiohttp.ClientError as e:
+            log_fn(f"[race] Groq/{model} network error: {e}")
+            continue
+        except Exception as e:
+            log_fn(f"[race] Groq/{model} error: {type(e).__name__}: {e}")
+            continue
+
+    log_fn("[race] Groq: all models exhausted.")
+    return None
 
 
 async def _call_openrouter(
@@ -514,53 +763,89 @@ async def _call_openrouter(
     prompt: str,
     log_fn=print,
 ) -> str | None:
-    """OpenRouter API caller. Returns valid Persian or None."""
+    """
+    OpenRouter API caller with model fallback chain.
+    Tries free model first, paid model as fallback.
+    Skips on 401 (invalid key).
+    """
     api_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
     if not api_key:
-        log_fn("[race] OpenRouter: OPENROUTER_API_KEY not set — skipping.")
+        log_fn("[race] OpenRouter: no key — skipping.")
         return None
 
-    payload = {
-        "model":       OPENROUTER_MODEL,
-        "messages":    [{"role": "user", "content": prompt}],
-        "temperature": OPENROUTER_TEMPERATURE,
-        "max_tokens":  OPENROUTER_MAX_TOKENS,
-    }
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type":  "application/json",
         "HTTP-Referer":  "https://t.me/irfashionnews",
         "X-Title":       "IrFashionNews",
     }
-    try:
-        async with session.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            json=payload,
-            headers=headers,
-            timeout=aiohttp.ClientTimeout(total=AI_PER_API_TIMEOUT),
-        ) as resp:
-            if resp.status != 200:
-                body = await resp.text()
-                log_fn(f"[race] OpenRouter HTTP {resp.status}: {body[:120]}")
-                return None
-            data   = await resp.json()
-            result = _extract_openai_content(data)
-            valid  = _is_valid_persian(result)
-            log_fn(
-                f"[race] OpenRouter responded: "
-                f"{len(result or '')}ch | valid={valid}"
-            )
-            return result if valid else None
 
-    except asyncio.CancelledError:
-        log_fn("[race] OpenRouter: cancelled (race won).")
-        raise
-    except aiohttp.ClientError as e:
-        log_fn(f"[race] OpenRouter network error: {e}")
-        return None
-    except Exception as e:
-        log_fn(f"[race] OpenRouter error: {type(e).__name__}: {e}")
-        return None
+    for model in OPENROUTER_MODELS:
+        payload = {
+            "model":       model,
+            "messages":    [{"role": "user", "content": prompt}],
+            "temperature": OPENROUTER_TEMPERATURE,
+            "max_tokens":  OPENROUTER_MAX_TOKENS,
+        }
+        try:
+            async with session.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                json=payload,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=AI_PER_API_TIMEOUT),
+            ) as resp:
+                body_text = await resp.text()
+
+                if resp.status == 401:
+                    # Key is invalid — no point trying other models
+                    log_fn(
+                        f"[race] OpenRouter: 401 invalid key — "
+                        f"skipping all OR models."
+                    )
+                    return None
+
+                if resp.status == 402:
+                    # Insufficient credits for paid model
+                    log_fn(
+                        f"[race] OpenRouter/{model}: 402 credits — "
+                        f"trying next."
+                    )
+                    continue
+
+                if resp.status != 200:
+                    log_fn(
+                        f"[race] OpenRouter/{model} HTTP {resp.status}: "
+                        f"{body_text[:120]}"
+                    )
+                    continue
+
+                import json as _json
+                data   = _json.loads(body_text)
+                result = _extract_openai_content(data)
+                valid  = _is_valid_persian(result)
+                log_fn(
+                    f"[race] OpenRouter/{model}: "
+                    f"{len(result or '')}ch | valid={valid}"
+                )
+                if valid:
+                    return result
+                continue
+
+        except asyncio.CancelledError:
+            log_fn(f"[race] OpenRouter/{model}: cancelled.")
+            raise
+        except aiohttp.ClientError as e:
+            log_fn(f"[race] OpenRouter/{model} network error: {e}")
+            continue
+        except Exception as e:
+            log_fn(
+                f"[race] OpenRouter/{model} error: "
+                f"{type(e).__name__}: {e}"
+            )
+            continue
+
+    log_fn("[race] OpenRouter: all models exhausted.")
+    return None
 
 
 async def _parallel_ai_race(
@@ -570,21 +855,11 @@ async def _parallel_ai_race(
 ) -> str | None:
     """
     First-response-wins parallel AI race.
-
-    Fires Groq and OpenRouter simultaneously at t=0.
-    Returns first valid Persian response. Cancels losers.
-
-    Args:
-        prompt:        Fully-formed prompt string
-        race_timeout:  Overall race deadline in seconds
-        log_fn:        Logging function (context.log or print)
-
-    Returns:
-        str  → valid Persian text from winning provider
-        None → all providers failed or timed out
+    Groq and OpenRouter fire simultaneously.
+    Each internally tries its model chain.
+    Returns first valid Persian response.
     """
     if not prompt or not prompt.strip():
-        log_fn("[race] Empty prompt — skipping.")
         return None
 
     result_queue: asyncio.Queue[str | None] = asyncio.Queue()
@@ -617,7 +892,7 @@ async def _parallel_ai_race(
         ]
 
         log_fn(
-            f"[race] ★ {total} providers fired simultaneously "
+            f"[race] ★ {total} providers fired "
             f"(timeout={race_timeout}s)."
         )
 
@@ -631,15 +906,14 @@ async def _parallel_ai_race(
                     if _is_valid_persian(result):
                         winner = result
                         log_fn(
-                            f"[race] ✓ Winner: {len(winner)}ch. "
-                            f"Cancelling remaining."
+                            f"[race] ✓ Winner: {len(winner)}ch."
                         )
                         break
                     else:
                         none_count += 1
                         log_fn(
                             f"[race] ✗ Invalid "
-                            f"({none_count}/{total} failed)."
+                            f"({none_count}/{total})."
                         )
         except TimeoutError:
             log_fn(f"[race] ✗ Timed out after {race_timeout}s.")
@@ -650,8 +924,6 @@ async def _parallel_ai_race(
                     t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    status = f"{len(winner)}ch winner" if winner else "all failed"
-    log_fn(f"[race] ═══ Complete: {status}. ═══")
     return winner
 
 
@@ -661,12 +933,8 @@ async def _run_three_races(
     tip_prompt: str,
     log_fn=print,
 ) -> tuple[str | None, str | None, str | None]:
-    """
-    Run body, title, and tip translation races concurrently.
-    All three races fire their internal provider pairs at t=0.
-    Returns (body_fa, title_fa, tip_fa).
-    """
-    log_fn("[ai] Starting 3 parallel AI races (body + title + tip)...")
+    """Run body + title + tip races concurrently."""
+    log_fn("[ai] Starting 3 concurrent AI races...")
     try:
         results = await asyncio.wait_for(
             asyncio.gather(
@@ -678,7 +946,7 @@ async def _run_three_races(
             timeout=AI_RACE_TIMEOUT + 10,
         )
     except asyncio.TimeoutError:
-        log_fn("[ai] Outer 3-race timeout.")
+        log_fn("[ai] Outer race timeout.")
         return None, None, None
 
     body_fa  = results[0] if isinstance(results[0], str) else None
@@ -686,8 +954,7 @@ async def _run_three_races(
     tip_fa   = results[2] if isinstance(results[2], str) else None
 
     log_fn(
-        f"[ai] Results — "
-        f"body={len(body_fa or '')}ch | "
+        f"[ai] body={len(body_fa or '')}ch | "
         f"title={len(title_fa or '')}ch | "
         f"tip={len(tip_fa or '')}ch"
     )
@@ -695,20 +962,7 @@ async def _run_three_races(
 
 
 # ═══════════════════════════════════════════════════════════
-# SECTION 5 — MEHRJAMEH CAPTION BUILDER
-#
-# Format:
-#   <b>عنوان فارسی</b>
-#   ─────────────
-#   مد و فشن ایرانی
-#
-#   متن خلاصه خبر...
-#
-#   💡 نکته استایلی
-#
-#   EMOJI  کانال مد و فشن ایرانی
-#
-#   #hashtag1 #hashtag2 ...    ← ALWAYS LAST
+# SECTION 8 — CAPTION BUILDER
 # ═══════════════════════════════════════════════════════════
 
 def _build_mehrjameh_caption(
@@ -719,9 +973,19 @@ def _build_mehrjameh_caption(
     category: str,
 ) -> str:
     """
-    Build Telegram-ready HTML caption in Mehrjameh editorial format.
-    Guarantees len(output) <= CAPTION_MAX.
-    Hashtags always last.
+    Mehrjameh editorial caption.
+    Format:
+      <b>عنوان</b>
+      ─────────────
+      مد و فشن ایرانی
+
+      خلاصه خبر
+
+      💡 نکته استایلی
+
+      EMOJI  کانال مد و فشن ایرانی
+
+      #hashtags
     """
     def _esc(t: str) -> str:
         return (
@@ -731,46 +995,37 @@ def _build_mehrjameh_caption(
         )
 
     CATEGORY_EMOJI = {
-        "runway":         "👗",
-        "brand":          "🏷️",
-        "business":       "📊",
-        "beauty":         "💄",
-        "sustainability": "♻️",
-        "celebrity":      "⭐",
-        "trend":          "🔥",
-        "general":        "🌐",
+        "runway": "👗", "brand": "🏷️", "business": "📊",
+        "beauty": "💄", "sustainability": "♻️", "celebrity": "⭐",
+        "trend": "🔥", "general": "🌐",
     }
     emoji     = CATEGORY_EMOJI.get(category, "🌐")
     hash_line = " ".join(hashtags)
 
-    # Fixed parts (never trimmed)
     header    = f"<b>{_esc(title_fa.strip())}</b>"
     sep       = "─────────────\nمد و فشن ایرانی"
-    tip_block = f"💡 {_esc(tip_fa.strip())}" if tip_fa else ""
+    tip_block = f"💡 {_esc(tip_fa.strip())}" if tip_fa and tip_fa.strip() else ""
     footer    = f"{emoji}  <i>کانال مد و فشن ایرانی</i>"
 
     # Calculate body budget
-    fixed_items = [header, sep]
+    fixed_parts = [header, sep]
     if tip_block:
-        fixed_items.append(tip_block)
-    fixed_items.append(footer)
+        fixed_parts.append(tip_block)
+    fixed_parts.append(footer)
     if hash_line:
-        fixed_items.append(hash_line)
+        fixed_parts.append(hash_line)
 
-    # Budget = total - fixed - separators (2 chars each \n\n)
-    separators  = (len(fixed_items)) * 2  # \n\n between each
-    fixed_len   = sum(len(p) for p in fixed_items) + separators
+    separators  = len(fixed_parts) * 2
+    fixed_len   = sum(len(p) for p in fixed_parts) + separators
     body_budget = CAPTION_MAX - fixed_len - 4
 
     safe_body = _esc(body_fa.strip())
-
     if body_budget <= 10:
         safe_body = ""
         header    = f"<b>{_esc(title_fa.strip())[:80]}</b>"
     elif len(safe_body) > body_budget:
         safe_body = safe_body[:body_budget - 1] + "…"
 
-    # Assemble
     parts = [header, sep]
     if safe_body:
         parts.append(safe_body)
@@ -781,28 +1036,20 @@ def _build_mehrjameh_caption(
         parts.append(hash_line)
 
     caption = "\n\n".join(parts)
-
-    # Hard guard
     if len(caption) > CAPTION_MAX:
         caption = caption[:CAPTION_MAX - 1] + "…"
-
     return caption
 
 
 # ═══════════════════════════════════════════════════════════
-# SECTION 6 — MAIN ENTRY POINT
+# SECTION 9 — MAIN ENTRY POINT
 # ═══════════════════════════════════════════════════════════
 
 async def main(event=None, context=None):
-    """
-    Main Appwrite Cloud Function entry point.
-    Uses context.log() when available, falls back to print().
-    """
-    # ── Logging setup ──────────────────────────────────────
     log   = context.log   if context and hasattr(context, "log")   else print
     error = context.error if context and hasattr(context, "error") else print
 
-    log("═══ FashionBot v11.0 (Mehrjameh) started ═══")
+    log("═══ FashionBot v11.1 started ═══")
 
     loop       = asyncio.get_running_loop()
     start_time = loop.time()
@@ -810,7 +1057,7 @@ async def main(event=None, context=None):
     def elapsed() -> str:
         return f"{loop.time() - start_time:.1f}"
 
-    # ── Environment ────────────────────────────────────────
+    # ── Environment ──
     token             = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id           = os.environ.get("TELEGRAM_CHANNEL_ID", "").strip()
     appwrite_endpoint = os.environ.get(
@@ -833,13 +1080,7 @@ async def main(event=None, context=None):
         error(f"Missing env vars: {missing}")
         return {"status": "error", "missing_vars": missing}
 
-    if not any([
-        os.environ.get("GROQ_API_KEY", ""),
-        os.environ.get("OPENROUTER_API_KEY", ""),
-    ]):
-        error("No AI API keys found. Translation will fail.")
-
-    # ── Clients ────────────────────────────────────────────
+    # ── Clients ──
     bot       = Bot(token=token)
     aw_client = Client()
     aw_client.set_endpoint(appwrite_endpoint)
@@ -849,25 +1090,53 @@ async def main(event=None, context=None):
     sdk_mode  = "new" if hasattr(databases, "list_rows") else "legacy"
     log(f"SDK mode: {sdk_mode}")
 
+    # ── Startup: schema detection + key validation ──────────
+    log(f"[{elapsed()}s] Detecting schema and validating AI keys...")
+
+    schema, groq_ok, or_ok = await asyncio.gather(
+        loop.run_in_executor(
+            None, _detect_schema,
+            databases, database_id, COLLECTION_ID, sdk_mode, log,
+        ),
+        _validate_groq_key(log),
+        _validate_openrouter_key(log),
+    )
+
+    log(
+        f"[{elapsed()}s] Schema={schema} | "
+        f"Groq={'✓' if groq_ok else '✗'} | "
+        f"OpenRouter={'✓' if or_ok else '✗'}"
+    )
+
+    if not groq_ok and not or_ok:
+        error(
+            "No working AI providers. "
+            "Check GROQ_API_KEY and OPENROUTER_API_KEY."
+        )
+        return {
+            "status": "error",
+            "reason": "no_ai_providers",
+        }
+
     now            = datetime.now(timezone.utc)
     time_threshold = now - timedelta(hours=ARTICLE_AGE_HOURS)
     current_hour   = now.hour
     is_peak        = current_hour in PEAK_HOURS_UTC
     log(
         f"UTC={current_hour}h | "
-        f"Peak={'YES +' + str(PEAK_HOUR_BONUS) if is_peak else 'no'}"
+        f"Peak={'YES' if is_peak else 'no'}"
     )
 
-    # ── Load posted-only titles for fuzzy dedup ────────────
+    # Load posted-only titles for fuzzy dedup
     recent_titles = _load_recent_titles_posted_only(
-        databases, database_id, COLLECTION_ID, sdk_mode,
-        FUZZY_LOOKBACK_COUNT, log,
+        databases, database_id, COLLECTION_ID,
+        sdk_mode, FUZZY_LOOKBACK_COUNT, schema, log,
     )
     log(f"[{elapsed()}s] {len(recent_titles)} posted titles loaded.")
 
-    # ════════════════════════════════════════════════════════
-    # PHASE 1 — RSS SCAN + SCORE
-    # ════════════════════════════════════════════════════════
+    # ════════════════════════════════
+    # PHASE 1 — RSS SCAN
+    # ════════════════════════════════
     log(f"[{elapsed()}s] Phase 1: Scanning {len(RSS_FEEDS)} feeds...")
     try:
         candidate = await asyncio.wait_for(
@@ -878,6 +1147,7 @@ async def main(event=None, context=None):
                 collection_id=COLLECTION_ID,
                 time_threshold=time_threshold,
                 sdk_mode=sdk_mode,
+                schema=schema,
                 now=now,
                 recent_titles=recent_titles,
                 is_peak=is_peak,
@@ -911,27 +1181,22 @@ async def main(event=None, context=None):
         f"score={score} cat={category} | {title[:65]}"
     )
 
-    # ════════════════════════════════════════════════════════
-    # PHASE 2 — LIGHT DEDUP (posted=true only)
-    # ════════════════════════════════════════════════════════
-    log(f"[{elapsed()}s] Phase 2: Light dedup (posted-only)...")
+    # ════════════════════════════════
+    # PHASE 2 — LIGHT DEDUP
+    # ════════════════════════════════
+    log(f"[{elapsed()}s] Phase 2: Light dedup...")
     is_dup, dup_reason = _light_duplicate_check(
         databases, database_id, COLLECTION_ID,
-        link, content_hash, title_hash, sdk_mode, log,
+        link, content_hash, title_hash, sdk_mode, schema, log,
     )
     if is_dup:
-        log(f"[{elapsed()}s] Confirmed posted dup ({dup_reason}). Skip.")
-        return {
-            "status":  "success",
-            "posted":  False,
-            "reason":  dup_reason,
-            "article": title[:80],
-        }
+        log(f"[{elapsed()}s] Confirmed dup ({dup_reason}). Skip.")
+        return {"status": "success", "posted": False, "reason": dup_reason}
 
-    # ════════════════════════════════════════════════════════
+    # ════════════════════════════════
     # PHASE 3 — PARALLEL SCRAPE
-    # ════════════════════════════════════════════════════════
-    log(f"[{elapsed()}s] Phase 3: Scraping text + images...")
+    # ════════════════════════════════
+    log(f"[{elapsed()}s] Phase 3: Scraping...")
     try:
         text_result, image_result = await asyncio.wait_for(
             asyncio.gather(
@@ -957,22 +1222,13 @@ async def main(event=None, context=None):
     )
 
     if len(content) < MIN_CONTENT_CHARS:
-        error(f"[{elapsed()}s] Thin content ({len(content)}ch). Abort.")
-        return {
-            "status": "skipped",
-            "reason": f"thin_content",
-            "posted": False,
-        }
+        error(f"[{elapsed()}s] Thin content ({len(content)}ch).")
+        return {"status": "skipped", "reason": "thin_content", "posted": False}
 
-    # ════════════════════════════════════════════════════════
+    # ════════════════════════════════
     # PHASE 4 — PARALLEL AI RACES
-    # Three races fire concurrently:
-    #   Race A: body summary (Groq vs OpenRouter)
-    #   Race B: title translation (Groq vs OpenRouter)
-    #   Race C: styling tip (Groq vs OpenRouter)
-    # ════════════════════════════════════════════════════════
-    log(f"[{elapsed()}s] Phase 4: Parallel AI races (body+title+tip)...")
-
+    # ════════════════════════════════
+    log(f"[{elapsed()}s] Phase 4: AI races (body + title + tip)...")
     body_prompt  = _PROMPT_BODY.format(input_text=content[:3000])
     title_prompt = _PROMPT_TITLE.format(input_text=title[:500])
     tip_prompt   = _PROMPT_TIP.format(input_text=content[:1500])
@@ -981,46 +1237,39 @@ async def main(event=None, context=None):
         body_prompt, title_prompt, tip_prompt, log_fn=log,
     )
 
-    # Fallbacks
     title_fa = (title_fa or "").strip() or title
     body_fa  = (body_fa  or "").strip() or None
     tip_fa   = (tip_fa   or "").strip() or None
 
     if not body_fa:
-        error(f"[{elapsed()}s] All AI providers failed for body.")
+        error(f"[{elapsed()}s] All AI providers failed.")
         return {
-            "status":     "error",
-            "reason":     "translation_failed",
-            "posted":     False,
-            "article_id": "",
+            "status": "error",
+            "reason": "translation_failed",
+            "posted": False,
         }
 
     log(
         f"[{elapsed()}s] "
-        f"title_fa={len(title_fa)}ch | "
-        f"body_fa={len(body_fa)}ch | "
-        f"tip_fa={len(tip_fa or '')}ch"
+        f"title={len(title_fa)}ch | "
+        f"body={len(body_fa)}ch | "
+        f"tip={len(tip_fa or '')}ch"
     )
 
-    # ════════════════════════════════════════════════════════
-    # PHASE 5 — BUILD MEHRJAMEH CAPTION
-    # ════════════════════════════════════════════════════════
+    # ════════════════════════════════
+    # PHASE 5 — BUILD CAPTION
+    # ════════════════════════════════
     combined_for_tags = f"{title} {desc} {content[:500]}"
     hashtags = _extract_hashtags_from_text(combined_for_tags)
     caption  = _build_mehrjameh_caption(
         title_fa, body_fa, tip_fa or "", hashtags, category
     )
+    log(f"[{elapsed()}s] Caption={len(caption)}ch")
 
-    log(
-        f"[{elapsed()}s] "
-        f"Caption={len(caption)}ch | Hashtags={len(hashtags)}"
-    )
-
-    # ════════════════════════════════════════════════════════
+    # ════════════════════════════════
     # PHASE 6 — SOFT LOCK WRITE
-    # Written AFTER AI success, BEFORE Telegram.
-    # ════════════════════════════════════════════════════════
-    log(f"[{elapsed()}s] Phase 6: Acquiring soft lock...")
+    # ════════════════════════════════
+    log(f"[{elapsed()}s] Phase 6: Soft lock...")
     lock_acquired, lock_result = _write_soft_lock(
         databases=databases,
         database_id=database_id,
@@ -1031,6 +1280,7 @@ async def main(event=None, context=None):
         pub_date=pub_date,
         source_type=SOURCE_TYPE,
         sdk_mode=sdk_mode,
+        schema=schema,
         title_hash=title_hash,
         content_hash=content_hash,
         category=category,
@@ -1041,22 +1291,16 @@ async def main(event=None, context=None):
     )
 
     if not lock_acquired:
-        error(f"[{elapsed()}s] Lock not acquired ({lock_result}). Abort.")
-        return {
-            "status":     "skipped",
-            "reason":     f"lock_failed: {lock_result}",
-            "posted":     False,
-            "article_id": "",
-        }
+        error(f"[{elapsed()}s] Lock failed ({lock_result}).")
+        return {"status": "skipped", "reason": lock_result, "posted": False}
 
     doc_id = lock_result
     log(f"[{elapsed()}s] Lock acquired. doc_id={doc_id}")
 
-    # ════════════════════════════════════════════════════════
+    # ════════════════════════════════
     # PHASE 7 — POST TO TELEGRAM
-    # Images sent first, then caption as reply (ordered).
-    # ════════════════════════════════════════════════════════
-    log(f"[{elapsed()}s] Phase 7: Posting to Telegram...")
+    # ════════════════════════════════
+    log(f"[{elapsed()}s] Phase 7: Posting...")
     posted     = False
     post_error = ""
     try:
@@ -1069,22 +1313,31 @@ async def main(event=None, context=None):
         error(f"[{elapsed()}s] Telegram timed out.")
     except Exception as e:
         post_error = str(e)[:200]
-        error(f"[{elapsed()}s] Telegram error: {e}")
+        error(f"[{elapsed()}s] Telegram: {e}")
 
-    # ════════════════════════════════════════════════════════
+    # ════════════════════════════════
     # PHASE 8 — UPDATE DB STATE
-    # posted=true ONLY written after confirmed Telegram success.
-    # ════════════════════════════════════════════════════════
-    if posted:
-        _mark_posted(databases, database_id, COLLECTION_ID, doc_id, sdk_mode, log)
-        log(f"[{elapsed()}s] DB → status=posted, posted=true. ✓")
+    # ════════════════════════════════
+    if schema.is_v11:
+        if posted:
+            _mark_posted(
+                databases, database_id, COLLECTION_ID,
+                doc_id, sdk_mode, log,
+            )
+            log(f"[{elapsed()}s] DB → posted=true ✓")
+        else:
+            _mark_failed(
+                databases, database_id, COLLECTION_ID,
+                doc_id, sdk_mode,
+                reason=post_error or "telegram_failed",
+                log_fn=log,
+            )
+            error(f"[{elapsed()}s] DB → status=failed")
     else:
-        _mark_failed(
-            databases, database_id, COLLECTION_ID, doc_id, sdk_mode,
-            reason=post_error or "telegram_post_failed",
-            log_fn=log,
+        log(
+            f"[{elapsed()}s] Schema missing v11 fields — "
+            f"skipping status update. Run --migrate."
         )
-        error(f"[{elapsed()}s] DB → status=failed (retryable).")
 
     result = {
         "images":     image_urls,
@@ -1095,31 +1348,27 @@ async def main(event=None, context=None):
         "category":   category,
         "score":      score,
     }
-
     log(
-        f"═══ v11.0 done in {elapsed()}s | "
+        f"═══ v11.1 done in {elapsed()}s | "
         f"{'POSTED ✓' if posted else 'FAILED ✗'} ═══"
     )
     return result
 
 
 # ═══════════════════════════════════════════════════════════
-# SECTION 7 — FEED SCANNING & CANDIDATE SELECTION
+# SECTION 10 — FEED SCANNING & CANDIDATE SELECTION
 # ═══════════════════════════════════════════════════════════
 
 async def _find_best_candidate(
     feeds, databases, database_id, collection_id,
-    time_threshold, sdk_mode, now, recent_titles, is_peak,
-    log_fn=print,
+    time_threshold, sdk_mode, schema, now,
+    recent_titles, is_peak, log_fn=print,
 ):
-    """
-    Scan all RSS feeds in parallel, score articles,
-    apply posted-only duplicate checks (L1-L3), return
-    the highest-scoring genuinely new article.
-    """
     loop  = asyncio.get_running_loop()
     tasks = [
-        loop.run_in_executor(None, _fetch_feed, url, time_threshold, log_fn)
+        loop.run_in_executor(
+            None, _fetch_feed, url, time_threshold, log_fn
+        )
         for url in feeds
     ]
     results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -1142,7 +1391,7 @@ async def _find_best_candidate(
 
     all_candidates.sort(key=lambda x: x["score"], reverse=True)
 
-    log_fn("[feed] Top 5 candidates:")
+    log_fn("[feed] Top 5:")
     for c in all_candidates[:5]:
         log_fn(
             f"  [{c['score']:>3}] [{c['category']:<14}] "
@@ -1150,9 +1399,9 @@ async def _find_best_candidate(
         )
 
     recent_domain_hashes = _load_recent_domain_hashes(
-        databases, database_id, collection_id, sdk_mode, log_fn
+        databases, database_id, collection_id, sdk_mode, schema, log_fn
     )
-    seen_domains_this_run: set[str] = set()
+    seen_domains: set[str] = set()
 
     for c in all_candidates:
         link         = c["link"]
@@ -1163,54 +1412,56 @@ async def _find_best_candidate(
         title_hash   = _make_title_hash(title, feed_url)
         domain_hash  = _make_domain_hash(domain)
 
-        # L1: Exact URL — posted=true only
-        r = _query_posted_field(
+        # L1: Exact URL
+        r = _query_field_safe(
             databases, database_id, collection_id,
-            "link", link[:DB_LINK_MAX], sdk_mode, log_fn,
+            "link", link[:DB_LINK_MAX], sdk_mode, schema, log_fn,
         )
         if r is True:
-            log_fn(f"[SKIP] L1(posted): {title[:58]}")
+            log_fn(f"[SKIP] L1: {title[:58]}")
             continue
 
-        # L2: Content hash — posted=true only
-        r = _query_posted_field(
-            databases, database_id, collection_id,
-            "content_hash", content_hash, sdk_mode, log_fn,
-        )
-        if r is True:
-            log_fn(f"[SKIP] L2(posted): {title[:58]}")
-            continue
+        # L2: Content hash (if field exists)
+        if schema.has_content_hash:
+            r = _query_field_safe(
+                databases, database_id, collection_id,
+                "content_hash", content_hash, sdk_mode, schema, log_fn,
+            )
+            if r is True:
+                log_fn(f"[SKIP] L2: {title[:58]}")
+                continue
 
-        # L2b: Title hash — posted=true only
-        r = _query_posted_field(
-            databases, database_id, collection_id,
-            "title_hash", title_hash, sdk_mode, log_fn,
-        )
-        if r is True:
-            log_fn(f"[SKIP] L2b(posted): {title[:58]}")
-            continue
+        # L2b: Title hash (if field exists)
+        if schema.has_title_hash:
+            r = _query_field_safe(
+                databases, database_id, collection_id,
+                "title_hash", title_hash, sdk_mode, schema, log_fn,
+            )
+            if r is True:
+                log_fn(f"[SKIP] L2b: {title[:58]}")
+                continue
 
-        # L3: Fuzzy — against posted=true titles only
+        # L3: Fuzzy
         is_fuzz, matched, fuzz_score = _fuzzy_duplicate(
             title, recent_titles
         )
         if is_fuzz:
             log_fn(
                 f"[SKIP] L3 fuzzy={fuzz_score:.2f}: "
-                f"{title[:45]} ≈ {(matched or '')[:35]}"
+                f"{title[:40]} ≈ {(matched or '')[:30]}"
             )
             continue
 
-        # L4b: Domain — informational only
+        # L4b: Domain informational
         if domain_hash in recent_domain_hashes:
             log_fn(f"[INFO] L4b: domain {domain} seen recently.")
 
         # L4a: One domain per run
-        if domain in seen_domains_this_run:
-            log_fn(f"[SKIP] L4a domain/run ({domain}): {title[:58]}")
+        if domain in seen_domains:
+            log_fn(f"[SKIP] L4a domain/run: {title[:58]}")
             continue
 
-        seen_domains_this_run.add(domain)
+        seen_domains.add(domain)
         log_fn(f"[PASS] fuzz={fuzz_score:.2f}: {title[:58]}")
         return c
 
@@ -1223,7 +1474,6 @@ def _fetch_feed(
     time_threshold: datetime,
     log_fn=print,
 ) -> list:
-    """Parse one RSS feed. Returns list of candidate dicts."""
     import socket
     try:
         old = socket.getdefaulttimeout()
@@ -1231,7 +1481,7 @@ def _fetch_feed(
         feed = feedparser.parse(feed_url)
         socket.setdefaulttimeout(old)
     except Exception as e:
-        log_fn(f"[feed] feedparser ({feed_url[:45]}): {e}")
+        log_fn(f"[feed] feedparser error ({feed_url[:45]}): {e}")
         return []
 
     candidates = []
@@ -1252,22 +1502,16 @@ def _fetch_feed(
         desc = re.sub(r"<[^>]+>", " ", raw)
         desc = re.sub(r"\s+",     " ", desc).strip()
         candidates.append({
-            "title":       title,
-            "link":        link,
-            "description": desc,
-            "feed_url":    feed_url,
-            "pub_date":    pub_date,
-            "entry":       entry,
-            "score":       0,
-            "category":    "general",
+            "title": title, "link": link,
+            "description": desc, "feed_url": feed_url,
+            "pub_date": pub_date, "entry": entry,
+            "score": 0, "category": "general",
         })
     return candidates
 
 
 def _score_article(
-    candidate: dict,
-    now: datetime,
-    is_peak: bool = False,
+    candidate: dict, now: datetime, is_peak: bool = False
 ) -> int:
     score     = 0
     age_hours = (now - candidate["pub_date"]).total_seconds() / 3600
@@ -1332,8 +1576,54 @@ def _extract_hashtags_from_text(text: str) -> list[str]:
 
 
 # ═══════════════════════════════════════════════════════════
-# SECTION 8 — DEDUPLICATION (state-aware, posted=true only)
+# SECTION 11 — SCHEMA-ADAPTIVE DEDUPLICATION (FIX 1)
 # ═══════════════════════════════════════════════════════════
+
+def _query_field_safe(
+    databases,
+    database_id: str,
+    collection_id: str,
+    field: str,
+    value: str,
+    sdk_mode: str,
+    schema: SchemaInfo,
+    log_fn=print,
+) -> bool | None:
+    """
+    Query field=value, optionally filtered by posted=true.
+
+    If schema.has_posted → adds posted=True filter (v11 mode).
+    If schema missing posted → queries field only (legacy mode,
+    more conservative — may skip already-posted articles).
+
+    Returns True (found), False (not found), None (DB error=safe).
+    """
+    try:
+        if schema.has_posted:
+            queries = [
+                Query.equal(field, value),
+                Query.equal("posted", True),
+                Query.limit(1),
+            ]
+        else:
+            # Legacy mode: no posted field — query field only
+            queries = [
+                Query.equal(field, value),
+                Query.limit(1),
+            ]
+        r = _db_list(databases, database_id, collection_id, queries, sdk_mode)
+        return r["total"] > 0
+    except AppwriteException as e:
+        msg = str(e.message).lower()
+        if "attribute not found" in msg:
+            log_fn(f"[dedup] Field '{field}' not in schema — treating as safe.")
+            return False
+        log_fn(f"[dedup] _query_field_safe ({field}): {e.message}")
+        return None
+    except Exception as e:
+        log_fn(f"[dedup] _query_field_safe ({field}): {e}")
+        return None
+
 
 def _light_duplicate_check(
     databases,
@@ -1343,67 +1633,41 @@ def _light_duplicate_check(
     content_hash: str,
     title_hash: str,
     sdk_mode: str,
+    schema: SchemaInfo,
     log_fn=print,
 ) -> tuple[bool, str]:
     """
-    Pre-AI check. Blocks ONLY confirmed posted=true articles.
-    locked/failed/missing → safe to proceed.
-    DB errors → treated as safe (non-blocking).
+    Pre-AI duplicate check.
+    v11 schema: blocks posted=true only.
+    Legacy schema: blocks any existing link match.
     """
-    for field, value in [
-        ("link",         link[:DB_LINK_MAX]),
-        ("content_hash", content_hash),
-        ("title_hash",   title_hash),
-    ]:
-        r = _query_posted_field(
+    # Always check link
+    r = _query_field_safe(
+        databases, database_id, collection_id,
+        "link", link[:DB_LINK_MAX], sdk_mode, schema, log_fn,
+    )
+    if r is True:
+        return True, "dup_link"
+
+    # Check content_hash only if field exists
+    if schema.has_content_hash:
+        r = _query_field_safe(
             databases, database_id, collection_id,
-            field, value, sdk_mode, log_fn,
+            "content_hash", content_hash, sdk_mode, schema, log_fn,
         )
         if r is True:
-            return True, f"posted_{field}"
+            return True, "dup_content_hash"
+
+    # Check title_hash only if field exists
+    if schema.has_title_hash:
+        r = _query_field_safe(
+            databases, database_id, collection_id,
+            "title_hash", title_hash, sdk_mode, schema, log_fn,
+        )
+        if r is True:
+            return True, "dup_title_hash"
+
     return False, ""
-
-
-def _query_posted_field(
-    databases,
-    database_id: str,
-    collection_id: str,
-    field: str,
-    value: str,
-    sdk_mode: str,
-    log_fn=print,
-) -> bool | None:
-    """
-    Query whether a record exists with field=value AND posted=true.
-    Returns True (dup), False (safe), None (DB error → safe).
-    """
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", DeprecationWarning)
-        try:
-            queries = [
-                Query.equal(field, value),
-                Query.equal("posted", True),
-                Query.limit(1),
-            ]
-            if sdk_mode == "new":
-                r = databases.list_rows(
-                    database_id=database_id,
-                    collection_id=collection_id,
-                    queries=queries,
-                )
-            else:
-                r = databases.list_documents(
-                    database_id=database_id,
-                    collection_id=collection_id,
-                    queries=queries,
-                )
-            return r["total"] > 0
-        except AppwriteException as e:
-            log_fn(f"[dedup] _query_posted_field ({field}): {e.message}")
-            return None
-        except Exception as e:
-            log_fn(f"[dedup] _query_posted_field ({field}): {e}")
-            return None
 
 
 def _load_recent_titles_posted_only(
@@ -1412,38 +1676,35 @@ def _load_recent_titles_posted_only(
     collection_id: str,
     sdk_mode: str,
     limit: int,
+    schema: SchemaInfo,
     log_fn=print,
 ) -> list:
-    """Load recent posted=true titles for fuzzy matching."""
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", DeprecationWarning)
-        try:
+    """
+    Load recent titles for fuzzy matching.
+    v11 schema: posted=true only.
+    Legacy schema: all recent records (no posted filter).
+    """
+    try:
+        if schema.has_posted:
             queries = [
                 Query.equal("posted", True),
                 Query.limit(limit),
                 Query.order_desc("$createdAt"),
             ]
-            if sdk_mode == "new":
-                r    = databases.list_rows(
-                    database_id=database_id,
-                    collection_id=collection_id,
-                    queries=queries,
-                )
-                docs = r.get("rows", [])
-            else:
-                r    = databases.list_documents(
-                    database_id=database_id,
-                    collection_id=collection_id,
-                    queries=queries,
-                )
-                docs = r.get("documents", [])
-            return [
-                (d.get("title", ""), _normalize_tokens(d.get("title", "")))
-                for d in docs if d.get("title")
+        else:
+            queries = [
+                Query.limit(limit),
+                Query.order_desc("$createdAt"),
             ]
-        except Exception as e:
-            log_fn(f"[dedup] _load_recent_titles: {e}")
-            return []
+        r    = _db_list(databases, database_id, collection_id, queries, sdk_mode)
+        docs = r.get("documents", r.get("rows", []))
+        return [
+            (d.get("title", ""), _normalize_tokens(d.get("title", "")))
+            for d in docs if d.get("title")
+        ]
+    except Exception as e:
+        log_fn(f"[dedup] _load_recent_titles: {e}")
+        return []
 
 
 def _load_recent_domain_hashes(
@@ -1451,73 +1712,41 @@ def _load_recent_domain_hashes(
     database_id: str,
     collection_id: str,
     sdk_mode: str,
+    schema: SchemaInfo,
     log_fn=print,
 ) -> set:
-    """Load domain hashes from posted=true records within DOMAIN_DEDUP_HOURS."""
     cutoff     = datetime.now(timezone.utc) - timedelta(hours=DOMAIN_DEDUP_HOURS)
     cutoff_str = cutoff.strftime("%Y-%m-%dT%H:%M:%S.000+00:00")
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", DeprecationWarning)
-        try:
-            queries = [
-                Query.greater_than("$createdAt", cutoff_str),
-                Query.equal("posted", True),
-                Query.limit(200),
-            ]
-            if sdk_mode == "new":
-                r    = databases.list_rows(
-                    database_id=database_id,
-                    collection_id=collection_id,
-                    queries=queries,
-                )
-                docs = r.get("rows", [])
-            else:
-                r    = databases.list_documents(
-                    database_id=database_id,
-                    collection_id=collection_id,
-                    queries=queries,
-                )
-                docs = r.get("documents", [])
-            return {d["domain_hash"] for d in docs if d.get("domain_hash")}
-        except Exception as e:
-            log_fn(f"[dedup] _load_recent_domain_hashes: {e}")
-            return set()
+    try:
+        queries = [
+            Query.greater_than("$createdAt", cutoff_str),
+            Query.limit(200),
+        ]
+        if schema.has_posted:
+            queries.append(Query.equal("posted", True))
+        r    = _db_list(databases, database_id, collection_id, queries, sdk_mode)
+        docs = r.get("documents", r.get("rows", []))
+        return {d["domain_hash"] for d in docs if d.get("domain_hash")}
+    except Exception as e:
+        log_fn(f"[dedup] _load_recent_domain_hashes: {e}")
+        return set()
 
 
 # ═══════════════════════════════════════════════════════════
-# SECTION 9 — SOFT LOCK & STATE TRANSITIONS
+# SECTION 12 — SOFT LOCK & STATE TRANSITIONS
 # ═══════════════════════════════════════════════════════════
 
 def _write_soft_lock(
-    databases,
-    database_id: str,
-    collection_id: str,
-    link: str,
-    title: str,
-    feed_url: str,
-    pub_date,
-    source_type: str,
-    sdk_mode: str,
-    title_hash: str,
-    content_hash: str,
-    category: str,
-    trend_score: int,
-    post_hour: int,
-    domain_hash: str,
+    databases, database_id, collection_id,
+    link, title, feed_url, pub_date, source_type,
+    sdk_mode, schema: SchemaInfo,
+    title_hash, content_hash, category,
+    trend_score, post_hour, domain_hash,
     log_fn=print,
 ) -> tuple[bool, str]:
     """
-    Acquire distributed soft lock for this article.
-
-    Decision tree:
-      posted=true              → real dup       → (False, reason)
-      status=locked, TTL fresh → active lock    → (False, reason)
-      status=locked, TTL stale → crash recovery → delete + write new
-      status=failed            → retry eligible  → delete + write new
-      unknown state            → stale           → delete + write new
-      no record                → new article     → write lock
-
-    Returns (True, doc_id) or (False, reason).
+    Acquire distributed soft lock.
+    Adapts payload based on schema fields available.
     """
     now     = datetime.now(timezone.utc)
     now_iso = now.strftime("%Y-%m-%dT%H:%M:%S.000+00:00")
@@ -1533,7 +1762,7 @@ def _write_soft_lock(
         locked_at_str   = existing.get("locked_at", "")
 
         if existing_posted is True or existing_status == STATUS_POSTED:
-            log_fn("[lock] Already posted — real duplicate.")
+            log_fn("[lock] Already posted — duplicate.")
             return False, "already_posted"
 
         if existing_status == STATUS_LOCKED and locked_at_str:
@@ -1543,10 +1772,7 @@ def _write_soft_lock(
                 )
                 age = (now - locked_at).total_seconds()
                 if age < LOCK_TTL_SECONDS:
-                    log_fn(
-                        f"[lock] Active lock (age={age:.0f}s "
-                        f"< TTL={LOCK_TTL_SECONDS}s). Skip."
-                    )
+                    log_fn(f"[lock] Active lock (age={age:.0f}s). Skip.")
                     return False, "active_lock"
                 else:
                     log_fn(f"[lock] Stale lock (age={age:.0f}s). Recovering.")
@@ -1555,91 +1781,79 @@ def _write_soft_lock(
                         existing_doc_id, sdk_mode, log_fn,
                     )
             except Exception as e:
-                log_fn(f"[lock] TTL parse error: {e}. Deleting stale.")
+                log_fn(f"[lock] TTL parse: {e}. Deleting stale.")
                 _delete_record(
                     databases, database_id, collection_id,
                     existing_doc_id, sdk_mode, log_fn,
                 )
         elif existing_status == STATUS_FAILED:
-            log_fn("[lock] Failed record — retrying. Deleting old.")
+            log_fn("[lock] Failed → retry. Deleting old.")
             _delete_record(
                 databases, database_id, collection_id,
                 existing_doc_id, sdk_mode, log_fn,
             )
         else:
-            log_fn(
-                f"[lock] Unknown status='{existing_status}' — "
-                f"treating as stale."
-            )
+            log_fn(f"[lock] Unknown status '{existing_status}' → stale.")
             _delete_record(
                 databases, database_id, collection_id,
                 existing_doc_id, sdk_mode, log_fn,
             )
 
-    # Write new lock record
     if pub_date.tzinfo is None:
         pub_date = pub_date.replace(tzinfo=timezone.utc)
 
-    payload = {
-        "link":         link[:DB_LINK_MAX],
-        "title":        title[:DB_TITLE_MAX],
+    # Build payload — only include fields that exist in schema
+    payload: dict = {
+        "link":        link[:DB_LINK_MAX],
+        "title":       title[:DB_TITLE_MAX],
         "published_at": pub_date.strftime("%Y-%m-%dT%H:%M:%S.000+00:00"),
-        "feed_url":     feed_url[:DB_FEED_URL_MAX],
-        "source_type":  source_type[:DB_SOURCE_TYPE_MAX],
-        "title_hash":   title_hash[:DB_HASH_MAX],
-        "content_hash": content_hash[:DB_HASH_MAX],
-        "category":     category[:DB_CATEGORY_MAX],
-        "trend_score":  int(trend_score),
-        "post_hour":    int(post_hour),
-        "domain_hash":  domain_hash[:DB_DOMAIN_HASH_MAX],
-        "status":       STATUS_LOCKED,
-        "posted":       False,
-        "locked_at":    now_iso,
-        "posted_at":    "",
-        "fail_reason":  "",
+        "feed_url":    feed_url[:DB_FEED_URL_MAX],
+        "source_type": source_type[:DB_SOURCE_TYPE_MAX],
+        "category":    category[:DB_CATEGORY_MAX],
+        "trend_score": int(trend_score),
+        "post_hour":   int(post_hour),
     }
 
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", DeprecationWarning)
-        try:
-            if sdk_mode == "new":
-                doc = databases.create_row(
-                    database_id=database_id,
-                    collection_id=collection_id,
-                    row_id="unique()",
-                    data=payload,
-                )
-            else:
-                doc = databases.create_document(
-                    database_id=database_id,
-                    collection_id=collection_id,
-                    document_id="unique()",
-                    data=payload,
-                )
-            doc_id = doc.get("$id") or doc.get("id", "")
-            log_fn(f"[lock] ✓ Soft lock acquired. doc_id={doc_id}")
-            return True, doc_id
-        except AppwriteException as e:
-            msg = str(e.message).lower()
-            if "already exists" in msg or e.code in (409, 400):
-                log_fn("[lock] Race condition — another instance won lock.")
-                return False, "race_lost"
-            log_fn(f"[lock] DB write error: {e.message}")
-            return False, f"db_error: {e.message}"
-        except Exception as e:
-            log_fn(f"[lock] DB write error: {e}")
-            return False, f"db_error: {e}"
+    if schema.has_content_hash:
+        payload["content_hash"] = content_hash[:DB_HASH_MAX]
+    if schema.has_title_hash:
+        payload["title_hash"] = title_hash[:DB_HASH_MAX]
+    if schema.has_domain_hash:
+        payload["domain_hash"] = domain_hash[:DB_DOMAIN_HASH_MAX]
+
+    # v11 state fields
+    if schema.has_status:
+        payload["status"] = STATUS_LOCKED
+    if schema.has_posted:
+        payload["posted"] = False
+    if schema.has_locked_at:
+        payload["locked_at"] = now_iso
+    if schema.has_posted_at:
+        payload["posted_at"] = ""
+    if schema.has_fail_reason:
+        payload["fail_reason"] = ""
+
+    try:
+        doc    = _db_create(databases, database_id, collection_id, payload, sdk_mode)
+        doc_id = doc.get("$id") or doc.get("id", "")
+        log_fn(f"[lock] ✓ Lock acquired. doc_id={doc_id}")
+        return True, doc_id
+    except AppwriteException as e:
+        msg = str(e.message).lower()
+        if "already exists" in msg or e.code in (409, 400):
+            log_fn("[lock] Race condition — another instance won.")
+            return False, "race_lost"
+        log_fn(f"[lock] DB error: {e.message}")
+        return False, f"db_error: {e.message}"
+    except Exception as e:
+        log_fn(f"[lock] Error: {e}")
+        return False, f"error: {e}"
 
 
 def _mark_posted(
-    databases,
-    database_id: str,
-    collection_id: str,
-    doc_id: str,
-    sdk_mode: str,
-    log_fn=print,
+    databases, database_id, collection_id,
+    doc_id, sdk_mode, log_fn=print,
 ) -> bool:
-    """Mark record as successfully posted. posted=true written ONLY here."""
     now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000+00:00")
     return _update_record(
         databases, database_id, collection_id, doc_id, sdk_mode,
@@ -1649,15 +1863,9 @@ def _mark_posted(
 
 
 def _mark_failed(
-    databases,
-    database_id: str,
-    collection_id: str,
-    doc_id: str,
-    sdk_mode: str,
-    reason: str,
-    log_fn=print,
+    databases, database_id, collection_id,
+    doc_id, sdk_mode, reason, log_fn=print,
 ) -> bool:
-    """Mark record as failed. Retryable on next execution."""
     return _update_record(
         databases, database_id, collection_id, doc_id, sdk_mode,
         {
@@ -1670,105 +1878,48 @@ def _mark_failed(
 
 
 def _update_record(
-    databases,
-    database_id: str,
-    collection_id: str,
-    doc_id: str,
-    sdk_mode: str,
-    fields: dict,
-    log_fn=print,
+    databases, database_id, collection_id,
+    doc_id, sdk_mode, fields, log_fn=print,
 ) -> bool:
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", DeprecationWarning)
-        try:
-            if sdk_mode == "new":
-                databases.update_row(
-                    database_id=database_id,
-                    collection_id=collection_id,
-                    row_id=doc_id,
-                    data=fields,
-                )
-            else:
-                databases.update_document(
-                    database_id=database_id,
-                    collection_id=collection_id,
-                    document_id=doc_id,
-                    data=fields,
-                )
-            log_fn(f"[db] {doc_id} → {list(fields.keys())}")
-            return True
-        except Exception as e:
-            log_fn(f"[db] Update failed ({doc_id}): {e}")
-            return False
+    try:
+        _db_update(databases, database_id, collection_id, doc_id, fields, sdk_mode)
+        log_fn(f"[db] {doc_id} → {list(fields.keys())}")
+        return True
+    except Exception as e:
+        log_fn(f"[db] Update failed ({doc_id}): {e}")
+        return False
 
 
 def _get_existing_record(
-    databases,
-    database_id: str,
-    collection_id: str,
-    link: str,
-    sdk_mode: str,
-    log_fn=print,
+    databases, database_id, collection_id,
+    link, sdk_mode, log_fn=print,
 ) -> dict | None:
-    """Fetch any existing record by URL, regardless of status."""
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", DeprecationWarning)
-        try:
-            queries = [
-                Query.equal("link", link[:DB_LINK_MAX]),
-                Query.limit(1),
-            ]
-            if sdk_mode == "new":
-                r    = databases.list_rows(
-                    database_id=database_id,
-                    collection_id=collection_id,
-                    queries=queries,
-                )
-                docs = r.get("rows", [])
-            else:
-                r    = databases.list_documents(
-                    database_id=database_id,
-                    collection_id=collection_id,
-                    queries=queries,
-                )
-                docs = r.get("documents", [])
-            return docs[0] if docs else None
-        except Exception as e:
-            log_fn(f"[db] _get_existing_record: {e}")
-            return None
+    try:
+        r    = _db_list(
+            databases, database_id, collection_id,
+            [Query.equal("link", link[:DB_LINK_MAX]), Query.limit(1)],
+            sdk_mode,
+        )
+        docs = r.get("documents", r.get("rows", []))
+        return docs[0] if docs else None
+    except Exception as e:
+        log_fn(f"[db] _get_existing_record: {e}")
+        return None
 
 
 def _delete_record(
-    databases,
-    database_id: str,
-    collection_id: str,
-    doc_id: str,
-    sdk_mode: str,
-    log_fn=print,
+    databases, database_id, collection_id,
+    doc_id, sdk_mode, log_fn=print,
 ) -> None:
-    """Delete a stale lock or failed record."""
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", DeprecationWarning)
-        try:
-            if sdk_mode == "new":
-                databases.delete_row(
-                    database_id=database_id,
-                    collection_id=collection_id,
-                    row_id=doc_id,
-                )
-            else:
-                databases.delete_document(
-                    database_id=database_id,
-                    collection_id=collection_id,
-                    document_id=doc_id,
-                )
-            log_fn(f"[db] Deleted stale record: {doc_id}")
-        except Exception as e:
-            log_fn(f"[db] Delete failed ({doc_id}): {e}")
+    try:
+        _db_delete(databases, database_id, collection_id, doc_id, sdk_mode)
+        log_fn(f"[db] Deleted: {doc_id}")
+    except Exception as e:
+        log_fn(f"[db] Delete failed ({doc_id}): {e}")
 
 
 # ═══════════════════════════════════════════════════════════
-# SECTION 10 — HASH & FUZZY UTILITIES
+# SECTION 13 — HASH & FUZZY UTILITIES
 # ═══════════════════════════════════════════════════════════
 
 def _make_content_hash(title: str) -> str:
@@ -1787,7 +1938,7 @@ def _make_domain_hash(domain: str) -> str:
     ).hexdigest()[:DB_DOMAIN_HASH_MAX]
 
 def _normalize_tokens(title: str) -> frozenset:
-    title  = re.sub(r"[^a-z0-9\s]", " ", title.lower())
+    title = re.sub(r"[^a-z0-9\s]", " ", title.lower())
     return frozenset(
         t for t in title.split()
         if t not in TITLE_STOP_WORDS and len(t) >= 2
@@ -1801,17 +1952,17 @@ def _fuzzy_duplicate(
     title: str, recent_titles: list
 ) -> tuple[bool, str | None, float]:
     if not recent_titles: return False, None, 0.0
-    incoming   = _normalize_tokens(title)
-    best_score = 0.0
-    best_match = None
+    incoming = _normalize_tokens(title)
+    best     = 0.0
+    match    = None
     for stored_title, stored_tokens in recent_titles:
         s = _jaccard(incoming, stored_tokens)
-        if s > best_score:
-            best_score = s
-            best_match = stored_title
-    if best_score >= FUZZY_SIMILARITY_THRESHOLD:
-        return True, best_match, best_score
-    return False, None, best_score
+        if s > best:
+            best  = s
+            match = stored_title
+    if best >= FUZZY_SIMILARITY_THRESHOLD:
+        return True, match, best
+    return False, None, best
 
 def _get_domain(url: str) -> str:
     try:
@@ -1822,13 +1973,11 @@ def _get_domain(url: str) -> str:
 
 
 # ═══════════════════════════════════════════════════════════
-# SECTION 11 — SCRAPING
+# SECTION 14 — SCRAPING
 # ═══════════════════════════════════════════════════════════
 
 def _select_content(
-    scraped_text: str | None,
-    description: str,
-    title: str,
+    scraped_text: str | None, description: str, title: str,
 ) -> str:
     if scraped_text and len(scraped_text) >= MIN_CONTENT_CHARS:
         return scraped_text[:MAX_SCRAPED_CHARS]
@@ -1967,7 +2116,7 @@ def _scrape_images(url: str, rss_entry, log_fn=print) -> list:
         if rss_img:
             _add(rss_img)
 
-    log_fn(f"[scrape] Images collected: {len(images)}")
+    log_fn(f"[scrape] Images: {len(images)}")
     return images[:MAX_IMAGES]
 
 
@@ -1992,7 +2141,9 @@ def _extract_rss_image(entry) -> str | None:
         for field in ["summary", "description"]:
             html = entry.get(field, "")
             if html:
-                img = BeautifulSoup(html, "html.parser").find("img")
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    img = BeautifulSoup(html, "html.parser").find("img")
                 if img:
                     src = img.get("src", "")
                     if src.startswith("http"): return src
@@ -2009,22 +2160,16 @@ def _extract_rss_image(entry) -> str | None:
 
 
 # ═══════════════════════════════════════════════════════════
-# SECTION 12 — TELEGRAM POSTING
-# Images sent first as media group (anchor).
-# Caption sent as reply to anchor (protocol-level ordering).
+# SECTION 15 — TELEGRAM POSTING
 # ═══════════════════════════════════════════════════════════
 
 async def _post_to_telegram(
-    bot: Bot,
-    chat_id: str,
-    caption: str,
-    image_urls: list,
-    log_fn=print,
+    bot: Bot, chat_id: str, caption: str,
+    image_urls: list, log_fn=print,
 ) -> bool:
     anchor_msg_id = None
     posted        = False
 
-    # ── Step 1: Send images ──
     if len(image_urls) >= 2:
         try:
             media_group   = [
@@ -2052,7 +2197,6 @@ async def _post_to_telegram(
                     log_fn(f"[tg] ① Fallback photo. anchor={anchor_msg_id}")
                 except Exception as e2:
                     log_fn(f"[tg] ① Photo fallback failed: {str(e2)[:80]}")
-
     elif len(image_urls) == 1:
         try:
             sent          = await bot.send_photo(
@@ -2062,16 +2206,13 @@ async def _post_to_telegram(
             anchor_msg_id = sent.message_id
             log_fn(f"[tg] ① Single photo. anchor={anchor_msg_id}")
         except Exception as e:
-            log_fn(f"[tg] ① Single photo failed: {str(e)[:120]}")
+            log_fn(f"[tg] ① Photo failed: {str(e)[:120]}")
     else:
-        log_fn("[tg] ① No images — caption standalone.")
+        log_fn("[tg] ① No images — standalone.")
 
-    # ── Step 2: Delay ──
     if anchor_msg_id is not None:
-        log_fn(f"[tg] ② Waiting {ALBUM_CAPTION_DELAY}s...")
         await asyncio.sleep(ALBUM_CAPTION_DELAY)
 
-    # ── Step 3: Send caption (reply to anchor) ──
     try:
         kwargs: dict = {
             "chat_id":              chat_id,
@@ -2092,7 +2233,6 @@ async def _post_to_telegram(
         log_fn(f"[tg] ③ Caption failed: {str(e)[:120]}")
         return False
 
-    # ── Step 4: Sticker ──
     if posted and FASHION_STICKERS:
         await asyncio.sleep(STICKER_DELAY)
         try:
@@ -2109,12 +2249,81 @@ async def _post_to_telegram(
 
 
 # ═══════════════════════════════════════════════════════════
-# SECTION 13 — ONE-TIME DB CLEANUP UTILITY
-# Run: python main.py --cleanup
-# Deletes all records where posted != true.
+# SECTION 16 — SCHEMA MIGRATION UTILITY
+#
+# Run: python main.py --migrate
+# Adds v11 fields to existing Appwrite collection.
+# Safe to run multiple times (skips existing fields).
+# ═══════════════════════════════════════════════════════════
+
+def _run_migrate():
+    """
+    Add v11 schema fields to the Appwrite collection.
+    Fields added: status, posted, locked_at, posted_at, fail_reason.
+    Existing fields are not modified.
+    """
+    print("[migrate] Starting schema migration...")
+
+    aw_client = Client()
+    aw_client.set_endpoint(
+        os.environ.get("APPWRITE_ENDPOINT", "https://cloud.appwrite.io/v1")
+    )
+    aw_client.set_project(os.environ.get("APPWRITE_PROJECT_ID", ""))
+    aw_client.set_key(os.environ.get("APPWRITE_API_KEY", ""))
+
+    from appwrite.services.databases import Databases as _Databases
+    databases  = _Databases(aw_client)
+    db_id      = os.environ.get("APPWRITE_DATABASE_ID", "")
+    col_id     = COLLECTION_ID
+
+    # Field definitions: (key, type, required, default, extra_kwargs)
+    FIELDS_TO_ADD = [
+        ("status",      "string",  False, STATUS_LOCKED, {"size": 20}),
+        ("posted",      "boolean", False, False,         {}),
+        ("locked_at",   "string",  False, "",            {"size": 50}),
+        ("posted_at",   "string",  False, "",            {"size": 50}),
+        ("fail_reason", "string",  False, "",            {"size": 500}),
+    ]
+
+    for field_key, field_type, required, default, extra in FIELDS_TO_ADD:
+        try:
+            if field_type == "string":
+                size = extra.get("size", 255)
+                databases.create_string_attribute(
+                    database_id=db_id,
+                    collection_id=col_id,
+                    key=field_key,
+                    size=size,
+                    required=required,
+                    default=default,
+                )
+            elif field_type == "boolean":
+                databases.create_boolean_attribute(
+                    database_id=db_id,
+                    collection_id=col_id,
+                    key=field_key,
+                    required=required,
+                    default=default,
+                )
+            print(f"[migrate] ✓ Added field: {field_key} ({field_type})")
+        except AppwriteException as e:
+            if "already exists" in str(e.message).lower():
+                print(f"[migrate] ℹ Field already exists: {field_key}")
+            else:
+                print(f"[migrate] ✗ Failed to add {field_key}: {e.message}")
+        except Exception as e:
+            print(f"[migrate] ✗ Error adding {field_key}: {e}")
+
+    print("[migrate] Done. Wait ~30s for Appwrite to index new fields.")
+    print("[migrate] Then run --cleanup to clear unposted records.")
+
+
+# ═══════════════════════════════════════════════════════════
+# SECTION 17 — CLEANUP UTILITY
 # ═══════════════════════════════════════════════════════════
 
 def _run_cleanup():
+    """Delete all records where posted != true."""
     print("[cleanup] Starting unposted record purge...")
     aw_client = Client()
     aw_client.set_endpoint(
@@ -2135,11 +2344,13 @@ def _run_cleanup():
         if cursor:
             queries.append(Query.cursor_after(cursor))
         try:
-            result = databases.list_documents(
-                database_id=db_id,
-                collection_id=col_id,
-                queries=queries,
-            )
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", DeprecationWarning)
+                result = databases.list_documents(
+                    database_id=db_id,
+                    collection_id=col_id,
+                    queries=queries,
+                )
         except Exception as e:
             print(f"[cleanup] Fetch error: {e}")
             break
@@ -2151,14 +2362,15 @@ def _run_cleanup():
         for doc in docs:
             doc_id    = doc["$id"]
             is_posted = doc.get("posted", False) is True
-
             if not is_posted:
                 try:
-                    databases.delete_document(
-                        database_id=db_id,
-                        collection_id=col_id,
-                        document_id=doc_id,
-                    )
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore", DeprecationWarning)
+                        databases.delete_document(
+                            database_id=db_id,
+                            collection_id=col_id,
+                            document_id=doc_id,
+                        )
                     print(f"[cleanup] DELETED: {doc.get('title', doc_id)[:60]}")
                     deleted += 1
                 except Exception as e:
@@ -2170,7 +2382,7 @@ def _run_cleanup():
         if len(docs) < 100:
             break
 
-    print(f"[cleanup] Done. Deleted={deleted} | Kept={kept}")
+    print(f"[cleanup] Deleted={deleted} | Kept={kept}")
 
 
 # ═══════════════════════════════════════════════════════════
@@ -2180,24 +2392,33 @@ def _run_cleanup():
 if __name__ == "__main__":
     import sys
 
-    if "--cleanup" in sys.argv:
+    if "--migrate" in sys.argv:
+        # Step 1: Add v11 fields to Appwrite collection
+        _run_migrate()
+
+    elif "--cleanup" in sys.argv:
+        # Step 2: Clear unposted records (run after --migrate)
         _run_cleanup()
+
     elif len(sys.argv) > 1 and sys.argv[1].startswith("http"):
+        # Test single URL
         url = sys.argv[1]
-        print(f"[LOCAL] Testing URL: {url}")
+        print(f"[LOCAL] Testing: {url}")
 
         async def _test():
-            content = _scrape_text(url) or url
-            body_p  = _PROMPT_BODY.format(input_text=content[:3000])
-            title_p = _PROMPT_TITLE.format(input_text=url[:200])
-            tip_p   = _PROMPT_TIP.format(input_text=content[:1500])
+            content  = _scrape_text(url) or url[:500]
+            body_p   = _PROMPT_BODY.format(input_text=content[:3000])
+            title_p  = _PROMPT_TITLE.format(input_text=url[:200])
+            tip_p    = _PROMPT_TIP.format(input_text=content[:1500])
             b, t, tip = await _run_three_races(body_p, title_p, tip_p)
             hashtags  = _extract_hashtags_from_text(content[:500])
             caption   = _build_mehrjameh_caption(
-                t or "عنوان", b or "متن", tip or "", hashtags, "general"
+                t or "عنوان", b or "متن", tip or "",
+                hashtags, "general",
             )
             print(f"\n── CAPTION ({len(caption)}ch) ──\n{caption}\n")
 
         asyncio.run(_test())
+
     else:
         asyncio.run(main())
