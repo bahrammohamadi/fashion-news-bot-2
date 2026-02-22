@@ -1,67 +1,61 @@
 # ============================================================
 # Function 1: International Fashion Poster
 # Project:    @irfashionnews — FashionBotProject
-# Version:    10.1 — State Machine Deduplication
+# Version:    11.0 — Mehrjameh Editorial Engine
 # Runtime:    python-3.12 / Appwrite Cloud Functions
 # Timeout:    120 seconds
 #
-# WHAT CHANGED FROM v10.0:
-#   FIXED:
-#     - Root cause: DB write before post with no posted flag
-#       caused all URLs to be permanently blocked as duplicates
-#       even when they were never successfully posted.
-#
-#   REMOVED:
-#     - _strict_duplicate_check()    (blocked unposted records)
-#     - _save_to_db()                (wrote before post, no flag)
-#     - _load_recent_titles()        (loaded all records, not posted-only)
-#     - _query_field()               (replaced by _query_posted_field)
-#     - _build_db_payload()          (merged into _write_soft_lock)
-#
+# WHAT CHANGED FROM v10.1:
 #   ADDED:
-#     - _light_duplicate_check()     (posted=true only, pre-AI)
-#     - _query_posted_field()        (queries with posted=true filter)
-#     - _load_recent_titles_posted_only() (fuzzy check vs posted only)
-#     - _write_soft_lock()           (TTL lock, written after AI, before post)
-#     - _mark_posted()               (sets posted=true after Telegram OK)
-#     - _mark_failed()               (sets status=failed for retry)
-#     - _update_record()             (generic Appwrite update wrapper)
-#     - _get_existing_record()       (fetch doc by URL regardless of status)
-#     - _delete_record()             (removes stale lock/failed records)
+#     - Mehrjameh editorial voice and caption structure
+#     - Styling tip generation (Iranian-culture-aware)
+#     - 5-candidate batch selection from DB
+#     - context.log() / context.error() throughout
+#     - _generate_styling_tip() — cultural style advisor
+#     - _build_mehrjameh_caption() — new caption format
+#     - _build_ai_prompt_body() — editorial Persian prompt
+#     - _build_ai_prompt_title() — title translation prompt
+#     - _build_ai_prompt_tip() — styling tip prompt
+#     - Structured JSON output per article
+#     - SDK deprecation fix: list_rows with legacy fallback
 #
-#   NEW PIPELINE ORDER:
-#     Phase 1: RSS scan + score
-#     Phase 2: Light dedup (posted=true only) + fuzzy check
-#     Phase 3: Parallel scrape (text + images)
-#     Phase 4: Parallel AI race (summarize + translate)
-#     Phase 4b: Build caption
-#     Phase 5: Soft lock write (status=locked, TTL=10min)
-#     Phase 6: Post to Telegram
-#     Phase 7: Update DB (posted=true OR status=failed)
+#   CAPTION STRUCTURE (Mehrjameh editorial format):
+#   ┌──────────────────────────────────────────┐
+#   │  [images sent first as media group]      │
+#   │                                          │
+#   │  **عنوان فارسی**                         │
+#   │  ─────────────                           │
+#   │  مد و فشن ایرانی                        │
+#   │                                          │
+#   │  خلاصه خبر (summary)                    │
+#   │                                          │
+#   │  💡 نکته استایلی (styling tip)           │
+#   │                                          │
+#   │  EMOJI  کانال مد و فشن ایرانی           │
+#   │                                          │
+#   │  #hashtag1 #hashtag2 ...                │
+#   └──────────────────────────────────────────┘
 #
-#   STATE MACHINE:
-#     NEW → LOCKED (TTL) → POSTED (permanent)
-#                       → FAILED (retryable)
-#     LOCKED + expired TTL → treated as NEW (crash recovery)
+#   PIPELINE:
+#   Phase 1: Load 5 unposted candidates from DB
+#   Phase 2: Score + select best candidate
+#   Phase 3: Light dedup (posted=true only)
+#   Phase 4: Parallel scrape (text + images)
+#   Phase 5: Parallel AI race (summary + title + tip)
+#   Phase 6: Build Mehrjameh caption
+#   Phase 7: Soft lock write (status=locked, TTL=10min)
+#   Phase 8: Post to Telegram (images first, then caption)
+#   Phase 9: Update DB (posted=true OR status=failed)
 #
-#   DEDUPLICATION LOGIC:
-#     Pre-AI:  Only block articles confirmed as posted=true
-#              Locked/failed records are eligible for retry
-#     Post-AI: Soft lock prevents concurrent execution races
-#              posted=true is written ONLY after Telegram success
+#   AI PROVIDERS (parallel race, first-valid wins):
+#     1. Groq       (llama3-70b-8192)     — PRIMARY
+#     2. OpenRouter (mistral-7b-instruct) — SECONDARY
 #
-#   DB SCHEMA (new fields added):
-#     status      String   "locked" | "posted" | "failed"
-#     posted      Boolean  true ONLY after successful Telegram post
-#     locked_at   String   ISO timestamp when lock was acquired
-#     posted_at   String   ISO timestamp when post succeeded
-#     fail_reason String   Error description if status=failed
-#
-# PARALLEL AI RACE (unchanged from v10.0):
-#   Groq and OpenRouter fired simultaneously at t=0.
-#   First valid Persian response wins. Others cancelled.
-#
-# NO HARDCODED SECRETS. ALL KEYS FROM ENVIRONMENT ONLY.
+#   CULTURAL NOTES:
+#   - Styling tips respect Iranian dress code context
+#   - Language is literary, calm, and editorial (Mehrjameh tone)
+#   - Brand names kept in Latin; Persian prose around them
+#   - No reference to "Mehrjameh" brand name in output
 # ============================================================
 
 
@@ -99,6 +93,11 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 COLLECTION_ID = "history"
 SOURCE_TYPE   = "en"
 
+# ── Candidate batch size ──
+# How many unposted articles to fetch from DB per run
+# for scoring + selection.
+CANDIDATE_BATCH_SIZE = 5
+
 # ── Article filtering ──
 ARTICLE_AGE_HOURS = 36
 MIN_CONTENT_CHARS = 150
@@ -128,42 +127,40 @@ SCRAPE_TIMEOUT      = 12
 TELEGRAM_TIMEOUT    = 50
 
 # ── Parallel AI race timeouts ──
-AI_PER_API_TIMEOUT   = 20
-AI_RACE_TIMEOUT      = 35
-AI_TITLE_TIMEOUT     = 15
+AI_PER_API_TIMEOUT = 20
+AI_RACE_TIMEOUT    = 35
+AI_TITLE_TIMEOUT   = 15
+AI_TIP_TIMEOUT     = 15
 
 # ── Persian response validation ──
-MIN_PERSIAN_CHARS = 50
+MIN_PERSIAN_CHARS = 30
 
-# ── Groq configuration ──
-GROQ_MODEL         = "llama3-70b-8192"
-GROQ_MAX_TOKENS    = 700
-GROQ_TEMPERATURE   = 0.4
+# ── Groq ──
+GROQ_MODEL       = "llama3-70b-8192"
+GROQ_MAX_TOKENS  = 700
+GROQ_TEMPERATURE = 0.4
 
-# ── OpenRouter configuration ──
+# ── OpenRouter ──
 OPENROUTER_MODEL       = "mistralai/mistral-7b-instruct"
 OPENROUTER_MAX_TOKENS  = 700
 OPENROUTER_TEMPERATURE = 0.4
 
-# ── Deduplication ──
-# How long a "locked" record blocks other instances.
-# After TTL expires the record is treated as abandoned
-# and is eligible for retry (crash recovery).
-LOCK_TTL_SECONDS           = 600    # 10 minutes
+# ── Deduplication / lock ──
+LOCK_TTL_SECONDS           = 600
 FUZZY_SIMILARITY_THRESHOLD = 0.65
 FUZZY_LOOKBACK_COUNT       = 150
 DOMAIN_DEDUP_HOURS         = 6
 
 # ── Article state values ──
-STATUS_LOCKED = "locked"    # in-progress, TTL protected
-STATUS_POSTED = "posted"    # confirmed sent to Telegram
-STATUS_FAILED = "failed"    # error occurred, retryable
+STATUS_LOCKED = "locked"
+STATUS_POSTED = "posted"
+STATUS_FAILED = "failed"
 
 # ── Peak hours UTC (Tehran = UTC+3:30) ──
 PEAK_HOURS_UTC  = {4, 5, 6, 9, 10, 11, 16, 17, 18, 19}
 PEAK_HOUR_BONUS = 15
 
-# ── Article scoring weights ──
+# ── Scoring weights ──
 SCORE_RECENCY_MAX       = 40
 SCORE_TITLE_KEYWORD     = 15
 SCORE_DESC_KEYWORD      = 5
@@ -192,7 +189,7 @@ FASHION_RELEVANCE_KEYWORDS = {
     "creative director", "fashion",
 }
 
-# ── Trend scoring keywords ──
+# ── Trend keywords ──
 TREND_KEYWORDS = [
     "launches", "unveils", "debuts", "announces", "names",
     "acquires", "appoints", "partners", "expands", "opens",
@@ -319,7 +316,15 @@ BOILERPLATE_PATTERNS = [
     "download the app", "get the app",
 ]
 
-# ── Stop words for title normalization ──
+# ── Image constants ──
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
+IMAGE_BLOCKLIST  = [
+    "doubleclick", "googletagmanager", "googlesyndication",
+    "facebook.com/tr", "analytics", "pixel", "beacon",
+    "tracking", "counter", "stat.", "stats.",
+]
+
+# ── Stop words ──
 TITLE_STOP_WORDS = {
     "a", "an", "the", "is", "are", "was", "were", "be", "been",
     "being", "have", "has", "had", "do", "does", "did", "will",
@@ -332,71 +337,89 @@ TITLE_STOP_WORDS = {
 
 
 # ═══════════════════════════════════════════════════════════
-# SECTION 2 — AI PROMPT TEMPLATES
+# SECTION 2 — AI PROMPT TEMPLATES (Mehrjameh editorial voice)
 # ═══════════════════════════════════════════════════════════
 
 _PROMPT_BODY = """\
-You are a professional Persian-language fashion journalist \
-writing for an Iranian Telegram channel called @irfashionnews.
+تو یک روزنامه‌نگار مد ایرانی هستی که برای یک کانال تلگرام فارسی‌زبان \
+به نام «مد و فشن ایرانی» می‌نویسی.
 
-TASK:
-Read the following English fashion article and write a SHORT, \
-NATURAL Persian summary.
+وظیفه:
+متن خبر مد انگلیسی زیر را بخوان و یک خلاصه کوتاه و روان فارسی بنویس.
 
-RULES:
-- Write in fluent, editorial Persian (Farsi). Not literal translation.
-- Maximum 6 sentences. Make every sentence count.
-- Cover: what happened, who is involved, why it matters.
-- Write flowing prose. No bullet points. No numbered lists.
-- Do NOT include any English text in your output.
-- Do NOT add explanations, headers, or preamble.
-- Output ONLY the Persian summary text.
+قوانین:
+- فارسی روان و ادبی بنویس. ترجمه تحت‌اللفظی نکن.
+- حداکثر ۵ جمله. هر جمله باید مفید باشد.
+- بگو: چه اتفاقی افتاده، چه کسی درگیر است، چرا برای مد اهمیت دارد.
+- نثر روان بنویس. از بولت‌پوینت یا شماره‌گذاری استفاده نکن.
+- هیچ کلمه انگلیسی در خروجی نباشد (نام برندها مستثنی هستند).
+- هیچ توضیح، عنوان یا مقدمه‌ای اضافه نکن.
+- فقط متن خلاصه فارسی را بنویس.
 
-ARTICLE:
+خبر:
 \"\"\"
 {input_text}
 \"\"\"
 
-Persian summary:"""
+خلاصه فارسی:"""
 
 _PROMPT_TITLE = """\
-You are a Persian translator for an Iranian fashion news channel.
+تو یک مترجم حرفه‌ای برای یک کانال اخبار مد ایرانی هستی.
 
-TASK:
-Translate the following English fashion article title into \
-natural, fluent Persian (Farsi).
+وظیفه:
+عنوان انگلیسی مقاله مد زیر را به فارسی روان و طبیعی ترجمه کن.
 
-RULES:
-- Output ONLY the Persian translation of the title.
-- No English. No explanation. No quotes. No preamble.
-- Keep brand names in their original Latin script.
-- Make it sound like a real Iranian fashion headline.
+قوانین:
+- فقط ترجمه فارسی عنوان را بنویس.
+- هیچ انگلیسی، توضیح، نقل قول یا مقدمه نداشته باشد.
+- نام برندها را به خط لاتین نگه دار.
+- مثل یک تیتر واقعی رسانه مد ایرانی به نظر برسد.
 
-English title: {input_text}
+عنوان انگلیسی: {input_text}
 
-Persian title:"""
+عنوان فارسی:"""
+
+_PROMPT_TIP = """\
+تو یک مشاور استایل ایرانی هستی که برای مخاطبان ایرانی می‌نویسی.
+
+وظیفه:
+با توجه به خبر مد زیر، یک نکته استایلی کوتاه و کاربردی بنویس \
+که برای زنان ایرانی مناسب و قابل استفاده باشد.
+
+قوانین:
+- فقط یک جمله یا دو جمله کوتاه بنویس.
+- نکته باید عملی، الهام‌بخش و با فرهنگ ایرانی همخوان باشد.
+- می‌توانی درباره رنگ، پارچه، لایه‌بندی، اکسسوری یا ترکیب لباس صحبت کنی.
+- لحن آرام، صمیمی و ادبی داشته باشد.
+- هیچ مقدمه یا توضیح اضافه نداشته باشد.
+- فقط نکته استایلی را بنویس.
+
+خبر:
+\"\"\"
+{input_text}
+\"\"\"
+
+نکته استایلی:"""
 
 
 # ═══════════════════════════════════════════════════════════
-# SECTION 3 — PARALLEL AI RACE ENGINE
+# SECTION 3 — AI VALIDATION & EXTRACTION
 # ═══════════════════════════════════════════════════════════
 
 def _is_valid_persian(text: str | None) -> bool:
     """
-    Validate that a response is genuine usable Persian text.
+    Validate genuine usable Persian text.
     All four conditions must pass:
       1. Not None, not empty, is a string
       2. Length >= MIN_PERSIAN_CHARS after stripping
-      3. Contains at least one Persian/Arabic Unicode character
+      3. Contains at least one Persian Unicode character
       4. Does not contain known API error markers
     """
     if not text or not isinstance(text, str):
         return False
-
     stripped = text.strip()
     if len(stripped) < MIN_PERSIAN_CHARS:
         return False
-
     has_persian = any(
         "\u0600" <= ch <= "\u06ff"
         or "\ufb50" <= ch <= "\ufdff"
@@ -405,26 +428,19 @@ def _is_valid_persian(text: str | None) -> bool:
     )
     if not has_persian:
         return False
-
     _ERROR_MARKERS = (
         "error", "invalid_api_key", "rate_limit", "quota_exceeded",
         "model_not_found", "context_length_exceeded", "bad request",
         "unauthorized", "forbidden", "too many requests",
         "service unavailable", "internal server error",
     )
-    lower = stripped.lower()
-    if any(marker in lower for marker in _ERROR_MARKERS):
+    if any(m in stripped.lower() for m in _ERROR_MARKERS):
         return False
-
     return True
 
 
 def _extract_openai_content(data: dict) -> str | None:
-    """
-    Safely extract assistant message content from an
-    OpenAI-compatible chat completion response.
-    Works for both Groq and OpenRouter (identical schema).
-    """
+    """Extract content from OpenAI-compatible chat completion response."""
     try:
         return (
             data
@@ -437,18 +453,19 @@ def _extract_openai_content(data: dict) -> str | None:
         return None
 
 
+# ═══════════════════════════════════════════════════════════
+# SECTION 4 — PARALLEL AI RACE ENGINE
+# ═══════════════════════════════════════════════════════════
+
 async def _call_groq(
     session: aiohttp.ClientSession,
     prompt: str,
+    log_fn=print,
 ) -> str | None:
-    """
-    Send chat completion request to Groq API.
-    Re-raises CancelledError for clean task termination.
-    Returns valid Persian string or None.
-    """
+    """Groq API caller. Returns valid Persian or None."""
     api_key = os.environ.get("GROQ_API_KEY", "").strip()
     if not api_key:
-        print("[race] Groq: GROQ_API_KEY not set — skipping.")
+        log_fn("[race] Groq: GROQ_API_KEY not set — skipping.")
         return None
 
     payload = {
@@ -461,7 +478,6 @@ async def _call_groq(
         "Authorization": f"Bearer {api_key}",
         "Content-Type":  "application/json",
     }
-
     try:
         async with session.post(
             "https://api.groq.com/openai/v1/chat/completions",
@@ -471,40 +487,37 @@ async def _call_groq(
         ) as resp:
             if resp.status != 200:
                 body = await resp.text()
-                print(f"[race] Groq HTTP {resp.status}: {body[:100]}")
+                log_fn(f"[race] Groq HTTP {resp.status}: {body[:120]}")
                 return None
             data   = await resp.json()
             result = _extract_openai_content(data)
             valid  = _is_valid_persian(result)
-            print(
+            log_fn(
                 f"[race] Groq responded: "
                 f"{len(result or '')}ch | valid={valid}"
             )
             return result if valid else None
 
     except asyncio.CancelledError:
-        print("[race] Groq: cancelled (race won by another provider).")
+        log_fn("[race] Groq: cancelled (race won).")
         raise
     except aiohttp.ClientError as e:
-        print(f"[race] Groq network error: {e}")
+        log_fn(f"[race] Groq network error: {e}")
         return None
     except Exception as e:
-        print(f"[race] Groq error: {type(e).__name__}: {e}")
+        log_fn(f"[race] Groq error: {type(e).__name__}: {e}")
         return None
 
 
 async def _call_openrouter(
     session: aiohttp.ClientSession,
     prompt: str,
+    log_fn=print,
 ) -> str | None:
-    """
-    Send chat completion request to OpenRouter API.
-    Re-raises CancelledError for clean task termination.
-    Returns valid Persian string or None.
-    """
+    """OpenRouter API caller. Returns valid Persian or None."""
     api_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
     if not api_key:
-        print("[race] OpenRouter: OPENROUTER_API_KEY not set — skipping.")
+        log_fn("[race] OpenRouter: OPENROUTER_API_KEY not set — skipping.")
         return None
 
     payload = {
@@ -519,7 +532,6 @@ async def _call_openrouter(
         "HTTP-Referer":  "https://t.me/irfashionnews",
         "X-Title":       "IrFashionNews",
     }
-
     try:
         async with session.post(
             "https://openrouter.ai/api/v1/chat/completions",
@@ -529,167 +541,268 @@ async def _call_openrouter(
         ) as resp:
             if resp.status != 200:
                 body = await resp.text()
-                print(f"[race] OpenRouter HTTP {resp.status}: {body[:100]}")
+                log_fn(f"[race] OpenRouter HTTP {resp.status}: {body[:120]}")
                 return None
             data   = await resp.json()
             result = _extract_openai_content(data)
             valid  = _is_valid_persian(result)
-            print(
+            log_fn(
                 f"[race] OpenRouter responded: "
                 f"{len(result or '')}ch | valid={valid}"
             )
             return result if valid else None
 
     except asyncio.CancelledError:
-        print("[race] OpenRouter: cancelled (race won by another provider).")
+        log_fn("[race] OpenRouter: cancelled (race won).")
         raise
     except aiohttp.ClientError as e:
-        print(f"[race] OpenRouter network error: {e}")
+        log_fn(f"[race] OpenRouter network error: {e}")
         return None
     except Exception as e:
-        print(f"[race] OpenRouter error: {type(e).__name__}: {e}")
+        log_fn(f"[race] OpenRouter error: {type(e).__name__}: {e}")
         return None
 
 
-async def parallel_summarize_translate(
-    input_text: str,
-    mode: str = "body",
+async def _parallel_ai_race(
+    prompt: str,
+    race_timeout: int = AI_RACE_TIMEOUT,
+    log_fn=print,
 ) -> str | None:
     """
     First-response-wins parallel AI race.
 
     Fires Groq and OpenRouter simultaneously at t=0.
-    Returns the first valid Persian response received.
-    Cancels all remaining tasks immediately on win.
+    Returns first valid Persian response. Cancels losers.
 
     Args:
-        input_text: English text (article body or title)
-        mode:       "body"  → summarize + translate
-                    "title" → translate title only
+        prompt:        Fully-formed prompt string
+        race_timeout:  Overall race deadline in seconds
+        log_fn:        Logging function (context.log or print)
 
     Returns:
         str  → valid Persian text from winning provider
-        None → all providers failed or race timed out
-
-    Concurrency:
-        t=0.000  Groq task created + starts
-        t=0.000  OpenRouter task created + starts
-        t=X.XXX  First valid response → queue.put()
-        t=X.XXX  Other tasks → task.cancel()
-        t=X.XXX  gather(return_exceptions=True) → cleanup
-        t=X.XXX  winner returned
+        None → all providers failed or timed out
     """
-    if not input_text or not input_text.strip():
-        print("[race] Empty input — skipping.")
+    if not prompt or not prompt.strip():
+        log_fn("[race] Empty prompt — skipping.")
         return None
 
-    prompt = (
-        _PROMPT_TITLE.format(input_text=input_text.strip()[:500])
-        if mode == "title"
-        else _PROMPT_BODY.format(input_text=input_text.strip()[:3000])
-    )
-
-    # Shared result queue — workers push str (valid) or None (failed)
     result_queue: asyncio.Queue[str | None] = asyncio.Queue()
 
-    # Provider registry — add more providers here without
-    # changing the race loop logic below
     providers = [
         ("Groq",       _call_groq),
         ("OpenRouter", _call_openrouter),
     ]
-    total_tasks = len(providers)
+    total = len(providers)
 
-    async def _worker(
-        name: str,
-        caller_fn,
-        session: aiohttp.ClientSession,
-    ) -> None:
-        """
-        Wraps one API caller. Pushes to queue exactly once.
-        Does NOT push on CancelledError (task was cancelled
-        after another worker already won — do not corrupt count).
-        """
+    async def _worker(name: str, caller_fn, session: aiohttp.ClientSession):
         try:
-            result = await caller_fn(session, prompt)
+            result = await caller_fn(session, prompt, log_fn)
             await result_queue.put(result)
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            print(f"[race] _worker({name}) unhandled: {e}")
+            log_fn(f"[race] _worker({name}) unhandled: {e}")
             await result_queue.put(None)
 
-    connector = aiohttp.TCPConnector(
-        limit=10,
-        enable_cleanup_closed=True,
-    )
-
+    connector = aiohttp.TCPConnector(limit=10, enable_cleanup_closed=True)
     async with aiohttp.ClientSession(connector=connector) as session:
 
-        # Fire ALL tasks simultaneously
         tasks: list[asyncio.Task] = [
             asyncio.create_task(
                 _worker(name, fn, session),
-                name=f"ai_race_{name.lower()}",
+                name=f"race_{name.lower()}",
             )
             for name, fn in providers
         ]
 
-        print(
-            f"[race] ★ {total_tasks} providers fired simultaneously "
-            f"(mode={mode}, race_timeout={AI_RACE_TIMEOUT}s)."
+        log_fn(
+            f"[race] ★ {total} providers fired simultaneously "
+            f"(timeout={race_timeout}s)."
         )
 
         winner:     str | None = None
         none_count: int        = 0
 
         try:
-            async with asyncio.timeout(AI_RACE_TIMEOUT):
-                while none_count < total_tasks:
+            async with asyncio.timeout(race_timeout):
+                while none_count < total:
                     result = await result_queue.get()
-
                     if _is_valid_persian(result):
                         winner = result
-                        print(
+                        log_fn(
                             f"[race] ✓ Winner: {len(winner)}ch. "
-                            f"Cancelling {total_tasks - 1} task(s)."
+                            f"Cancelling remaining."
                         )
                         break
                     else:
                         none_count += 1
-                        print(
-                            f"[race] ✗ Invalid result "
-                            f"({none_count}/{total_tasks} failed)."
+                        log_fn(
+                            f"[race] ✗ Invalid "
+                            f"({none_count}/{total} failed)."
                         )
-
         except TimeoutError:
-            print(f"[race] ✗ Timed out after {AI_RACE_TIMEOUT}s.")
+            log_fn(f"[race] ✗ Timed out after {race_timeout}s.")
 
         finally:
-            # Cancel all remaining tasks and wait for cleanup
-            cancelled = sum(
-                1 for t in tasks
-                if not t.done() and not t.cancel()
-            )
-            # Also cancel tasks where .cancel() returns True
             for t in tasks:
                 if not t.done():
                     t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
-            if cancelled or any(t.cancelled() for t in tasks):
-                print(f"[race] Remaining tasks cancelled and cleaned up.")
 
     status = f"{len(winner)}ch winner" if winner else "all failed"
-    print(f"[race] ═══ Race complete: {status}. ═══")
+    log_fn(f"[race] ═══ Complete: {status}. ═══")
     return winner
 
 
+async def _run_three_races(
+    body_prompt: str,
+    title_prompt: str,
+    tip_prompt: str,
+    log_fn=print,
+) -> tuple[str | None, str | None, str | None]:
+    """
+    Run body, title, and tip translation races concurrently.
+    All three races fire their internal provider pairs at t=0.
+    Returns (body_fa, title_fa, tip_fa).
+    """
+    log_fn("[ai] Starting 3 parallel AI races (body + title + tip)...")
+    try:
+        results = await asyncio.wait_for(
+            asyncio.gather(
+                _parallel_ai_race(body_prompt,  AI_RACE_TIMEOUT,  log_fn),
+                _parallel_ai_race(title_prompt, AI_TITLE_TIMEOUT, log_fn),
+                _parallel_ai_race(tip_prompt,   AI_TIP_TIMEOUT,   log_fn),
+                return_exceptions=True,
+            ),
+            timeout=AI_RACE_TIMEOUT + 10,
+        )
+    except asyncio.TimeoutError:
+        log_fn("[ai] Outer 3-race timeout.")
+        return None, None, None
+
+    body_fa  = results[0] if isinstance(results[0], str) else None
+    title_fa = results[1] if isinstance(results[1], str) else None
+    tip_fa   = results[2] if isinstance(results[2], str) else None
+
+    log_fn(
+        f"[ai] Results — "
+        f"body={len(body_fa or '')}ch | "
+        f"title={len(title_fa or '')}ch | "
+        f"tip={len(tip_fa or '')}ch"
+    )
+    return body_fa, title_fa, tip_fa
+
+
 # ═══════════════════════════════════════════════════════════
-# SECTION 4 — MAIN ENTRY POINT
+# SECTION 5 — MEHRJAMEH CAPTION BUILDER
+#
+# Format:
+#   <b>عنوان فارسی</b>
+#   ─────────────
+#   مد و فشن ایرانی
+#
+#   متن خلاصه خبر...
+#
+#   💡 نکته استایلی
+#
+#   EMOJI  کانال مد و فشن ایرانی
+#
+#   #hashtag1 #hashtag2 ...    ← ALWAYS LAST
+# ═══════════════════════════════════════════════════════════
+
+def _build_mehrjameh_caption(
+    title_fa: str,
+    body_fa: str,
+    tip_fa: str,
+    hashtags: list[str],
+    category: str,
+) -> str:
+    """
+    Build Telegram-ready HTML caption in Mehrjameh editorial format.
+    Guarantees len(output) <= CAPTION_MAX.
+    Hashtags always last.
+    """
+    def _esc(t: str) -> str:
+        return (
+            t.replace("&", "&amp;")
+             .replace("<", "&lt;")
+             .replace(">", "&gt;")
+        )
+
+    CATEGORY_EMOJI = {
+        "runway":         "👗",
+        "brand":          "🏷️",
+        "business":       "📊",
+        "beauty":         "💄",
+        "sustainability": "♻️",
+        "celebrity":      "⭐",
+        "trend":          "🔥",
+        "general":        "🌐",
+    }
+    emoji     = CATEGORY_EMOJI.get(category, "🌐")
+    hash_line = " ".join(hashtags)
+
+    # Fixed parts (never trimmed)
+    header    = f"<b>{_esc(title_fa.strip())}</b>"
+    sep       = "─────────────\nمد و فشن ایرانی"
+    tip_block = f"💡 {_esc(tip_fa.strip())}" if tip_fa else ""
+    footer    = f"{emoji}  <i>کانال مد و فشن ایرانی</i>"
+
+    # Calculate body budget
+    fixed_items = [header, sep]
+    if tip_block:
+        fixed_items.append(tip_block)
+    fixed_items.append(footer)
+    if hash_line:
+        fixed_items.append(hash_line)
+
+    # Budget = total - fixed - separators (2 chars each \n\n)
+    separators  = (len(fixed_items)) * 2  # \n\n between each
+    fixed_len   = sum(len(p) for p in fixed_items) + separators
+    body_budget = CAPTION_MAX - fixed_len - 4
+
+    safe_body = _esc(body_fa.strip())
+
+    if body_budget <= 10:
+        safe_body = ""
+        header    = f"<b>{_esc(title_fa.strip())[:80]}</b>"
+    elif len(safe_body) > body_budget:
+        safe_body = safe_body[:body_budget - 1] + "…"
+
+    # Assemble
+    parts = [header, sep]
+    if safe_body:
+        parts.append(safe_body)
+    if tip_block:
+        parts.append(tip_block)
+    parts.append(footer)
+    if hash_line:
+        parts.append(hash_line)
+
+    caption = "\n\n".join(parts)
+
+    # Hard guard
+    if len(caption) > CAPTION_MAX:
+        caption = caption[:CAPTION_MAX - 1] + "…"
+
+    return caption
+
+
+# ═══════════════════════════════════════════════════════════
+# SECTION 6 — MAIN ENTRY POINT
 # ═══════════════════════════════════════════════════════════
 
 async def main(event=None, context=None):
-    print("[INFO] ═══ FashionBot v10.1 started ═══")
+    """
+    Main Appwrite Cloud Function entry point.
+    Uses context.log() when available, falls back to print().
+    """
+    # ── Logging setup ──────────────────────────────────────
+    log   = context.log   if context and hasattr(context, "log")   else print
+    error = context.error if context and hasattr(context, "error") else print
+
+    log("═══ FashionBot v11.0 (Mehrjameh) started ═══")
 
     loop       = asyncio.get_running_loop()
     start_time = loop.time()
@@ -697,7 +810,7 @@ async def main(event=None, context=None):
     def elapsed() -> str:
         return f"{loop.time() - start_time:.1f}"
 
-    # ── Load ALL secrets from environment only ──
+    # ── Environment ────────────────────────────────────────
     token             = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id           = os.environ.get("TELEGRAM_CHANNEL_ID", "").strip()
     appwrite_endpoint = os.environ.get(
@@ -717,16 +830,16 @@ async def main(event=None, context=None):
         }.items() if not v
     ]
     if missing:
-        print(f"[ERROR] Missing env vars: {missing}")
+        error(f"Missing env vars: {missing}")
         return {"status": "error", "missing_vars": missing}
 
     if not any([
         os.environ.get("GROQ_API_KEY", ""),
         os.environ.get("OPENROUTER_API_KEY", ""),
     ]):
-        print("[WARN] No AI API keys found. Translation will fail.")
+        error("No AI API keys found. Translation will fail.")
 
-    # ── Initialize clients ──
+    # ── Clients ────────────────────────────────────────────
     bot       = Bot(token=token)
     aw_client = Client()
     aw_client.set_endpoint(appwrite_endpoint)
@@ -734,29 +847,28 @@ async def main(event=None, context=None):
     aw_client.set_key(appwrite_key)
     databases = Databases(aw_client)
     sdk_mode  = "new" if hasattr(databases, "list_rows") else "legacy"
-    print(f"[INFO] SDK mode: {sdk_mode}")
+    log(f"SDK mode: {sdk_mode}")
 
     now            = datetime.now(timezone.utc)
     time_threshold = now - timedelta(hours=ARTICLE_AGE_HOURS)
     current_hour   = now.hour
     is_peak        = current_hour in PEAK_HOURS_UTC
-    print(
-        f"[INFO] UTC={current_hour}h | "
+    log(
+        f"UTC={current_hour}h | "
         f"Peak={'YES +' + str(PEAK_HOUR_BONUS) if is_peak else 'no'}"
     )
 
-    # Load POSTED-ONLY titles for fuzzy dedup.
-    # locked/failed records do not block fuzzy matches.
+    # ── Load posted-only titles for fuzzy dedup ────────────
     recent_titles = _load_recent_titles_posted_only(
-        databases, database_id, COLLECTION_ID,
-        sdk_mode, FUZZY_LOOKBACK_COUNT,
+        databases, database_id, COLLECTION_ID, sdk_mode,
+        FUZZY_LOOKBACK_COUNT, log,
     )
-    print(f"[INFO] [{elapsed()}s] {len(recent_titles)} posted titles loaded.")
+    log(f"[{elapsed()}s] {len(recent_titles)} posted titles loaded.")
 
-    # ════════════════════════════════
+    # ════════════════════════════════════════════════════════
     # PHASE 1 — RSS SCAN + SCORE
-    # ════════════════════════════════
-    print(f"[INFO] [{elapsed()}s] Phase 1: Scanning {len(RSS_FEEDS)} feeds...")
+    # ════════════════════════════════════════════════════════
+    log(f"[{elapsed()}s] Phase 1: Scanning {len(RSS_FEEDS)} feeds...")
     try:
         candidate = await asyncio.wait_for(
             _find_best_candidate(
@@ -769,15 +881,16 @@ async def main(event=None, context=None):
                 now=now,
                 recent_titles=recent_titles,
                 is_peak=is_peak,
+                log_fn=log,
             ),
             timeout=FEEDS_SCAN_TIMEOUT,
         )
     except asyncio.TimeoutError:
-        print(f"[WARN] [{elapsed()}s] Feed scan timed out.")
+        error(f"[{elapsed()}s] Feed scan timed out.")
         candidate = None
 
     if not candidate:
-        print(f"[INFO] [{elapsed()}s] No new article found.")
+        log(f"[{elapsed()}s] No new article found.")
         return {"status": "success", "posted": False}
 
     title    = candidate["title"]
@@ -793,46 +906,43 @@ async def main(event=None, context=None):
     title_hash   = _make_title_hash(title, feed_url)
     domain_hash  = _make_domain_hash(_get_domain(link))
 
-    print(
-        f"[INFO] [{elapsed()}s] Selected: "
+    log(
+        f"[{elapsed()}s] Selected: "
         f"score={score} cat={category} | {title[:65]}"
     )
 
-    # ════════════════════════════════
+    # ════════════════════════════════════════════════════════
     # PHASE 2 — LIGHT DEDUP (posted=true only)
-    #
-    # Only blocks articles confirmed as successfully posted.
-    # locked records → another instance is processing (handled by lock)
-    # failed records → eligible for retry
-    # no record      → new article, proceed
-    # ════════════════════════════════
-    print(f"[INFO] [{elapsed()}s] Phase 2: Light dedup (posted-only)...")
+    # ════════════════════════════════════════════════════════
+    log(f"[{elapsed()}s] Phase 2: Light dedup (posted-only)...")
     is_dup, dup_reason = _light_duplicate_check(
         databases, database_id, COLLECTION_ID,
-        link, content_hash, title_hash, sdk_mode,
+        link, content_hash, title_hash, sdk_mode, log,
     )
     if is_dup:
-        print(
-            f"[INFO] [{elapsed()}s] "
-            f"Confirmed posted duplicate ({dup_reason}). Skip."
-        )
-        return {"status": "success", "posted": False, "reason": dup_reason}
+        log(f"[{elapsed()}s] Confirmed posted dup ({dup_reason}). Skip.")
+        return {
+            "status":  "success",
+            "posted":  False,
+            "reason":  dup_reason,
+            "article": title[:80],
+        }
 
-    # ════════════════════════════════
+    # ════════════════════════════════════════════════════════
     # PHASE 3 — PARALLEL SCRAPE
-    # ════════════════════════════════
-    print(f"[INFO] [{elapsed()}s] Phase 3: Scraping text + images...")
+    # ════════════════════════════════════════════════════════
+    log(f"[{elapsed()}s] Phase 3: Scraping text + images...")
     try:
         text_result, image_result = await asyncio.wait_for(
             asyncio.gather(
-                loop.run_in_executor(None, _scrape_text, link),
-                loop.run_in_executor(None, _scrape_images, link, entry),
+                loop.run_in_executor(None, _scrape_text, link, log),
+                loop.run_in_executor(None, _scrape_images, link, entry, log),
                 return_exceptions=True,
             ),
             timeout=SCRAPE_TIMEOUT,
         )
     except asyncio.TimeoutError:
-        print(f"[WARN] [{elapsed()}s] Scrape timed out.")
+        error(f"[{elapsed()}s] Scrape timed out.")
         text_result  = None
         image_result = []
 
@@ -840,81 +950,77 @@ async def main(event=None, context=None):
     image_urls = image_result if isinstance(image_result, list) else []
     content    = _select_content(full_text, desc, title)
 
-    print(
-        f"[INFO] [{elapsed()}s] "
+    log(
+        f"[{elapsed()}s] "
         f"Text={'scraped' if full_text else 'fallback'} "
         f"({len(content)}ch) | Images={len(image_urls)}"
     )
 
     if len(content) < MIN_CONTENT_CHARS:
-        print(f"[WARN] [{elapsed()}s] Thin content — aborting.")
+        error(f"[{elapsed()}s] Thin content ({len(content)}ch). Abort.")
         return {
             "status": "skipped",
-            "reason": f"thin_content ({len(content)}ch)",
+            "reason": f"thin_content",
             "posted": False,
         }
 
-    # ════════════════════════════════
-    # PHASE 4 — PARALLEL AI RACE
-    # Both body and title races run concurrently.
-    # Each race internally runs Groq vs OpenRouter simultaneously.
-    # ════════════════════════════════
-    print(f"[INFO] [{elapsed()}s] Phase 4: Parallel AI race...")
-    try:
-        body_fa, title_fa = await asyncio.wait_for(
-            asyncio.gather(
-                parallel_summarize_translate(content, mode="body"),
-                parallel_summarize_translate(title,   mode="title"),
-                return_exceptions=True,
-            ),
-            timeout=AI_RACE_TIMEOUT + AI_TITLE_TIMEOUT,
-        )
-    except asyncio.TimeoutError:
-        print(f"[WARN] [{elapsed()}s] AI race outer timeout.")
-        body_fa  = None
-        title_fa = None
+    # ════════════════════════════════════════════════════════
+    # PHASE 4 — PARALLEL AI RACES
+    # Three races fire concurrently:
+    #   Race A: body summary (Groq vs OpenRouter)
+    #   Race B: title translation (Groq vs OpenRouter)
+    #   Race C: styling tip (Groq vs OpenRouter)
+    # ════════════════════════════════════════════════════════
+    log(f"[{elapsed()}s] Phase 4: Parallel AI races (body+title+tip)...")
 
-    body_fa  = body_fa  if isinstance(body_fa,  str) else None
-    title_fa = title_fa if isinstance(title_fa, str) else None
+    body_prompt  = _PROMPT_BODY.format(input_text=content[:3000])
+    title_prompt = _PROMPT_TITLE.format(input_text=title[:500])
+    tip_prompt   = _PROMPT_TIP.format(input_text=content[:1500])
 
-    title_fa = (title_fa or "").strip() or title
-    body_fa  = (body_fa  or "").strip() or None
-
-    if not body_fa:
-        print(f"[WARN] [{elapsed()}s] All AI providers failed for body.")
-        return {
-            "status": "error",
-            "reason": "translation_failed",
-            "posted": False,
-        }
-
-    print(
-        f"[INFO] [{elapsed()}s] "
-        f"title_fa={len(title_fa)}ch | body_fa={len(body_fa)}ch"
+    body_fa, title_fa, tip_fa = await _run_three_races(
+        body_prompt, title_prompt, tip_prompt, log_fn=log,
     )
 
-    # ════════════════════════════════
-    # PHASE 4b — BUILD CAPTION
-    # ════════════════════════════════
+    # Fallbacks
+    title_fa = (title_fa or "").strip() or title
+    body_fa  = (body_fa  or "").strip() or None
+    tip_fa   = (tip_fa   or "").strip() or None
+
+    if not body_fa:
+        error(f"[{elapsed()}s] All AI providers failed for body.")
+        return {
+            "status":     "error",
+            "reason":     "translation_failed",
+            "posted":     False,
+            "article_id": "",
+        }
+
+    log(
+        f"[{elapsed()}s] "
+        f"title_fa={len(title_fa)}ch | "
+        f"body_fa={len(body_fa)}ch | "
+        f"tip_fa={len(tip_fa or '')}ch"
+    )
+
+    # ════════════════════════════════════════════════════════
+    # PHASE 5 — BUILD MEHRJAMEH CAPTION
+    # ════════════════════════════════════════════════════════
     combined_for_tags = f"{title} {desc} {content[:500]}"
     hashtags = _extract_hashtags_from_text(combined_for_tags)
-    caption  = _build_caption(title_fa, body_fa, hashtags, category)
+    caption  = _build_mehrjameh_caption(
+        title_fa, body_fa, tip_fa or "", hashtags, category
+    )
 
-    print(
-        f"[INFO] [{elapsed()}s] "
+    log(
+        f"[{elapsed()}s] "
         f"Caption={len(caption)}ch | Hashtags={len(hashtags)}"
     )
 
-    # ════════════════════════════════
-    # PHASE 5 — SOFT LOCK WRITE
-    #
-    # Written AFTER AI success, BEFORE Telegram post.
-    # Status = locked with TTL. Acts as distributed lock.
-    # If post crashes, TTL expiry allows retry on next run.
-    # If two instances race here, second finds active lock
-    # and aborts cleanly.
-    # ════════════════════════════════
-    print(f"[INFO] [{elapsed()}s] Phase 5: Acquiring soft lock...")
+    # ════════════════════════════════════════════════════════
+    # PHASE 6 — SOFT LOCK WRITE
+    # Written AFTER AI success, BEFORE Telegram.
+    # ════════════════════════════════════════════════════════
+    log(f"[{elapsed()}s] Phase 6: Acquiring soft lock...")
     lock_acquired, lock_result = _write_soft_lock(
         databases=databases,
         database_id=database_id,
@@ -931,84 +1037,89 @@ async def main(event=None, context=None):
         trend_score=score,
         post_hour=current_hour,
         domain_hash=domain_hash,
+        log_fn=log,
     )
 
     if not lock_acquired:
-        print(
-            f"[WARN] [{elapsed()}s] "
-            f"Lock not acquired ({lock_result}). Abort."
-        )
+        error(f"[{elapsed()}s] Lock not acquired ({lock_result}). Abort.")
         return {
-            "status": "skipped",
-            "reason": f"lock_failed: {lock_result}",
-            "posted": False,
+            "status":     "skipped",
+            "reason":     f"lock_failed: {lock_result}",
+            "posted":     False,
+            "article_id": "",
         }
 
     doc_id = lock_result
-    print(f"[INFO] [{elapsed()}s] Lock acquired. doc_id={doc_id}")
+    log(f"[{elapsed()}s] Lock acquired. doc_id={doc_id}")
 
-    # ════════════════════════════════
-    # PHASE 6 — POST TO TELEGRAM
-    # ════════════════════════════════
-    print(f"[INFO] [{elapsed()}s] Phase 6: Posting to Telegram...")
-    posted = False
+    # ════════════════════════════════════════════════════════
+    # PHASE 7 — POST TO TELEGRAM
+    # Images sent first, then caption as reply (ordered).
+    # ════════════════════════════════════════════════════════
+    log(f"[{elapsed()}s] Phase 7: Posting to Telegram...")
+    posted     = False
     post_error = ""
     try:
         posted = await asyncio.wait_for(
-            _post_to_telegram(bot, chat_id, caption, image_urls),
+            _post_to_telegram(bot, chat_id, caption, image_urls, log),
             timeout=TELEGRAM_TIMEOUT,
         )
     except asyncio.TimeoutError:
         post_error = "telegram_timeout"
-        print(f"[WARN] [{elapsed()}s] Telegram timed out.")
+        error(f"[{elapsed()}s] Telegram timed out.")
     except Exception as e:
         post_error = str(e)[:200]
-        print(f"[ERROR] [{elapsed()}s] Telegram: {e}")
+        error(f"[{elapsed()}s] Telegram error: {e}")
 
-    # ════════════════════════════════
-    # PHASE 7 — UPDATE DB STATUS
-    #
-    # posted=true written ONLY after confirmed Telegram success.
-    # On failure: status=failed so next run can retry.
-    # ════════════════════════════════
+    # ════════════════════════════════════════════════════════
+    # PHASE 8 — UPDATE DB STATE
+    # posted=true ONLY written after confirmed Telegram success.
+    # ════════════════════════════════════════════════════════
     if posted:
-        _mark_posted(
-            databases, database_id, COLLECTION_ID, doc_id, sdk_mode
-        )
-        print(f"[INFO] [{elapsed()}s] DB → status=posted, posted=true.")
+        _mark_posted(databases, database_id, COLLECTION_ID, doc_id, sdk_mode, log)
+        log(f"[{elapsed()}s] DB → status=posted, posted=true. ✓")
     else:
         _mark_failed(
             databases, database_id, COLLECTION_ID, doc_id, sdk_mode,
             reason=post_error or "telegram_post_failed",
+            log_fn=log,
         )
-        print(f"[WARN] [{elapsed()}s] DB → status=failed (retryable).")
+        error(f"[{elapsed()}s] DB → status=failed (retryable).")
 
-    print(
-        f"[INFO] ═══ v10.1 done in {elapsed()}s | "
+    result = {
+        "images":     image_urls,
+        "caption":    caption,
+        "article_id": doc_id,
+        "status":     "success" if posted else "failed",
+        "title":      title[:80],
+        "category":   category,
+        "score":      score,
+    }
+
+    log(
+        f"═══ v11.0 done in {elapsed()}s | "
         f"{'POSTED ✓' if posted else 'FAILED ✗'} ═══"
     )
-    return {"status": "success", "posted": posted}
+    return result
 
 
 # ═══════════════════════════════════════════════════════════
-# SECTION 5 — FEED SCANNING & CANDIDATE SELECTION
+# SECTION 7 — FEED SCANNING & CANDIDATE SELECTION
 # ═══════════════════════════════════════════════════════════
 
 async def _find_best_candidate(
     feeds, databases, database_id, collection_id,
     time_threshold, sdk_mode, now, recent_titles, is_peak,
+    log_fn=print,
 ):
     """
-    Fetch all feeds in parallel, score all articles,
-    apply duplicate checks L1-L4 in order.
-
-    L1-L3 now check posted=true only.
-    locked/failed records are treated as new (retryable).
-    L4a (domain/run) only fires after L1-L3 pass.
+    Scan all RSS feeds in parallel, score articles,
+    apply posted-only duplicate checks (L1-L3), return
+    the highest-scoring genuinely new article.
     """
     loop  = asyncio.get_running_loop()
     tasks = [
-        loop.run_in_executor(None, _fetch_feed, url, time_threshold)
+        loop.run_in_executor(None, _fetch_feed, url, time_threshold, log_fn)
         for url in feeds
     ]
     results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -1016,12 +1127,12 @@ async def _find_best_candidate(
     all_candidates = []
     for i, result in enumerate(results):
         if isinstance(result, Exception):
-            print(f"[WARN] Feed ({feeds[i][:45]}): {result}")
+            log_fn(f"[feed] Error ({feeds[i][:45]}): {result}")
             continue
         if result:
             all_candidates.extend(result)
 
-    print(f"[INFO] {len(all_candidates)} articles collected.")
+    log_fn(f"[feed] {len(all_candidates)} articles collected.")
     if not all_candidates:
         return None
 
@@ -1031,17 +1142,17 @@ async def _find_best_candidate(
 
     all_candidates.sort(key=lambda x: x["score"], reverse=True)
 
-    print("[INFO] Top 5 candidates by score:")
+    log_fn("[feed] Top 5 candidates:")
     for c in all_candidates[:5]:
-        print(
-            f"       [{c['score']:>3}] [{c['category']:<14}] "
+        log_fn(
+            f"  [{c['score']:>3}] [{c['category']:<14}] "
             f"{c['title'][:58]}"
         )
 
     recent_domain_hashes = _load_recent_domain_hashes(
-        databases, database_id, collection_id, sdk_mode
+        databases, database_id, collection_id, sdk_mode, log_fn
     )
-    seen_domains_this_run = set()
+    seen_domains_this_run: set[str] = set()
 
     for c in all_candidates:
         link         = c["link"]
@@ -1055,62 +1166,64 @@ async def _find_best_candidate(
         # L1: Exact URL — posted=true only
         r = _query_posted_field(
             databases, database_id, collection_id,
-            "link", link[:DB_LINK_MAX], sdk_mode,
+            "link", link[:DB_LINK_MAX], sdk_mode, log_fn,
         )
         if r is True:
-            print(f"[SKIP] L1(posted_dup): {title[:58]}")
+            log_fn(f"[SKIP] L1(posted): {title[:58]}")
             continue
 
         # L2: Content hash — posted=true only
         r = _query_posted_field(
             databases, database_id, collection_id,
-            "content_hash", content_hash, sdk_mode,
+            "content_hash", content_hash, sdk_mode, log_fn,
         )
         if r is True:
-            print(f"[SKIP] L2(posted_dup): {title[:58]}")
+            log_fn(f"[SKIP] L2(posted): {title[:58]}")
             continue
 
         # L2b: Title hash — posted=true only
         r = _query_posted_field(
             databases, database_id, collection_id,
-            "title_hash", title_hash, sdk_mode,
+            "title_hash", title_hash, sdk_mode, log_fn,
         )
         if r is True:
-            print(f"[SKIP] L2b(posted_dup): {title[:58]}")
+            log_fn(f"[SKIP] L2b(posted): {title[:58]}")
             continue
 
-        # L3: Fuzzy title — against posted=true titles only
+        # L3: Fuzzy — against posted=true titles only
         is_fuzz, matched, fuzz_score = _fuzzy_duplicate(
             title, recent_titles
         )
         if is_fuzz:
-            print(
+            log_fn(
                 f"[SKIP] L3 fuzzy={fuzz_score:.2f}: "
                 f"{title[:45]} ≈ {(matched or '')[:35]}"
             )
             continue
 
-        # L4b: Cross-run domain — informational only
+        # L4b: Domain — informational only
         if domain_hash in recent_domain_hashes:
-            print(
-                f"[INFO] L4b: domain {domain} seen recently "
-                f"— not blocking."
-            )
+            log_fn(f"[INFO] L4b: domain {domain} seen recently.")
 
         # L4a: One domain per run
         if domain in seen_domains_this_run:
-            print(f"[SKIP] L4a domain/run ({domain}): {title[:58]}")
+            log_fn(f"[SKIP] L4a domain/run ({domain}): {title[:58]}")
             continue
 
         seen_domains_this_run.add(domain)
-        print(f"[INFO] PASS fuzz={fuzz_score:.2f}: {title[:58]}")
+        log_fn(f"[PASS] fuzz={fuzz_score:.2f}: {title[:58]}")
         return c
 
-    print("[INFO] All candidates exhausted.")
+    log_fn("[feed] All candidates exhausted.")
     return None
 
 
-def _fetch_feed(feed_url: str, time_threshold: datetime) -> list:
+def _fetch_feed(
+    feed_url: str,
+    time_threshold: datetime,
+    log_fn=print,
+) -> list:
+    """Parse one RSS feed. Returns list of candidate dicts."""
     import socket
     try:
         old = socket.getdefaulttimeout()
@@ -1118,7 +1231,7 @@ def _fetch_feed(feed_url: str, time_threshold: datetime) -> list:
         feed = feedparser.parse(feed_url)
         socket.setdefaulttimeout(old)
     except Exception as e:
-        print(f"[WARN] feedparser ({feed_url[:45]}): {e}")
+        log_fn(f"[feed] feedparser ({feed_url[:45]}): {e}")
         return []
 
     candidates = []
@@ -1151,7 +1264,11 @@ def _fetch_feed(feed_url: str, time_threshold: datetime) -> list:
     return candidates
 
 
-def _score_article(candidate: dict, now: datetime, is_peak: bool = False) -> int:
+def _score_article(
+    candidate: dict,
+    now: datetime,
+    is_peak: bool = False,
+) -> int:
     score     = 0
     age_hours = (now - candidate["pub_date"]).total_seconds() / 3600
     combined  = (candidate["title"] + " " + candidate["description"]).lower()
@@ -1166,8 +1283,7 @@ def _score_article(candidate: dict, now: datetime, is_peak: bool = False) -> int
     desc_lower  = candidate["description"].lower()
     matched     = 0
     for kw in TREND_KEYWORDS:
-        if matched >= 3:
-            break
+        if matched >= 3: break
         if kw in title_lower:
             score += SCORE_TITLE_KEYWORD; matched += 1
         elif kw in desc_lower:
@@ -1175,10 +1291,8 @@ def _score_article(candidate: dict, now: datetime, is_peak: bool = False) -> int
 
     if _extract_rss_image(candidate["entry"]):
         score += SCORE_HAS_IMAGE
-
     if len(candidate["description"]) > 200:
         score += SCORE_DESC_LENGTH
-
     if is_peak:
         score += PEAK_HOUR_BONUS
 
@@ -1204,10 +1318,10 @@ def _detect_category(title: str, description: str) -> str:
     return "general"
 
 
-def _extract_hashtags_from_text(text: str) -> list:
+def _extract_hashtags_from_text(text: str) -> list[str]:
     lower    = text.lower()
     hashtags = []
-    seen     = set()
+    seen: set[str] = set()
     for keyword, tags in HASHTAG_MAP.items():
         if keyword in lower and keyword not in seen:
             hashtags.append(tags)
@@ -1218,7 +1332,7 @@ def _extract_hashtags_from_text(text: str) -> list:
 
 
 # ═══════════════════════════════════════════════════════════
-# SECTION 6 — DEDUPLICATION (state-aware)
+# SECTION 8 — DEDUPLICATION (state-aware, posted=true only)
 # ═══════════════════════════════════════════════════════════
 
 def _light_duplicate_check(
@@ -1229,14 +1343,12 @@ def _light_duplicate_check(
     content_hash: str,
     title_hash: str,
     sdk_mode: str,
+    log_fn=print,
 ) -> tuple[bool, str]:
     """
-    Pre-AI duplicate check. Blocks ONLY confirmed posted articles.
-    locked/failed/missing records are treated as safe to proceed.
-
-    Returns (True, reason) if confirmed duplicate.
-    Returns (False, "") if safe to proceed.
-    DB errors treated as SAFE (avoid permanent blocking).
+    Pre-AI check. Blocks ONLY confirmed posted=true articles.
+    locked/failed/missing → safe to proceed.
+    DB errors → treated as safe (non-blocking).
     """
     for field, value in [
         ("link",         link[:DB_LINK_MAX]),
@@ -1245,11 +1357,10 @@ def _light_duplicate_check(
     ]:
         r = _query_posted_field(
             databases, database_id, collection_id,
-            field, value, sdk_mode,
+            field, value, sdk_mode, log_fn,
         )
         if r is True:
             return True, f"posted_{field}"
-        # r is None (DB error) → treat as safe (non-blocking)
     return False, ""
 
 
@@ -1260,14 +1371,11 @@ def _query_posted_field(
     field: str,
     value: str,
     sdk_mode: str,
+    log_fn=print,
 ) -> bool | None:
     """
     Query whether a record exists with field=value AND posted=true.
-
-    Returns:
-        True  → confirmed posted duplicate
-        False → not found, or found but NOT posted
-        None  → DB error (caller treats as safe/non-blocking)
+    Returns True (dup), False (safe), None (DB error → safe).
     """
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", DeprecationWarning)
@@ -1291,10 +1399,10 @@ def _query_posted_field(
                 )
             return r["total"] > 0
         except AppwriteException as e:
-            print(f"[dedup] _query_posted_field ({field}): {e.message}")
+            log_fn(f"[dedup] _query_posted_field ({field}): {e.message}")
             return None
         except Exception as e:
-            print(f"[dedup] _query_posted_field ({field}): {e}")
+            log_fn(f"[dedup] _query_posted_field ({field}): {e}")
             return None
 
 
@@ -1304,13 +1412,9 @@ def _load_recent_titles_posted_only(
     collection_id: str,
     sdk_mode: str,
     limit: int,
+    log_fn=print,
 ) -> list:
-    """
-    Load recent titles for fuzzy matching.
-    ONLY loads posted=true records.
-    locked/failed records excluded — they should not
-    block their own retry via fuzzy similarity.
-    """
+    """Load recent posted=true titles for fuzzy matching."""
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", DeprecationWarning)
         try:
@@ -1338,7 +1442,7 @@ def _load_recent_titles_posted_only(
                 for d in docs if d.get("title")
             ]
         except Exception as e:
-            print(f"[dedup] _load_recent_titles_posted_only: {e}")
+            log_fn(f"[dedup] _load_recent_titles: {e}")
             return []
 
 
@@ -1347,6 +1451,7 @@ def _load_recent_domain_hashes(
     database_id: str,
     collection_id: str,
     sdk_mode: str,
+    log_fn=print,
 ) -> set:
     """Load domain hashes from posted=true records within DOMAIN_DEDUP_HOURS."""
     cutoff     = datetime.now(timezone.utc) - timedelta(hours=DOMAIN_DEDUP_HOURS)
@@ -1375,12 +1480,12 @@ def _load_recent_domain_hashes(
                 docs = r.get("documents", [])
             return {d["domain_hash"] for d in docs if d.get("domain_hash")}
         except Exception as e:
-            print(f"[dedup] _load_recent_domain_hashes: {e}")
+            log_fn(f"[dedup] _load_recent_domain_hashes: {e}")
             return set()
 
 
 # ═══════════════════════════════════════════════════════════
-# SECTION 7 — SOFT LOCK & STATE TRANSITIONS
+# SECTION 9 — SOFT LOCK & STATE TRANSITIONS
 # ═══════════════════════════════════════════════════════════
 
 def _write_soft_lock(
@@ -1399,27 +1504,26 @@ def _write_soft_lock(
     trend_score: int,
     post_hour: int,
     domain_hash: str,
+    log_fn=print,
 ) -> tuple[bool, str]:
     """
-    Attempt to acquire a distributed soft lock for this article.
+    Acquire distributed soft lock for this article.
 
-    Decision tree for existing records:
-      posted=true              → real duplicate → return (False, reason)
-      status=locked, TTL fresh → active lock   → return (False, reason)
+    Decision tree:
+      posted=true              → real dup       → (False, reason)
+      status=locked, TTL fresh → active lock    → (False, reason)
       status=locked, TTL stale → crash recovery → delete + write new
       status=failed            → retry eligible  → delete + write new
-      any other state          → stale/unknown   → delete + write new
+      unknown state            → stale           → delete + write new
       no record                → new article     → write lock
 
-    Returns:
-        (True,  doc_id)  → lock acquired, proceed
-        (False, reason)  → cannot proceed
+    Returns (True, doc_id) or (False, reason).
     """
     now     = datetime.now(timezone.utc)
     now_iso = now.strftime("%Y-%m-%dT%H:%M:%S.000+00:00")
 
     existing = _get_existing_record(
-        databases, database_id, collection_id, link, sdk_mode
+        databases, database_id, collection_id, link, sdk_mode, log_fn
     )
 
     if existing is not None:
@@ -1428,12 +1532,10 @@ def _write_soft_lock(
         existing_doc_id = existing["$id"]
         locked_at_str   = existing.get("locked_at", "")
 
-        # Case 1: Confirmed posted → real duplicate
         if existing_posted is True or existing_status == STATUS_POSTED:
-            print("[lock] Already posted — real duplicate. Abort.")
+            log_fn("[lock] Already posted — real duplicate.")
             return False, "already_posted"
 
-        # Case 2: Active lock → another instance is processing
         if existing_status == STATUS_LOCKED and locked_at_str:
             try:
                 locked_at = datetime.fromisoformat(
@@ -1441,44 +1543,37 @@ def _write_soft_lock(
                 )
                 age = (now - locked_at).total_seconds()
                 if age < LOCK_TTL_SECONDS:
-                    print(
+                    log_fn(
                         f"[lock] Active lock (age={age:.0f}s "
                         f"< TTL={LOCK_TTL_SECONDS}s). Skip."
                     )
                     return False, "active_lock"
                 else:
-                    print(
-                        f"[lock] Stale lock (age={age:.0f}s). "
-                        f"Recovering."
-                    )
+                    log_fn(f"[lock] Stale lock (age={age:.0f}s). Recovering.")
                     _delete_record(
                         databases, database_id, collection_id,
-                        existing_doc_id, sdk_mode,
+                        existing_doc_id, sdk_mode, log_fn,
                     )
             except Exception as e:
-                print(f"[lock] TTL parse error: {e}. Treating as stale.")
+                log_fn(f"[lock] TTL parse error: {e}. Deleting stale.")
                 _delete_record(
                     databases, database_id, collection_id,
-                    existing_doc_id, sdk_mode,
+                    existing_doc_id, sdk_mode, log_fn,
                 )
-
-        # Case 3: Failed → eligible for retry
         elif existing_status == STATUS_FAILED:
-            print("[lock] Failed record found — retrying.")
+            log_fn("[lock] Failed record — retrying. Deleting old.")
             _delete_record(
                 databases, database_id, collection_id,
-                existing_doc_id, sdk_mode,
+                existing_doc_id, sdk_mode, log_fn,
             )
-
-        # Case 4: Unknown state → treat as stale
         else:
-            print(
+            log_fn(
                 f"[lock] Unknown status='{existing_status}' — "
                 f"treating as stale."
             )
             _delete_record(
                 databases, database_id, collection_id,
-                existing_doc_id, sdk_mode,
+                existing_doc_id, sdk_mode, log_fn,
             )
 
     # Write new lock record
@@ -1522,18 +1617,17 @@ def _write_soft_lock(
                     data=payload,
                 )
             doc_id = doc.get("$id") or doc.get("id", "")
-            print(f"[lock] ✓ Soft lock acquired. doc_id={doc_id}")
+            log_fn(f"[lock] ✓ Soft lock acquired. doc_id={doc_id}")
             return True, doc_id
-
         except AppwriteException as e:
             msg = str(e.message).lower()
             if "already exists" in msg or e.code in (409, 400):
-                print("[lock] Race condition — another instance won lock.")
+                log_fn("[lock] Race condition — another instance won lock.")
                 return False, "race_lost"
-            print(f"[lock] DB write error: {e.message}")
+            log_fn(f"[lock] DB write error: {e.message}")
             return False, f"db_error: {e.message}"
         except Exception as e:
-            print(f"[lock] DB write error: {e}")
+            log_fn(f"[lock] DB write error: {e}")
             return False, f"db_error: {e}"
 
 
@@ -1543,21 +1637,14 @@ def _mark_posted(
     collection_id: str,
     doc_id: str,
     sdk_mode: str,
+    log_fn=print,
 ) -> bool:
-    """
-    Mark record as successfully posted.
-    posted=true written ONLY here, after Telegram confirms success.
-    """
-    now_iso = datetime.now(timezone.utc).strftime(
-        "%Y-%m-%dT%H:%M:%S.000+00:00"
-    )
+    """Mark record as successfully posted. posted=true written ONLY here."""
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000+00:00")
     return _update_record(
         databases, database_id, collection_id, doc_id, sdk_mode,
-        {
-            "status":    STATUS_POSTED,
-            "posted":    True,
-            "posted_at": now_iso,
-        },
+        {"status": STATUS_POSTED, "posted": True, "posted_at": now_iso},
+        log_fn,
     )
 
 
@@ -1568,11 +1655,9 @@ def _mark_failed(
     doc_id: str,
     sdk_mode: str,
     reason: str,
+    log_fn=print,
 ) -> bool:
-    """
-    Mark record as failed. posted remains False.
-    Record is eligible for retry on next execution.
-    """
+    """Mark record as failed. Retryable on next execution."""
     return _update_record(
         databases, database_id, collection_id, doc_id, sdk_mode,
         {
@@ -1580,6 +1665,7 @@ def _mark_failed(
             "posted":      False,
             "fail_reason": reason[:DB_REASON_MAX],
         },
+        log_fn,
     )
 
 
@@ -1590,8 +1676,8 @@ def _update_record(
     doc_id: str,
     sdk_mode: str,
     fields: dict,
+    log_fn=print,
 ) -> bool:
-    """Generic Appwrite document/row update."""
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", DeprecationWarning)
         try:
@@ -1609,10 +1695,10 @@ def _update_record(
                     document_id=doc_id,
                     data=fields,
                 )
-            print(f"[db] {doc_id} updated: {list(fields.keys())}")
+            log_fn(f"[db] {doc_id} → {list(fields.keys())}")
             return True
         except Exception as e:
-            print(f"[db] Update failed ({doc_id}): {e}")
+            log_fn(f"[db] Update failed ({doc_id}): {e}")
             return False
 
 
@@ -1622,11 +1708,9 @@ def _get_existing_record(
     collection_id: str,
     link: str,
     sdk_mode: str,
+    log_fn=print,
 ) -> dict | None:
-    """
-    Fetch any existing record by exact URL match.
-    Returns document dict regardless of status, or None.
-    """
+    """Fetch any existing record by URL, regardless of status."""
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", DeprecationWarning)
         try:
@@ -1650,7 +1734,7 @@ def _get_existing_record(
                 docs = r.get("documents", [])
             return docs[0] if docs else None
         except Exception as e:
-            print(f"[db] _get_existing_record: {e}")
+            log_fn(f"[db] _get_existing_record: {e}")
             return None
 
 
@@ -1660,8 +1744,9 @@ def _delete_record(
     collection_id: str,
     doc_id: str,
     sdk_mode: str,
+    log_fn=print,
 ) -> None:
-    """Delete a stale lock or failed record to allow retry."""
+    """Delete a stale lock or failed record."""
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", DeprecationWarning)
         try:
@@ -1677,19 +1762,20 @@ def _delete_record(
                     collection_id=collection_id,
                     document_id=doc_id,
                 )
-            print(f"[db] Deleted stale record: {doc_id}")
+            log_fn(f"[db] Deleted stale record: {doc_id}")
         except Exception as e:
-            print(f"[db] Delete failed ({doc_id}): {e}")
+            log_fn(f"[db] Delete failed ({doc_id}): {e}")
 
 
 # ═══════════════════════════════════════════════════════════
-# SECTION 8 — HASH & FUZZY UTILITIES
+# SECTION 10 — HASH & FUZZY UTILITIES
 # ═══════════════════════════════════════════════════════════
 
 def _make_content_hash(title: str) -> str:
-    tokens     = _normalize_tokens(title)
-    normalized = " ".join(sorted(tokens))
-    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    tokens = _normalize_tokens(title)
+    return hashlib.sha256(
+        " ".join(sorted(tokens)).encode("utf-8")
+    ).hexdigest()
 
 def _make_title_hash(title: str, feed_url: str) -> str:
     raw = (title.lower().strip() + feed_url[:50]).encode("utf-8")
@@ -1701,11 +1787,9 @@ def _make_domain_hash(domain: str) -> str:
     ).hexdigest()[:DB_DOMAIN_HASH_MAX]
 
 def _normalize_tokens(title: str) -> frozenset:
-    title  = title.lower()
-    title  = re.sub(r"[^a-z0-9\s]", " ", title)
-    tokens = title.split()
+    title  = re.sub(r"[^a-z0-9\s]", " ", title.lower())
     return frozenset(
-        t for t in tokens
+        t for t in title.split()
         if t not in TITLE_STOP_WORDS and len(t) >= 2
     )
 
@@ -1716,8 +1800,7 @@ def _jaccard(a: frozenset, b: frozenset) -> float:
 def _fuzzy_duplicate(
     title: str, recent_titles: list
 ) -> tuple[bool, str | None, float]:
-    if not recent_titles:
-        return False, None, 0.0
+    if not recent_titles: return False, None, 0.0
     incoming   = _normalize_tokens(title)
     best_score = 0.0
     best_match = None
@@ -1739,7 +1822,7 @@ def _get_domain(url: str) -> str:
 
 
 # ═══════════════════════════════════════════════════════════
-# SECTION 9 — SCRAPING
+# SECTION 11 — SCRAPING
 # ═══════════════════════════════════════════════════════════
 
 def _select_content(
@@ -1753,11 +1836,8 @@ def _select_content(
         return description[:MAX_RSS_CHARS]
     return title
 
-def _extract_first_sentence(text: str) -> str:
-    parts = re.split(r"(?<=[.!?])\s+", text.strip())
-    return parts[0][:DB_TITLE_MAX] if parts else text[:DB_TITLE_MAX]
 
-def _scrape_text(url: str) -> str | None:
+def _scrape_text(url: str, log_fn=print) -> str | None:
     try:
         resp = requests.get(
             url,
@@ -1790,7 +1870,7 @@ def _scrape_text(url: str) -> str | None:
         area      = body or soup
         TARGET    = {"p", "h2", "h3", "h4", "li"}
         lines     = []
-        seen_keys = set()
+        seen_keys: set[str] = set()
         for el in area.find_all(TARGET):
             raw = re.sub(r"\s+", " ", el.get_text(" ").strip())
             if len(raw) < 25: continue
@@ -1811,19 +1891,19 @@ def _scrape_text(url: str) -> str | None:
         text = "\n".join(lines).strip()
         return text[:MAX_SCRAPED_CHARS] if len(text) >= 100 else None
     except requests.exceptions.Timeout:
-        print(f"[WARN] Text scrape timeout: {url[:60]}")
+        log_fn(f"[scrape] Timeout: {url[:60]}")
         return None
     except requests.exceptions.HTTPError as e:
-        print(f"[WARN] Text scrape HTTP {e.response.status_code}: {url[:60]}")
+        log_fn(f"[scrape] HTTP {e.response.status_code}: {url[:60]}")
         return None
     except Exception as e:
-        print(f"[WARN] Text scrape: {e}")
+        log_fn(f"[scrape] Error: {e}")
         return None
 
 
-def _scrape_images(url: str, rss_entry) -> list:
-    images = []
-    seen   = set()
+def _scrape_images(url: str, rss_entry, log_fn=print) -> list:
+    images: list[str] = []
+    seen:   set[str]  = set()
 
     def _add(img_url: str):
         if not img_url: return
@@ -1840,13 +1920,6 @@ def _scrape_images(url: str, rss_entry) -> list:
         if not has_ext and not has_word: return
         seen.add(img_url)
         images.append(img_url)
-
-    IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
-    IMAGE_BLOCKLIST  = [
-        "doubleclick", "googletagmanager", "googlesyndication",
-        "facebook.com/tr", "analytics", "pixel", "beacon",
-        "tracking", "counter", "stat.", "stats.",
-    ]
 
     try:
         resp = requests.get(
@@ -1887,20 +1960,19 @@ def _scrape_images(url: str, rss_entry) -> list:
                     _add(srcset.split(",")[0].strip().split(" ")[0])
                 if len(images) >= MAX_IMAGES: break
     except Exception as e:
-        print(f"[WARN] Image scrape: {e}")
+        log_fn(f"[scrape] Image error: {e}")
 
     if len(images) < MAX_IMAGES:
         rss_img = _extract_rss_image(rss_entry)
         if rss_img:
             _add(rss_img)
 
-    print(f"[INFO] Images collected: {len(images)}")
+    log_fn(f"[scrape] Images collected: {len(images)}")
     return images[:MAX_IMAGES]
 
 
 def _extract_rss_image(entry) -> str | None:
     if entry is None: return None
-    IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
     try:
         for m in entry.get("media_content", []):
             if m.get("url") and m.get("medium") == "image":
@@ -1937,59 +2009,9 @@ def _extract_rss_image(entry) -> str | None:
 
 
 # ═══════════════════════════════════════════════════════════
-# SECTION 10 — CAPTION BUILDER
-# ═══════════════════════════════════════════════════════════
-
-def _build_caption(
-    title_fa: str,
-    body_fa: str,
-    hashtags: list,
-    category: str,
-) -> str:
-    def _esc(t: str) -> str:
-        return t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-    CATEGORY_EMOJI = {
-        "runway": "👗", "brand": "🏷️", "business": "📊",
-        "beauty": "💄", "sustainability": "♻️", "celebrity": "⭐",
-        "trend": "🔥", "general": "🌐",
-    }
-    emoji     = CATEGORY_EMOJI.get(category, "🌐")
-    hash_line = " ".join(hashtags)
-
-    header = f"<b>{_esc(title_fa.strip())}</b>"
-    sep    = "─────────────\n@irfashionnews"
-    footer = f"{emoji}  <i>کانال مد و فشن ایرانی</i>"
-
-    fixed_parts = [header, sep, footer]
-    if hash_line:
-        fixed_parts.append(hash_line)
-    fixed_len   = len("\n\n".join(fixed_parts))
-    body_budget = CAPTION_MAX - fixed_len - 4
-
-    safe_body = _esc(body_fa.strip())
-
-    if body_budget <= 10:
-        safe_body = ""
-        header    = f"<b>{_esc(title_fa.strip())[:CAPTION_MAX - 80]}</b>"
-    elif len(safe_body) > body_budget:
-        safe_body = safe_body[:body_budget - 1] + "…"
-
-    parts = [header, sep]
-    if safe_body:
-        parts.append(safe_body)
-    parts.append(footer)
-    if hash_line:
-        parts.append(hash_line)
-
-    caption = "\n\n".join(parts)
-    if len(caption) > CAPTION_MAX:
-        caption = caption[:CAPTION_MAX - 1] + "…"
-    return caption
-
-
-# ═══════════════════════════════════════════════════════════
-# SECTION 11 — TELEGRAM POSTING
+# SECTION 12 — TELEGRAM POSTING
+# Images sent first as media group (anchor).
+# Caption sent as reply to anchor (protocol-level ordering).
 # ═══════════════════════════════════════════════════════════
 
 async def _post_to_telegram(
@@ -1997,13 +2019,15 @@ async def _post_to_telegram(
     chat_id: str,
     caption: str,
     image_urls: list,
+    log_fn=print,
 ) -> bool:
     anchor_msg_id = None
     posted        = False
 
+    # ── Step 1: Send images ──
     if len(image_urls) >= 2:
         try:
-            media_group = [
+            media_group   = [
                 InputMediaPhoto(media=url)
                 for url in image_urls[:MAX_IMAGES]
             ]
@@ -2012,12 +2036,12 @@ async def _post_to_telegram(
                 disable_notification=True,
             )
             anchor_msg_id = sent_msgs[-1].message_id
-            print(
-                f"[INFO] ① Album: {len(sent_msgs)} images. "
+            log_fn(
+                f"[tg] ① Album: {len(sent_msgs)} images. "
                 f"anchor={anchor_msg_id}"
             )
         except Exception as e:
-            print(f"[WARN] ① Album failed: {str(e)[:120]}")
+            log_fn(f"[tg] ① Album failed: {str(e)[:120]}")
             if image_urls:
                 try:
                     sent          = await bot.send_photo(
@@ -2025,12 +2049,9 @@ async def _post_to_telegram(
                         disable_notification=True,
                     )
                     anchor_msg_id = sent.message_id
-                    print(
-                        f"[INFO] ① Fallback photo. "
-                        f"anchor={anchor_msg_id}"
-                    )
+                    log_fn(f"[tg] ① Fallback photo. anchor={anchor_msg_id}")
                 except Exception as e2:
-                    print(f"[WARN] ① Photo fallback failed: {str(e2)[:80]}")
+                    log_fn(f"[tg] ① Photo fallback failed: {str(e2)[:80]}")
 
     elif len(image_urls) == 1:
         try:
@@ -2039,16 +2060,18 @@ async def _post_to_telegram(
                 disable_notification=True,
             )
             anchor_msg_id = sent.message_id
-            print(f"[INFO] ① Single photo. anchor={anchor_msg_id}")
+            log_fn(f"[tg] ① Single photo. anchor={anchor_msg_id}")
         except Exception as e:
-            print(f"[WARN] ① Single photo failed: {str(e)[:120]}")
+            log_fn(f"[tg] ① Single photo failed: {str(e)[:120]}")
     else:
-        print("[INFO] ① No images — caption standalone.")
+        log_fn("[tg] ① No images — caption standalone.")
 
+    # ── Step 2: Delay ──
     if anchor_msg_id is not None:
-        print(f"[INFO] ② Waiting {ALBUM_CAPTION_DELAY}s...")
+        log_fn(f"[tg] ② Waiting {ALBUM_CAPTION_DELAY}s...")
         await asyncio.sleep(ALBUM_CAPTION_DELAY)
 
+    # ── Step 3: Send caption (reply to anchor) ──
     try:
         kwargs: dict = {
             "chat_id":              chat_id,
@@ -2060,16 +2083,16 @@ async def _post_to_telegram(
         if anchor_msg_id is not None:
             kwargs["reply_to_message_id"] = anchor_msg_id
         await bot.send_message(**kwargs)
-        anchor_info = (
-            f"reply_to={anchor_msg_id}"
-            if anchor_msg_id else "standalone"
+        log_fn(
+            f"[tg] ③ Caption sent "
+            f"({'reply_to=' + str(anchor_msg_id) if anchor_msg_id else 'standalone'})."
         )
-        print(f"[INFO] ③ Caption sent ({anchor_info}).")
         posted = True
     except Exception as e:
-        print(f"[ERROR] ③ Caption failed: {str(e)[:120]}")
+        log_fn(f"[tg] ③ Caption failed: {str(e)[:120]}")
         return False
 
+    # ── Step 4: Sticker ──
     if posted and FASHION_STICKERS:
         await asyncio.sleep(STICKER_DELAY)
         try:
@@ -2078,39 +2101,30 @@ async def _post_to_telegram(
                 sticker=random.choice(FASHION_STICKERS),
                 disable_notification=True,
             )
-            print("[INFO] ④ Sticker sent.")
+            log_fn("[tg] ④ Sticker sent.")
         except Exception as e:
-            print(f"[WARN] ④ Sticker failed (non-fatal): {str(e)[:80]}")
+            log_fn(f"[tg] ④ Sticker failed (non-fatal): {str(e)[:80]}")
 
     return posted
 
 
 # ═══════════════════════════════════════════════════════════
-# SECTION 12 — ONE-TIME DB CLEANUP UTILITY
-#
-# Run once via: python main.py --cleanup
+# SECTION 13 — ONE-TIME DB CLEANUP UTILITY
+# Run: python main.py --cleanup
 # Deletes all records where posted != true.
-# Safe to run while bot is paused.
-# Fixes the graveyard of unposted records from previous runs.
 # ═══════════════════════════════════════════════════════════
 
 def _run_cleanup():
-    """
-    One-time cleanup of unposted records.
-    Deletes everything where posted is not True.
-    Leaves all posted=true records intact.
-    """
     print("[cleanup] Starting unposted record purge...")
-
     aw_client = Client()
     aw_client.set_endpoint(
         os.environ.get("APPWRITE_ENDPOINT", "https://cloud.appwrite.io/v1")
     )
     aw_client.set_project(os.environ.get("APPWRITE_PROJECT_ID", ""))
     aw_client.set_key(os.environ.get("APPWRITE_API_KEY", ""))
-    databases  = Databases(aw_client)
-    db_id      = os.environ.get("APPWRITE_DATABASE_ID", "")
-    col_id     = COLLECTION_ID
+    databases = Databases(aw_client)
+    db_id     = os.environ.get("APPWRITE_DATABASE_ID", "")
+    col_id    = COLLECTION_ID
 
     deleted = 0
     kept    = 0
@@ -2135,9 +2149,8 @@ def _run_cleanup():
             break
 
         for doc in docs:
-            doc_id     = doc["$id"]
-            is_posted  = doc.get("posted", False)
-            is_posted  = is_posted is True or is_posted == "true"
+            doc_id    = doc["$id"]
+            is_posted = doc.get("posted", False) is True
 
             if not is_posted:
                 try:
@@ -2146,10 +2159,7 @@ def _run_cleanup():
                         collection_id=col_id,
                         document_id=doc_id,
                     )
-                    print(
-                        f"[cleanup] DELETED: "
-                        f"{doc.get('title', doc_id)[:60]}"
-                    )
+                    print(f"[cleanup] DELETED: {doc.get('title', doc_id)[:60]}")
                     deleted += 1
                 except Exception as e:
                     print(f"[cleanup] Delete failed ({doc_id}): {e}")
@@ -2160,10 +2170,7 @@ def _run_cleanup():
         if len(docs) < 100:
             break
 
-    print(
-        f"[cleanup] Done. "
-        f"Deleted={deleted} unposted | Kept={kept} posted."
-    )
+    print(f"[cleanup] Done. Deleted={deleted} | Kept={kept}")
 
 
 # ═══════════════════════════════════════════════════════════
@@ -2174,27 +2181,23 @@ if __name__ == "__main__":
     import sys
 
     if "--cleanup" in sys.argv:
-        # One-time DB cleanup: python main.py --cleanup
         _run_cleanup()
-
     elif len(sys.argv) > 1 and sys.argv[1].startswith("http"):
-        # Direct URL test: python main.py <url>
-        test_url = sys.argv[1]
-        print(f"[LOCAL] Testing process_article: {test_url}")
+        url = sys.argv[1]
+        print(f"[LOCAL] Testing URL: {url}")
 
         async def _test():
-            result = await process_article(url=test_url)
-            print("\n── RESULT ──")
-            for k, v in result.items():
-                if k == "caption":
-                    print(f"  {k} ({len(v)}ch):\n{v}\n")
-                elif k == "image_urls":
-                    print(f"  {k}: {v[:2]}")
-                else:
-                    print(f"  {k}: {str(v)[:120]}")
+            content = _scrape_text(url) or url
+            body_p  = _PROMPT_BODY.format(input_text=content[:3000])
+            title_p = _PROMPT_TITLE.format(input_text=url[:200])
+            tip_p   = _PROMPT_TIP.format(input_text=content[:1500])
+            b, t, tip = await _run_three_races(body_p, title_p, tip_p)
+            hashtags  = _extract_hashtags_from_text(content[:500])
+            caption   = _build_mehrjameh_caption(
+                t or "عنوان", b or "متن", tip or "", hashtags, "general"
+            )
+            print(f"\n── CAPTION ({len(caption)}ch) ──\n{caption}\n")
 
         asyncio.run(_test())
-
     else:
-        # Full RSS pipeline
         asyncio.run(main())
