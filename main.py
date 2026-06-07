@@ -345,10 +345,8 @@ def _detect_schema(
             return True
         except AppwriteException as e:
             msg = str(e.message).lower()
-            # "attribute not found" = field does not exist
             if "attribute not found" in msg:
                 return False
-            # Other error = field probably exists, DB issue
             return True
         except Exception:
             return False
@@ -1342,26 +1340,17 @@ def _extract_rss_image(entry) -> str | None:
 
 
 async def _find_best_candidate(
-    feeds: list[str],
-    databases,
-    database_id: str,
-    collection_id: str,
-    time_threshold: datetime,
-    sdk_mode: str,
-    schema=None,
-    now: datetime = None,
-    recent_titles: list[str] = None,
-    is_peak: bool = False,
-    log_fn=print,
-) -> dict | None:
-    if now is None:
-        now = datetime.now(timezone.utc)
-    if recent_titles is None:
-        recent_titles = []
-
+    feeds, databases, database_id, collection_id,
+    time_threshold, sdk_mode, schema, now,
+    recent_titles, is_peak, log_fn=print,
+):
     recent_domains = _load_recent_domain_hashes(
-        databases, database_id, collection_id, sdk_mode,
-        schema, log_fn,
+        databases=databases,
+        db_id=database_id,
+        coll_id=collection_id,
+        sdk_mode=sdk_mode,
+        schema=schema,
+        log_fn=log_fn,
     )
 
     candidates = []
@@ -1407,7 +1396,14 @@ async def _find_best_candidate(
 
                 norm_title = _clean_title(title)
                 
-                if any(_fuzzy_similarity(norm_title, rt) > FUZZY_SIMILARITY_THRESHOLD for rt in recent_titles):
+                # Unwrap recent_titles correctly if it's stored as (title, tokens) tuples
+                is_fuzz_dup = False
+                for rt in recent_titles:
+                    rt_title = rt[0] if isinstance(rt, tuple) else rt
+                    if _fuzzy_similarity(norm_title, rt_title) > FUZZY_SIMILARITY_THRESHOLD:
+                        is_fuzz_dup = True
+                        break
+                if is_fuzz_dup:
                     continue
 
                 domain = _get_domain(link)
@@ -1598,11 +1594,11 @@ def _select_content(scraped: str | None, desc: str, title: str) -> str:
 # ═══════════════════════════════════════════════════════════
 
 def _write_soft_lock(
-    databases, database_id: str, collection_id: str,
-    link: str, title: str, feed_url: str, pub_date: str,
-    source_type: str, sdk_mode: str, schema: SchemaInfo,
-    title_hash: str, content_hash: str, category: str,
-    trend_score: int, post_hour: int, domain_hash: str,
+    databases, database_id, collection_id,
+    link, title, feed_url, pub_date, source_type,
+    sdk_mode, schema: SchemaInfo,
+    title_hash, content_hash, category,
+    trend_score, post_hour, domain_hash,
     log_fn=print,
 ) -> tuple[bool, str]:
     now     = datetime.now(timezone.utc)
