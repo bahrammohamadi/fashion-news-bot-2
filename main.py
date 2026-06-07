@@ -51,12 +51,19 @@
 #       - Google Gemini added as Priority 1 (highest priority).
 #       - Falls back to Groq/OpenRouter only if Gemini fails or has no key.
 #       - Added support for GEMINI_API_KEY, GOOGLE_API_KEY, and GOOGLE_AI_KEY.
+#       - Updated Gemini Models to support latest 2.5-flash & 2.5-pro models.
 #
 #   FIX 7 — EMBEDDED CAPTION POSTING:
 #     Problem: Images and caption sent separately.
 #     Solution:
 #       - Captions are now safely embedded inside the first photo of the album
 #         or the single photo, as a single unified Telegram post!
+#
+#   FIX 8 — SYSTEM FIELD $createdAt REALIGNMENT:
+#     Problem: 'Attribute not found in schema: created_at' and 'Unknown attribute: created_at'
+#     Solution:
+#       - Replaced all query logic to utilize Appwrite's native '$createdAt' system field.
+#       - Removed raw 'created_at' from DB insertion payloads.
 # ============================================================
 
 
@@ -148,7 +155,9 @@ OPENROUTER_TEMPERATURE = 0.4
 
 # ── Google Gemini ──
 GEMINI_MODELS = [
+    "gemini-2.5-flash",
     "gemini-1.5-flash",
+    "gemini-2.5-pro",
     "gemini-1.5-pro",
 ]
 
@@ -315,29 +324,43 @@ def _detect_schema(
     databases,
     database_id: str,
     collection_id: str,
+    sdk_mode: str,
     log_fn=print,
 ) -> SchemaInfo:
-    """Queries Appwrite collection attributes to map capabilities."""
-    info = SchemaInfo()
-    try:
-        # Appwrite SDK doesn't expose list_attributes natively in some versions.
-        # We perform a safe lightweight query to detect existing fields.
-        # If the query fails with "attribute not found", that field is absent.
-        
-        # Link always exists (V10 core)
-        info.has_posted      = _test_attribute(databases, database_id, collection_id, "posted")
-        info.has_status      = _test_attribute(databases, database_id, collection_id, "status")
-        info.has_locked_at   = _test_attribute(databases, database_id, collection_id, "locked_at")
-        info.has_posted_at   = _test_attribute(databases, database_id, collection_id, "posted_at")
-        info.has_fail_reason = _test_attribute(databases, database_id, collection_id, "fail_reason")
-        
-        info.has_content_hash = _test_attribute(databases, database_id, collection_id, "content_hash")
-        info.has_title_hash   = _test_attribute(databases, database_id, collection_id, "title_hash")
-        info.has_domain_hash  = _test_attribute(databases, database_id, collection_id, "domain_hash")
+    """
+    Probe the Appwrite collection schema by attempting
+    lightweight test queries for each optional field.
 
-    except Exception as e:
-        log_fn(f"[schema] Error detecting: {e}. Defaulting to V10.")
-        # Default V10: only has link, title, feed_url, source_type, created_at
+    Returns SchemaInfo with boolean flags for each field.
+    Never raises — returns minimal SchemaInfo on any error.
+    """
+    info = SchemaInfo()
+
+    def _probe(field: str, value) -> bool:
+        """Returns True if field exists in schema."""
+        try:
+            queries = [Query.equal(field, value), Query.limit(1)]
+            _db_list(databases, database_id, collection_id,
+                     queries, sdk_mode)
+            return True
+        except AppwriteException as e:
+            msg = str(e.message).lower()
+            # "attribute not found" = field does not exist
+            if "attribute not found" in msg:
+                return False
+            # Other error = field probably exists, DB issue
+            return True
+        except Exception:
+            return False
+
+    info.has_posted       = _probe("posted",       True)
+    info.has_status       = _probe("status",       STATUS_POSTED)
+    info.has_locked_at    = _probe("locked_at",    "")
+    info.has_posted_at    = _probe("posted_at",    "")
+    info.has_fail_reason  = _probe("fail_reason",  "")
+    info.has_content_hash = _probe("content_hash", "x")
+    info.has_title_hash   = _probe("title_hash",   "x")
+    info.has_domain_hash  = _probe("domain_hash",  "x")
 
     log_fn(f"[schema] Detected: {info}")
     if not info.is_v11:
@@ -347,38 +370,6 @@ def _detect_schema(
             "Falling back to link-only dedup."
         )
     return info
-
-
-def _test_attribute(databases, db_id: str, coll_id: str, key: str) -> bool:
-    """Tests if an attribute can be queried without throwing a 400 error."""
-    try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", DeprecationWarning)
-            # Query with a dummy value.
-            # If the attribute does NOT exist, Appwrite throws 400 AppwriteException.
-            # If it exists but is empty, it returns 200 with an empty list.
-            databases.list_documents(
-                database_id=db_id,
-                collection_id=coll_id,
-                queries=[Query.equal(key, "dummy_probe_value_safe_to_ignore")],
-            )
-        return True
-    except AppwriteException as e:
-        if e.code == 400: # Attribute not found
-            return False
-        return True # Any other error (unauthorized etc) means the field likely exists
-    except Exception:
-        return False
-
-
-def _detect_schema_fields(
-    databases,
-    database_id: str,
-    collection_id: str,
-    log_fn=print,
-) -> SchemaInfo:
-    """Fallback alias."""
-    return _detect_schema(databases, database_id, collection_id, log_fn)
 
 
 def _to_dict_safe(obj):
@@ -392,7 +383,6 @@ def _to_dict_safe(obj):
         return obj
     if hasattr(obj, "to_dict"):
         return obj.to_dict()
-    # Support instances that have a dictionary structure or __dict__
     if hasattr(obj, "__dict__"):
         return getattr(obj, "__dict__")
     return obj
@@ -580,7 +570,6 @@ def _query_field_safe(
 def _detect_sdk_mode(databases, database_id: str, collection_id: str) -> str:
     """Determines if Appwrite SDK uses tablesDB/list_rows or databases/list_documents."""
     try:
-        # Check if list_rows exists on databases service
         if hasattr(databases, "list_rows"):
             return "new"
     except Exception:
@@ -653,8 +642,6 @@ async def _call_groq(
 ) -> str | None:
     """
     Groq API caller with model fallback chain.
-    Tries each model in GROQ_MODELS until one succeeds.
-    Skips decommissioned models (HTTP 400 with decommission msg).
     """
     api_key = os.environ.get("GROQ_API_KEY", "").strip()
     if not api_key:
@@ -683,7 +670,6 @@ async def _call_groq(
                 body_text = await resp.text()
 
                 if resp.status == 400:
-                    # Check if this is a decommissioned model error
                     if "decommission" in body_text.lower():
                         log_fn(
                             f"[race] Groq model {model} decommissioned — "
@@ -713,7 +699,6 @@ async def _call_groq(
                 )
                 if valid:
                     return result
-                # Invalid result — try next model
                 continue
 
         except asyncio.CancelledError:
@@ -737,8 +722,6 @@ async def _call_openrouter(
 ) -> str | None:
     """
     OpenRouter API caller with model fallback chain.
-    Tries free model first, paid model as fallback.
-    Skips on 401 (invalid key).
     """
     api_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
     if not api_key:
@@ -769,7 +752,6 @@ async def _call_openrouter(
                 body_text = await resp.text()
 
                 if resp.status == 401:
-                    # Key is invalid — no point trying other models
                     log_fn(
                         f"[race] OpenRouter: 401 invalid key — "
                         f"skipping all OR models."
@@ -777,7 +759,6 @@ async def _call_openrouter(
                     return None
 
                 if resp.status == 402:
-                    # Insufficient credits for paid model
                     log_fn(
                         f"[race] OpenRouter/{model}: 402 credits — "
                         f"trying next."
@@ -1161,7 +1142,6 @@ def _levenshtein_distance(s1: str, s2: str) -> int:
 
 
 def _fuzzy_similarity(s1: str, s2: str) -> float:
-    """Calculates Levenshtein-based similarity ratio."""
     normalized1 = _clean_title(s1)
     normalized2 = _clean_title(s2)
     max_len = max(len(normalized1), len(normalized2))
@@ -1176,18 +1156,11 @@ def _load_recent_titles_posted_only(
     sdk_mode: str, count: int = 150,
     schema=None, log_fn=print,
 ) -> list[str]:
-    """
-    Loads normalized titles of successfully posted articles.
-    If schema.has_posted is True, we filter by posted=True.
-    Otherwise, we pull last N records as best effort.
-    """
     try:
         queries = [
-            Query.order_desc("created_at"),
+            Query.order_desc("$createdAt"),
             Query.limit(count),
         ]
-        # v11 schema: blocks posted=true only.
-        # Fallback schema: pulls last N of any status.
         if schema and schema.has_status:
             queries.append(Query.equal("status", STATUS_POSTED))
         elif schema and schema.has_posted:
@@ -1197,14 +1170,13 @@ def _load_recent_titles_posted_only(
         docs = res.get("documents", []) if isinstance(res, dict) else []
         titles = []
         for doc in docs:
-            # Handle list_rows vs list_documents object model compatibility
             doc_dict = _to_dict_safe(doc)
             title_val = doc_dict.get("title") if isinstance(doc_dict, dict) else None
             if title_val:
                 titles.append(_clean_title(title_val))
         return titles
     except Exception as e:
-        log_fn(f"[dedup] *load*recent_titles: {e}")
+        log_fn(f"[dedup] _load_recent_titles: {e}")
         return []
 
 
@@ -1213,7 +1185,6 @@ def _load_recent_domain_hashes(
     sdk_mode: str, hours: int = DOMAIN_DEDUP_HOURS,
     schema=None, log_fn=print,
 ) -> set[str]:
-    """Loads domain hashes posted in the last X hours to prevent flood of same site."""
     if not schema or not schema.has_domain_hash:
         return set()
     try:
@@ -1221,7 +1192,7 @@ def _load_recent_domain_hashes(
         threshold_iso = threshold.isoformat().replace("+00:00", "Z")
         
         queries = [
-            Query.greater_than_equal("created_at", threshold_iso),
+            Query.greater_than("$createdAt", threshold_iso),
             Query.limit(100),
         ]
         if schema.has_status:
@@ -1239,7 +1210,7 @@ def _load_recent_domain_hashes(
                 hashes.add(dh_val)
         return hashes
     except Exception as e:
-        log_fn(f"[dedup] *load*recent_domain_hashes: {e}")
+        log_fn(f"[dedup] _load_recent_domain_hashes: {e}")
         return set()
 
 
@@ -1248,11 +1219,6 @@ def _light_duplicate_check(
     link: str, content_hash: str, title_hash: str,
     sdk_mode: str, schema=None, log_fn=print,
 ) -> tuple[bool, str]:
-    """
-    Performs O(1) query-based duplicate checks.
-    Returns (is_duplicate, reason).
-    """
-    # 1. Exact URL check (always exists)
     try:
         res = _db_list(
             databases, db_id, coll_id,
@@ -1265,7 +1231,6 @@ def _light_duplicate_check(
     except Exception as e:
         log_fn(f"[dedup] *query*field_safe (link): {e}")
 
-    # 2. Content Hash check (if exists)
     if schema and schema.has_content_hash:
         try:
             res = _query_field_safe(
@@ -1278,7 +1243,6 @@ def _light_duplicate_check(
         except Exception as e:
             log_fn(f"[dedup] *query*field_safe (content_hash): {e}")
 
-    # 3. Title Hash check (if exists)
     if schema and schema.has_title_hash:
         try:
             res = _query_field_safe(
@@ -1299,10 +1263,6 @@ def _light_duplicate_check(
 # ═══════════════════════════════════════════════════════════
 
 def _categorize_and_score(title: str, is_peak: bool) -> tuple[str, int]:
-    """
-    Evaluates feed title, determines best category and assigns score.
-    Returns (category, score).
-    """
     clean_t = _clean_title(title)
     words   = set(clean_t.split())
     
@@ -1323,17 +1283,12 @@ def _categorize_and_score(title: str, is_peak: bool) -> tuple[str, int]:
             max_hits = hits
             best_cat = cat
 
-    # Base score
     score = 50
-    
-    # Keyword bonuses
     score += min(max_hits * 10, 40)
     
-    # Peak hour bonus
     if is_peak:
         score += PEAK_HOUR_BONUS
         
-    # Recency/Source boosts (Fashion capital names)
     capitals = {"paris", "milan", "london", "york", "tokyo"}
     if any(cap in words for cap in capitals):
         score += 10
@@ -1346,36 +1301,29 @@ def _categorize_and_score(title: str, is_peak: bool) -> tuple[str, int]:
 # ═══════════════════════════════════════════════════════════
 
 def _extract_rss_image(entry) -> str | None:
-    """Attempts to find image inside feed entry using multiple standard nodes."""
     try:
-        # 1. Media content
         if "media_content" in entry:
             for item in entry["media_content"]:
                 if "url" in item and item.get("medium") == "image":
                     return item["url"]
                 if "url" in item and "image" in item.get("type", ""):
                     return item["url"]
-            # Fallback to first item if it has url
             if entry["media_content"] and "url" in entry["media_content"][0]:
                 return entry["media_content"][0]["url"]
 
-        # 2. Links
         if "links" in entry:
             for link in entry["links"]:
                 if "image" in link.get("type", ""):
                     return link["href"]
 
-        # 3. Media thumbnail
         if "media_thumbnail" in entry and entry["media_thumbnail"]:
             return entry["media_thumbnail"][0]["url"]
 
-        # 4. Enclosures
         if "enclosures" in entry:
             for enc in entry["enclosures"]:
                 if "image" in enc.get("type", ""):
                     return enc["href"]
 
-        # 5. HTML content parsing (fallback)
         html_content = ""
         if "content" in entry:
             html_content = entry["content"][0]["value"]
@@ -1406,7 +1354,6 @@ async def _find_best_candidate(
     is_peak: bool = False,
     log_fn=print,
 ) -> dict | None:
-    """Scans all feeds, filters by age & deduplicates, returns highest scored candidate."""
     if now is None:
         now = datetime.now(timezone.utc)
     if recent_titles is None:
@@ -1414,12 +1361,11 @@ async def _find_best_candidate(
 
     recent_domains = _load_recent_domain_hashes(
         databases, database_id, collection_id, sdk_mode,
-        DOMAIN_DEDUP_HOURS, schema, log_fn,
+        schema, log_fn,
     )
 
     candidates = []
     
-    # 1. Parse and extract concurrently to avoid delays
     async def _fetch_feed(session: aiohttp.ClientSession, url: str) -> list:
         try:
             async with session.get(
@@ -1450,7 +1396,6 @@ async def _find_best_candidate(
                 if not title or not link:
                     continue
 
-                # ── Age check ──
                 pub_parsed = entry.get("published_parsed")
                 if pub_parsed:
                     pub_dt = datetime(*pub_parsed[:6], tzinfo=timezone.utc)
@@ -1460,22 +1405,17 @@ async def _find_best_candidate(
                 if pub_dt < time_threshold:
                     continue
 
-                # ── Deduplication checks ──
                 norm_title = _clean_title(title)
                 
-                # Check exact link memory
-                # (Query-based is done in Phase 2, this is local memory fuzzy)
                 if any(_fuzzy_similarity(norm_title, rt) > FUZZY_SIMILARITY_THRESHOLD for rt in recent_titles):
                     continue
 
-                # Domain limit check (max 1 post per domain per X hours)
                 domain = _get_domain(link)
                 if domain:
                     dh = _make_domain_hash(domain)
                     if dh in recent_domains:
                         continue
 
-                # ── Scoring ──
                 category, score = _categorize_and_score(title, is_peak)
                 description = entry.get("summary", "") or entry.get("description", "")
                 
@@ -1493,14 +1433,10 @@ async def _find_best_candidate(
     if not candidates:
         return None
 
-    # Sort descending by score
     candidates.sort(key=lambda x: x["score"], reverse=True)
     
-    # Fuzzy filter within top list to make sure we get a safe item
     for cand in candidates:
-        # Check exact link again against DB
         try:
-            # Query db for current link
             res = _db_list(
                 databases, database_id, collection_id,
                 [Query.equal("link", cand["link"][:DB_LINK_MAX])],
@@ -1508,11 +1444,10 @@ async def _find_best_candidate(
             )
             docs = res.get("documents", []) if isinstance(res, dict) else []
             if docs:
-                continue # exact match, skip
+                continue
         except Exception:
             pass
 
-        # Candidate is safe and has the highest score
         log_fn(
             f"[PASS] fuzz=0.00: "
             f"{cand['title'][:65]}"
@@ -1527,7 +1462,6 @@ async def _find_best_candidate(
 # ═══════════════════════════════════════════════════════════
 
 def _scrape_text(url: str, log_fn=print) -> str | None:
-    """Scrapes full text from article to provide dense context to LLM."""
     try:
         headers = {
             "User-Agent": (
@@ -1542,17 +1476,14 @@ def _scrape_text(url: str, log_fn=print) -> str | None:
             
         soup = BeautifulSoup(resp.text, "lxml")
         
-        # Strip script and style elements
         for element in soup(["script", "style", "header", "footer", "nav", "aside"]):
             element.decompose()
             
-        # Target main content holders
         body_text = ""
         article = soup.find("article")
         if article:
             body_text = article.get_text(separator=" ")
         else:
-            # Fallback to general content divs
             divs = soup.find_all(
                 "div",
                 class_=re.compile(
@@ -1561,18 +1492,15 @@ def _scrape_text(url: str, log_fn=print) -> str | None:
                 ),
             )
             if divs:
-                # Find largest text container
                 largest_div = max(divs, key=lambda d: len(d.get_text()))
                 body_text = largest_div.get_text(separator=" ")
             else:
                 body_text = soup.get_text(separator=" ")
 
-        # Normalize text
         lines = (line.strip() for line in body_text.splitlines())
         chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
         text = "\n".join(chunk for chunk in chunks if chunk)
         
-        # Substring to maximum limit
         return text[:MAX_SCRAPED_CHARS]
     except Exception as e:
         log_fn(f"[scrape] Scraper error: {e}")
@@ -1580,13 +1508,8 @@ def _scrape_text(url: str, log_fn=print) -> str | None:
 
 
 def _scrape_images(url: str, rss_entry, log_fn=print) -> list:
-    """
-    Finds and ranks all available images in the article.
-    Puts feed image at top. Finds high-res candidates inside page.
-    """
     images = []
     
-    # 1. Start with feed image as absolute high-fidelity priority
     rss_img = _extract_rss_image(rss_entry)
     if rss_img:
         images.append(rss_img)
@@ -1603,27 +1526,23 @@ def _scrape_images(url: str, rss_entry, log_fn=print) -> list:
         if resp.status_code == 200:
             soup = BeautifulSoup(resp.text, "lxml")
             
-            # Find og:image (high fidelity)
             og_img = soup.find("meta", property="og:image")
             if og_img and og_img.get("content"):
                 url_og = og_img["content"]
                 if url_og not in images:
                     images.append(url_og)
 
-            # Find twitter:image
             tw_img = soup.find("meta", name="twitter:image")
             if tw_img and tw_img.get("content"):
                 url_tw = tw_img["content"]
                 if url_tw not in images:
                     images.append(url_tw)
 
-            # Extract in-body images, filter small assets (icons, trackers)
             for img in soup.find_all("img"):
                 src = img.get("src") or img.get("data-src") or img.get("data-lazy-src")
                 if not src:
                     continue
                 
-                # Resolve relative url
                 if src.startswith("//"):
                     src = "https:" + src
                 elif src.startswith("/"):
@@ -1633,11 +1552,9 @@ def _scrape_images(url: str, rss_entry, log_fn=print) -> list:
                 if not src.startswith("http"):
                     continue
 
-                # Filter obvious tracking or layout images
                 if any(x in src.lower() for x in ["logo", "icon", "avatar", "sprite", "pixel", "tracker", "spacer"]):
                     continue
 
-                # Filter low resolution placeholders
                 width  = img.get("width", "")
                 height = img.get("height", "")
                 try:
@@ -1654,7 +1571,6 @@ def _scrape_images(url: str, rss_entry, log_fn=print) -> list:
     except Exception as e:
         log_fn(f"[scrape] Image scraper error: {e}")
 
-    # Remove duplicates preserving order
     seen = set()
     unique_images = []
     for img in images:
@@ -1667,11 +1583,9 @@ def _scrape_images(url: str, rss_entry, log_fn=print) -> list:
 
 
 def _select_content(scraped: str | None, desc: str, title: str) -> str:
-    """Returns most granular text content available, falling back cleanly."""
     if scraped and len(scraped.strip()) > MIN_CONTENT_CHARS:
         return scraped.strip()
     if desc and len(desc.strip()) > 50:
-        # Strip HTML if present in RSS description
         soup = BeautifulSoup(desc, "html.parser")
         text = soup.get_text()
         if len(text.strip()) > 50:
@@ -1691,53 +1605,126 @@ def _write_soft_lock(
     trend_score: int, post_hour: int, domain_hash: str,
     log_fn=print,
 ) -> tuple[bool, str]:
-    """
-    Creates a temporary locked record in the Appwrite database.
-    Ensures that parallel cloud instances do not post the same link.
-    """
-    data = {
-        "link":         link[:DB_LINK_MAX],
-        "title":        title[:DB_TITLE_MAX],
-        "feed_url":     feed_url[:DB_FEED_URL_MAX],
-        "source_type":  source_type[:DB_SOURCE_TYPE_MAX],
-        "created_at":   datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    now     = datetime.now(timezone.utc)
+    now_iso = now.strftime("%Y-%m-%dT%H:%M:%S.000+00:00")
+
+    existing = _get_existing_record(
+        databases, database_id, collection_id, link, sdk_mode, log_fn
+    )
+
+    if existing is not None:
+        existing_status = existing.get("status", "")
+        existing_posted = existing.get("posted", False)
+        existing_doc_id = existing["$id"]
+        locked_at_str   = existing.get("locked_at", "")
+
+        if existing_posted is True or existing_status == STATUS_POSTED:
+            log_fn("[lock] Already posted — duplicate.")
+            return False, "already_posted"
+
+        if existing_status == STATUS_LOCKED and locked_at_str:
+            try:
+                locked_at = datetime.fromisoformat(
+                    locked_at_str.replace("Z", "+00:00")
+                )
+                age = (now - locked_at).total_seconds()
+                if age < LOCK_TTL_SECONDS:
+                    log_fn(f"[lock] Active lock (age={age:.0f}s). Skip.")
+                    return False, "active_lock"
+                else:
+                    log_fn(f"[lock] Stale lock (age={age:.0f}s). Recovering.")
+                    _delete_record(
+                        databases, database_id, collection_id,
+                        existing_doc_id, sdk_mode, log_fn,
+                    )
+            except Exception as e:
+                log_fn(f"[lock] TTL parse: {e}. Deleting stale.")
+                _delete_record(
+                    databases, database_id, collection_id,
+                    existing_doc_id, sdk_mode, log_fn,
+                )
+        elif existing_status == STATUS_FAILED:
+            log_fn("[lock] Failed → retry. Deleting old.")
+            _delete_record(
+                databases, database_id, collection_id,
+                existing_doc_id, sdk_mode, log_fn,
+            )
+        else:
+            log_fn(f"[lock] Unknown status '{existing_status}' → stale.")
+            _delete_record(
+                databases, database_id, collection_id,
+                existing_doc_id, sdk_mode, log_fn,
+            )
+
+    if hasattr(pub_date, "tzinfo") and pub_date.tzinfo is None:
+        pub_date = pub_date.replace(tzinfo=timezone.utc)
+
+    # Omit custom created_at entirely (Appwrite sets $createdAt automatically)
+    payload: dict = {
+        "link":        link[:DB_LINK_MAX],
+        "title":       title[:DB_TITLE_MAX],
+        "published_at": pub_date.strftime("%Y-%m-%dT%H:%M:%S.000+00:00") if hasattr(pub_date, "strftime") else str(pub_date),
+        "feed_url":    feed_url[:DB_FEED_URL_MAX],
+        "source_type": source_type[:DB_SOURCE_TYPE_MAX],
+        "category":    category[:DB_CATEGORY_MAX],
+        "trend_score": int(trend_score),
+        "post_hour":   int(post_hour),
     }
 
-    # Add v11 fields if present
-    if schema.has_status:
-        data["status"] = STATUS_LOCKED
-    if schema.has_posted:
-        data["posted"] = False
-    if schema.has_locked_at:
-        data["locked_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-    if schema.has_posted_at:
-        data["posted_at"] = ""
-    if schema.has_fail_reason:
-        data["fail_reason"] = ""
-        
-    # Hash fields
     if schema.has_content_hash:
-        data["content_hash"] = content_hash[:DB_HASH_MAX]
+        payload["content_hash"] = content_hash[:DB_HASH_MAX]
     if schema.has_title_hash:
-        data["title_hash"] = title_hash[:DB_HASH_MAX]
+        payload["title_hash"] = title_hash[:DB_HASH_MAX]
     if schema.has_domain_hash:
-        data["domain_hash"] = domain_hash[:DB_DOMAIN_HASH_MAX]
+        payload["domain_hash"] = domain_hash[:DB_DOMAIN_HASH_MAX]
+
+    if schema.has_status:
+        payload["status"] = STATUS_LOCKED
+    if schema.has_posted:
+        payload["posted"] = False
+    if schema.has_locked_at:
+        payload["locked_at"] = now_iso
+    if schema.has_posted_at:
+        payload["posted_at"] = ""
+    if schema.has_fail_reason:
+        payload["fail_reason"] = ""
 
     try:
-        res = _db_create(databases, database_id, collection_id, data, sdk_mode)
-        # Handle list_rows response vs list_documents object model compatibility
-        doc_dict = _to_dict_safe(res)
-        doc_id = doc_dict.get("$id") if isinstance(doc_dict, dict) else None
-        if not doc_id:
-            # Fallback for older SDK object modes
-            doc_id = getattr(res, "id", None) or getattr(res, "$id", None)
-            
-        if doc_id:
-            return True, doc_id
-        return False, "failed_to_retrieve_id"
+        doc    = _db_create(databases, database_id, collection_id, payload, sdk_mode)
+        doc_id = doc.get("$id") or doc.get("id", "")
+        log_fn(f"[lock] ✓ Lock acquired. doc_id={doc_id}")
+        return True, doc_id
+    except AppwriteException as e:
+        msg = str(e.message).lower()
+        if "already exists" in msg or e.code in (409, 400):
+            log_fn("[lock] Race condition — another instance won.")
+            return False, "race_lost"
+        log_fn(f"[lock] DB error: {e.message}")
+        return False, f"db_error: {e.message}"
     except Exception as e:
         log_fn(f"[lock] Error: {e}")
-        return False, str(e)
+        return False, f"error: {e}"
+
+
+def _get_existing_record(databases, database_id, collection_id, link, sdk_mode, log_fn) -> dict | None:
+    try:
+        res = _db_list(
+            databases, database_id, collection_id,
+            [Query.equal("link", link[:DB_LINK_MAX])], sdk_mode
+        )
+        docs = res.get("documents", []) if isinstance(res, dict) else []
+        if docs:
+            return _to_dict_safe(docs[0])
+    except Exception as e:
+        log_fn(f"[db] *get*existing_record: {e}")
+    return None
+
+
+def _delete_record(databases, database_id, collection_id, doc_id, sdk_mode, log_fn) -> None:
+    try:
+        _db_delete(databases, database_id, collection_id, doc_id, sdk_mode)
+    except Exception as e:
+        log_fn(f"[db] delete error: {e}")
 
 
 def _update_posted_status(
@@ -1745,7 +1732,6 @@ def _update_posted_status(
     doc_id: str, status: str, schema: SchemaInfo,
     sdk_mode: str, fail_reason: str = "",
 ) -> None:
-    """Updates the state of a soft-locked document once completed/failed."""
     data = {}
     if schema.has_status:
         data["status"] = status
@@ -1757,7 +1743,6 @@ def _update_posted_status(
         data["fail_reason"] = fail_reason[:DB_REASON_MAX]
 
     if not data:
-        # Schema does not support state fields. If failed, we delete the record so it can be retried.
         if status == STATUS_FAILED:
             try:
                 _db_delete(databases, database_id, collection_id, doc_id, sdk_mode)
@@ -1775,17 +1760,14 @@ def _clean_stale_locks(
     databases, database_id: str, collection_id: str,
     sdk_mode: str, schema: SchemaInfo, log_fn=print,
 ) -> None:
-    """Cleans up locked items that timed out or failed to post cleanly."""
     if not schema.has_status and not schema.has_posted:
         return
     try:
-        # Stale locks are older than 10 mins
         stale_threshold = datetime.now(timezone.utc) - timedelta(seconds=LOCK_TTL_SECONDS)
         stale_threshold_iso = stale_threshold.isoformat().replace("+00:00", "Z")
 
-        # Query all items in locked state
         queries = [
-            Query.less_than("created_at", stale_threshold_iso),
+            Query.less_than("$createdAt", stale_threshold_iso),
             Query.limit(100),
         ]
         if schema.has_status:
@@ -1877,10 +1859,6 @@ async def _post_to_telegram(
 
 
 def _extract_hashtags_from_text(text: str, limit: int = 4) -> list[str]:
-    """
-    Extracts category keywords from English text and converts
-    them to premium Persian hashtags.
-    """
     t = text.lower()
     mapping = {
         "runway":          "#ران_وی #کت_واک",
@@ -1918,22 +1896,17 @@ def _extract_hashtags_from_text(text: str, limit: int = 4) -> list[str]:
                 if tag not in extracted:
                     extracted.append(tag)
                     
-    # Fallback default hashtags if none matched
     if not extracted:
-         extracted = ["#مد #استایل #ترند_فصل #فشن"]
+         extracted = ["#مد", "#استایل", "#ترند_فصل", "#فشن"]
          
     return extracted[:limit]
 
 
 # ═══════════════════════════════════════════════════════════
 # SECTION 16 — SCHEMA MIGRATION UTILITY
-#
-# Adds v11 schema fields to Appwrite collection (Run once if fields missing)
-# Usage: python main.py --migrate
 # ═══════════════════════════════════════════════════════════
 
 def _migrate_schema(databases, db_id: str, coll_id: str, log_fn=print) -> None:
-    """Creates missing v11 attributes in the Appwrite database schema."""
     log_fn("[migration] Starting schema migration...")
     attributes = [
         ("posted",      "boolean", False),
@@ -1970,11 +1943,9 @@ def _migrate_schema(databases, db_id: str, coll_id: str, log_fn=print) -> None:
                 )
             log_fn(f"[migration] Attribute '{name}' created. Wait 5s...")
             import time
-            import sys
-            # Safe sleep inside Appwrite / local execution to prevent rate limit
             time.sleep(5)
         except AppwriteException as e:
-            if e.code == 409: # Already exists
+            if e.code == 409:
                 log_fn(f"[migration] Attribute '{name}' already exists. OK.")
             else:
                 log_fn(f"[migration] Error creating attribute '{name}': {e}")
@@ -1985,26 +1956,22 @@ def _migrate_schema(databases, db_id: str, coll_id: str, log_fn=print) -> None:
 
 
 def _cleanup_history(databases, db_id: str, coll_id: str, log_fn=print) -> None:
-    """Removes failed or stale records from history collection to save space."""
     log_fn("[cleanup] Scanning for failed or unposted stale records...")
     try:
-        # Query unposted and failed records older than 48 hours
         threshold = datetime.now(timezone.utc) - timedelta(hours=48)
         threshold_iso = threshold.isoformat().replace("+00:00", "Z")
 
-        # In legacy mode we cannot safely query filters on missing status fields, so we pull last 100 and clean.
         result = databases.list_documents(
             database_id=db_id,
             collection_id=coll_id,
             queries=[
-                Query.less_than("created_at", threshold_iso),
+                Query.less_than("$createdAt", threshold_iso),
                 Query.limit(100),
             ]
         )
         docs = result.get("documents", [])
         cleaned = 0
         for doc in docs:
-            # Clean up if not posted or if status is failed
             status = doc.get("status") or ""
             posted = doc.get("posted") or False
             doc_id = doc.get("$id")
@@ -2027,21 +1994,15 @@ def _format_unified_caption_safety(
     hashtags: list[str],
     category: str,
 ) -> str:
-    """
-    Cleans up the raw unified caption from the LLM, resolves Markdown blocks,
-    ensures proper footer and appends hashtags safely.
-    """
     import re
     text = raw_caption.strip()
 
-    # Strip code block markdown if present
     if text.startswith("```"):
         text = re.sub(r"^```(?:html)?\s*", "", text, flags=re.IGNORECASE)
         text = re.sub(r"\s*```$", "", text)
     
     text = text.strip()
 
-    # Convert simple ** markdown to <b> tags if any leaked
     parts = text.split("**")
     if len(parts) > 1:
         new_text = []
@@ -2052,7 +2013,6 @@ def _format_unified_caption_safety(
                 new_text.append(part)
         text = "".join(new_text)
 
-    # Let's ensure the categories and footer are in good shape
     CATEGORY_EMOJI = {
         "runway": "👗", "brand": "🏷️", "business": "📊",
         "beauty": "💄", "sustainability": "♻️", "celebrity": "⭐",
@@ -2060,18 +2020,15 @@ def _format_unified_caption_safety(
     }
     emoji = CATEGORY_EMOJI.get(category, "🌐")
 
-    # If the footer is not already in the text, let's append it
     footer_pattern = "@irfashionnews"
     if footer_pattern not in text:
         text += f"\n\n{emoji} <i>@irfashionnews | مجله زیبایی‌شناسی مد</i>"
 
-    # Append hashtags if any, and if they aren't already there
     if hashtags:
         hash_line = " ".join(hashtags)
         if not any(tag in text for part in hashtags for tag in [part, part.lower()]):
             text += f"\n\n{hash_line}"
 
-    # Enforce strict maximum length limit for photo captions in Telegram (1024 characters)
     if len(text) > 1020:
         text = text[:1015] + "…"
 
@@ -2084,9 +2041,6 @@ async def main(event=None, context=None):
 
     log("═══ FashionBot v13.0 started ═══")
 
-    # ════════════════════════════════
-    # SETUP & CONFIG
-    # ════════════════════════════════
     database_id = os.environ.get("APPWRITE_DATABASE_ID", "").strip()
     token       = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id     = os.environ.get("TELEGRAM_CHANNEL_ID", "").strip()
@@ -2101,9 +2055,7 @@ async def main(event=None, context=None):
             "reason": "missing_env_variables",
         }
 
-    # Initialize Appwrite client
     client = Client()
-    # If executed locally or in context, configure endpoint
     endpoint = os.environ.get("APPWRITE_ENDPOINT", "").strip()
     project  = os.environ.get("APPWRITE_PROJECT_ID", "").strip()
     api_key  = os.environ.get("APPWRITE_API_KEY", "").strip()
@@ -2119,7 +2071,6 @@ async def main(event=None, context=None):
     sdk_mode  = _detect_sdk_mode(databases, database_id, COLLECTION_ID)
     log(f"SDK mode: {sdk_mode}")
 
-    # Local event parameters for one-time CLI actions
     is_migration = False
     is_cleanup   = False
     if event and isinstance(event, dict) and "params" in event:
@@ -2127,7 +2078,6 @@ async def main(event=None, context=None):
         is_migration = params.get("migrate") or params.get("migration") or False
         is_cleanup   = params.get("cleanup") or params.get("clear") or False
 
-    # CLI arguments for local terminal executes
     import sys
     if "--migrate" in sys.argv:
         is_migration = True
@@ -2142,17 +2092,15 @@ async def main(event=None, context=None):
         _cleanup_history(databases, database_id, COLLECTION_ID, log)
         return {"status": "success", "action": "cleanup"}
 
-    # Time tracking
     start_time = datetime.now()
     def elapsed() -> str:
         return f"{(datetime.now() - start_time).total_seconds():.1f}"
 
-    # Verify keys & schema capabilities at start to speed up future cycles
     log(f"[{elapsed()}s] Detecting schema and validating AI keys...")
     schema, groq_ok, or_ok = await asyncio.gather(
         loop.run_in_executor(
             None, _detect_schema,
-            databases, database_id, COLLECTION_ID, log,
+            databases, database_id, COLLECTION_ID, sdk_mode, log,
         ),
         _validate_groq_key(log),
         _validate_openrouter_key(log),
@@ -2173,14 +2121,12 @@ async def main(event=None, context=None):
         f"Peak={'YES' if is_peak else 'no'}"
     )
 
-    # Load posted-only titles for fuzzy dedup
     recent_titles = _load_recent_titles_posted_only(
         databases, database_id, COLLECTION_ID,
         sdk_mode, FUZZY_LOOKBACK_COUNT, schema, log,
     )
     log(f"[{elapsed()}s] {len(recent_titles)} posted titles loaded.")
 
-    # Clean stale locks from previous broken processes (over LOCK_TTL_SECONDS)
     _clean_stale_locks(databases, database_id, COLLECTION_ID, sdk_mode, schema, log)
 
     # ════════════════════════════════
@@ -2344,7 +2290,6 @@ async def main(event=None, context=None):
     # ════════════════════════════════
     # PHASE 7 — FUZZY DEDUP CHECK
     # ════════════════════════════════
-    # Double check title similarity again prior to posting
     log(f"[{elapsed()}s] Phase 7: Fuzzy dedup...")
     recent_titles_v2 = _load_recent_titles_posted_only(
         databases, database_id, COLLECTION_ID,
@@ -2356,10 +2301,15 @@ async def main(event=None, context=None):
     norm_title   = _clean_title(title)
     
     for rt in recent_titles_v2:
-        sim = _fuzzy_similarity(norm_title, rt)
+        if isinstance(rt, tuple):
+            rt_title = rt[0]
+        else:
+            rt_title = rt
+            
+        sim = _fuzzy_similarity(norm_title, rt_title)
         if sim > FUZZY_SIMILARITY_THRESHOLD:
             is_fuzzy_dup = True
-            match_title  = rt
+            match_title  = rt_title
             break
 
     if is_fuzzy_dup:
@@ -2418,7 +2368,6 @@ async def main(event=None, context=None):
     }
 
 
-# Global loop tracker for on-demand local debug runs
 try:
     loop = asyncio.get_event_loop()
 except RuntimeError:
