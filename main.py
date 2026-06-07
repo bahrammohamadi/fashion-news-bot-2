@@ -1,11 +1,11 @@
 # ============================================================
 # Function 1: International Fashion Poster
 # Project:    @irfashionnews — FashionBotProject
-# Version:    13.0 — Unified Creative AI + Embedded Photo Captioning + Dynamic News Formatting
+# Version:    11.1 — Schema-Adaptive + Model Fixes
 # Runtime:    python-3.12 / Appwrite Cloud Functions
 # Timeout:    120 seconds
 #
-# FIXES FROM v11.0 & v12.0:
+# FIXES FROM v11.0:
 #
 #   FIX 1 — SCHEMA ADAPTATION:
 #     Problem: "posted" field missing → all dedup queries fail
@@ -39,31 +39,12 @@
 #       - _db_list() tries list_rows first, falls back to list_documents
 #       - Deprecation warnings suppressed cleanly
 #
-#   FIX 5 — APPWRITE OBJECT TO DICT BUG:
-#     Problem: 'DocumentList' object has no attribute 'get' or 'not subscriptable'
-#     Solution:
-#       - Added _to_dict_safe helper to convert all Appwrite SDK response models
-#         to python dicts, fixing all database query/locking crashes.
+# SCHEMA MIGRATION (run once if posted field is missing):
+#   python main.py --migrate
+#   Adds posted/status/locked_at/posted_at/fail_reason fields.
 #
-#   FIX 6 — PRIORITY GOOGLE GEMINI FLOW:
-#     Problem: Rate limit errors on Groq and OpenRouter keys.
-#     Solution:
-#       - Google Gemini added as Priority 1 (highest priority).
-#       - Falls back to Groq/OpenRouter only if Gemini fails or has no key.
-#       - Added support for GEMINI_API_KEY, GOOGLE_API_KEY, and GOOGLE_AI_KEY.
-#       - Updated Gemini Models to support latest 2.5-flash & 2.5-pro models.
-#
-#   FIX 7 — EMBEDDED CAPTION POSTING:
-#     Problem: Images and caption sent separately.
-#     Solution:
-#       - Captions are now safely embedded inside the first photo of the album
-#         or the single photo, as a single unified Telegram post!
-#
-#   FIX 8 — SYSTEM FIELD $createdAt REALIGNMENT:
-#     Problem: 'Attribute not found in schema: created_at' and 'Unknown attribute: created_at'
-#     Solution:
-#       - Replaced all query logic to utilize Appwrite's native '$createdAt' system field.
-#       - Removed raw 'created_at' from DB insertion payloads.
+# ONE-TIME CLEANUP (run once to clear unposted records):
+#   python main.py --cleanup
 # ============================================================
 
 
@@ -175,45 +156,134 @@ STATUS_FAILED = "failed"
 # ── Scoring ──
 PEAK_HOURS_UTC          = {4, 5, 6, 9, 10, 11, 16, 17, 18, 19}
 PEAK_HOUR_BONUS         = 15
+SCORE_RECENCY_MAX       = 40
+SCORE_TITLE_KEYWORD     = 15
+SCORE_DESC_KEYWORD      = 5
+SCORE_HAS_IMAGE         = 10
+SCORE_DESC_LENGTH       = 10
+SCORE_FASHION_RELEVANCE = 20
 
-CATEGORY_KEYWORDS = {
+FASHION_RELEVANCE_KEYWORDS = {
+    "chanel", "dior", "gucci", "prada", "louis vuitton", "lv",
+    "balenciaga", "versace", "fendi", "burberry", "valentino",
+    "armani", "hermes", "celine", "givenchy", "saint laurent",
+    "bottega veneta", "miu miu", "loewe", "jacquemus", "off-white",
+    "alexander mcqueen", "vivienne westwood", "stella mccartney",
+    "zara", "h&m", "hm", "uniqlo", "massimo dutti", "cos",
+    "mango", "asos", "shein", "& other stories",
+    "nike", "adidas", "puma", "reebok", "new balance", "converse",
+    "vans", "supreme", "palace", "stussy", "kith", "jordan",
+    "fashion week", "runway", "catwalk", "collection", "couture",
+    "resort", "pre-fall", "ss26", "fw26", "ss25", "fw25",
+    "pfw", "mfw", "lfw", "nyfw", "met gala", "red carpet",
+    "fashion show", "lookbook", "editorial",
+    "trend", "style", "outfit", "wardrobe", "streetwear", "luxury",
+    "vintage", "sustainable fashion", "fast fashion", "capsule",
+    "collaboration", "collab", "model", "designer",
+    "creative director", "fashion",
+}
+
+TREND_KEYWORDS = [
+    "launches", "unveils", "debuts", "announces", "names",
+    "acquires", "appoints", "partners", "expands", "opens",
+    "trend", "collection", "season", "runway", "fashion week",
+    "capsule", "collab", "collaboration", "limited edition",
+    "viral", "popular", "iconic", "exclusive", "first look",
+    "top", "best", "most", "new", "latest",
+    "chanel", "dior", "gucci", "prada", "louis vuitton",
+    "zara", "h&m", "nike", "adidas", "balenciaga",
+    "versace", "fendi", "burberry", "valentino", "armani",
+]
+
+CONTENT_CATEGORIES = {
     "runway": [
-        "runway", "couture", "show", "collection", "haute", "fashion week",
-        "spring 2026", "fall 2026", "parade", "catwalk", "front row",
+        "runway", "fashion week", "collection", "show", "catwalk",
+        "ss26", "fw26", "ss25", "fw25", "resort", "couture",
+        "paris", "milan", "london", "new york", "pfw", "mfw",
     ],
     "brand": [
-        "gucci", "chanel", "prada", "balenciaga", "louis vuitton", "dior",
-        "hermes", "saint laurent", "celine", "loewe", "jacquemus", "versace",
-        "bottega veneta", "maison margiela", "miu miu", "fendi", "valentino",
+        "chanel", "dior", "gucci", "prada", "louis vuitton", "lv",
+        "balenciaga", "versace", "fendi", "burberry", "valentino",
+        "armani", "hermes", "celine", "givenchy", "saint laurent",
+        "bottega", "miu miu", "loewe", "jacquemus", "off-white",
     ],
     "business": [
-        "acquisition", "revenue", "ceo", "shares", "lvmh", "kering", "stocks",
-        "bof", "market", "sales", "report", "growth", "industry", "appointed",
+        "acquires", "acquisition", "merger", "revenue", "profit",
+        "ipo", "stock", "sales", "growth", "market", "investment",
+        "funding", "ceo", "appoints", "names", "executive",
+        "partnership", "deal", "collaboration", "brand deal",
     ],
     "beauty": [
-        "makeup", "cosmetics", "skincare", "lipstick", "perfume", "fragrance",
-        "eyeshadow", "beauty trend", "manicure", "hair", "dermatology",
+        "beauty", "makeup", "cosmetics", "skincare", "fragrance",
+        "perfume", "lipstick", "foundation", "serum", "moisturizer",
+        "hair", "nail", "spa", "wellness", "grooming",
     ],
     "sustainability": [
-        "sustainable", "recycled", "eco-friendly", "organic cotton", "vegan",
-        "circular", "ethical", "upcycled", "greenwashing", "consignment",
+        "sustainable", "sustainability", "eco", "green", "recycled",
+        "organic", "ethical", "conscious", "upcycled", "carbon",
+        "environment", "circular", "biodegradable", "vegan",
     ],
     "celebrity": [
-        "gala", "red carpet", "met gala", "oscars", "zendaya", "hadid",
-        "rihanna", "kardashian", "ambassador", "spotted wearing", "style file",
+        "celebrity", "actor", "actress", "singer", "kardashian",
+        "beyonce", "rihanna", "zendaya", "hailey", "kendall",
+        "gigi", "bella", "met gala", "red carpet", "wore", "spotted",
     ],
     "trend": [
-        "how to style", "must-have", "aesthetic", "coquette", "mob wife",
-        "minimalism", "chic", "wardrobe", "staple", "how to wear", "it-bag",
+        "trend", "trending", "viral", "popular", "style", "look",
+        "aesthetic", "core", "outfit", "wear", "season", "must-have",
+        "fashion", "wardrobe", "staple", "classic",
     ],
 }
 
+HASHTAG_MAP = {
+    "chanel":         "#Chanel #شنل",
+    "dior":           "#Dior #دیور",
+    "gucci":          "#Gucci #گوچی",
+    "prada":          "#Prada #پرادا",
+    "louis vuitton":  "#LouisVuitton #لویی_ویتون",
+    "balenciaga":     "#Balenciaga #بالنسیاگا",
+    "versace":        "#Versace #ورساچه",
+    "zara":           "#Zara #زارا",
+    "hm":             "#HM #اچ_اند_ام",
+    "nike":           "#Nike #نایکی",
+    "adidas":         "#Adidas #آدیداس",
+    "runway":         "#Runway #رانوی",
+    "fashion week":   "#FashionWeek #هفته_مد",
+    "collection":     "#Collection #کالکشن",
+    "sustainability": "#Sustainability #مد_پایدار",
+    "beauty":         "#Beauty #زیبایی",
+    "trend":          "#Trend #ترند",
+    "style":          "#Style #استایل",
+    "celebrity":      "#Celebrity #سلبریتی",
+    "streetwear":     "#Streetwear #استریت_ویر",
+    "luxury":         "#Luxury #لاکچری",
+    "vintage":        "#Vintage #وینتیج",
+    "met gala":       "#MetGala #مت_گالا",
+    "red carpet":     "#RedCarpet #فرش_قرمز",
+    "couture":        "#Couture #کوتور",
+    "collab":         "#Collab #همکاری",
+}
+MAX_HASHTAGS = 5
+
+FASHION_STICKERS = [
+    "CAACAgIAAxkBAAIBmGRx1yRFMVhVqVXLv_dAAXJMOdFNAAIUAAOVgnkAAVGGBbBjxbg4LwQ",
+    "CAACAgIAAxkBAAIBmWRx1yRqy9JkN2DmV_Z2sRsKdaTjAAIVAAOVgnkAAc8R3q5p5-AELAQ",
+    "CAACAgIAAxkBAAIBmmRx1yS2T2gfLqJQX9oK6LZqp1HIAAIWAAO0yXAAAV0MzCRF3ZRILAQ",
+    "CAACAgIAAxkBAAIBm2Rx1ySiJV4dVeTuCTc-RfFDnfQpAAIXAAO0yXAAAA3Vm7IiJdisLAQ",
+    "CAACAgIAAxkBAAIBnGRx1yT_jVlWt5xPJ7BO9aQ4JvFaAAIYAAO0yXAAAA0k9GZDQpLcLAQ",
+]
+
 RSS_FEEDS = [
     "https://www.vogue.com/feed/rss",
+    "https://wwd.com/feed/",
+    "https://fashionista.com/feed",
     "https://www.harpersbazaar.com/rss/fashion.xml",
     "https://www.elle.com/rss/fashion.xml",
+    "https://www.businessoffashion.com/feed/",
+    "https://www.thecut.com/feed",
     "https://www.refinery29.com/rss.xml",
     "https://www.whowhatwear.com/rss",
+    "https://feeds.feedburner.com/fibre2fashion/fashion-news",
     "https://www.gq.com/feed/style/rss",
     "https://www.cosmopolitan.com/rss/fashion.xml",
     "https://www.instyle.com/rss/fashion.xml",
@@ -221,18 +291,30 @@ RSS_FEEDS = [
     "https://www.vanityfair.com/feed/style/rss",
     "https://www.allure.com/feed/fashion/rss",
     "https://www.teenvogue.com/feed/rss",
+    "https://www.glossy.co/feed/",
     "https://www.highsnobiety.com/feed/",
-    "https://hypebeast.com/feed",
-    "https://www.wmagazine.com/feed/rss",
-    "https://www.lofficielusa.com/rss",
-    "https://thecut.com/feed/index.xml",
-    "https://www.fashionista.com/.rss/full/",
-    "https://www.grailed.com/drycleanonly/feed",
-    "https://wwd.com/feed/",
+    "https://fashionmagazine.com/feed/",
+]
+
+BOILERPLATE_PATTERNS = [
+    "subscribe", "newsletter", "sign up", "cookie",
+    "privacy policy", "all rights reserved", "terms of service",
+    "advertisement", "sponsored content", "follow us",
+    "share this", "read more", "click here", "tap here",
+    "download the app", "get the app",
+]
+
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
+IMAGE_BLOCKLIST  = [
+    "doubleclick", "googletagmanager", "googlesyndication",
+    "facebook.com/tr", "analytics", "pixel", "beacon",
+    "tracking", "counter", "stat.", "stats.",
 ]
 
 TITLE_STOP_WORDS = {
-    "the", "a", "an", "and", "but", "or", "for", "nor", "on", "at",
+    "a", "an", "the", "is", "are", "was", "were", "be", "been",
+    "being", "have", "has", "had", "do", "does", "did", "will",
+    "would", "could", "should", "may", "might", "shall", "can",
     "to", "of", "in", "for", "on", "with", "at", "by", "from",
     "its", "it", "this", "that", "these", "those", "and", "or",
     "but", "as", "up", "out", "if", "about", "into", "over",
@@ -250,37 +332,33 @@ _PROMPT_UNIFIED = '''\
 
 مخاطب تو: زنان و مردان خوش‌سلیقه، اهل هنر، طراحان و دنبال‌کنندگان مد آوانگارد در ایران هستند.
 
-قوانین ساختاری و ادبی طلایی (نسخه ۱۳.۰):
-۱. لحن نگارش:
-   - صد درصد روزنامه‌نگاری حرفه‌ای، فاخر، داستان‌گو و عمیق، متناسب با ادبیات معتبرترین رسانه‌های مد و لایف‌استایل ایران (مثل مجلات چه‌بپوشم، مهرجامه، مجلات هنری).
-   - دوری کامل از عامیانه‌نویسی، لحن‌های بازاری، زرد، تبلیغاتی یا کلیک‌بیت‌های تکراری (کلماتی مثل "خیره‌کننده"، "شگفت‌انگیز"، "باورنکردنی" مطلقاً ممنوع هستند).
-   - پالت واژگانی فاخر ایرانی را به کار ببر (مانند: سیلوئت، هم‌نشینی فرم‌ها، دگرگونی زیبایی‌شناختی، کانسپچوال، بافت، ریزش پارچه، پویایی پالت، اصالت).
+فرآیند ترجمه و نگارش چندمرحله‌ای شناختی (مکانیزم چندمرحله‌ای لوکس):
+قبل از نوشتن متن نهایی، ۳ مرحله ذهنی زیر را به صورت خودکار طی کن تا ترجمه و خلاصه کاملاً بی‌نقص و مجله‌ای باشد:
+۱. مرحله اول (کالبدشکافی معنایی و خلاصه‌سازی): کل متن خبر انگلیسی را تحلیل کن و مغز متفکر آن (برندها، محصولات، متریال‌ها، پالت رنگی و خلاقیت طراح) را استخراج کن. (به هیچ وجه ترجمه تحت‌اللفظی یا ماشینی نکن).
+۲. مرحله دوم (بومی‌سازی فرهنگی و زیبایی‌شناسی ایران): این نوآوری یا ترند جهانی را با فضای پوشش شهری و باوقار در ایران بسنج؛ مثلاً یک بلیزر شیک را به «مانتو کتی با برش‌های مینی‌مال»، یک ترنچ‌کت را به «بارانی کلاسیک پاییزه»، و روسری‌های ابریشمی را به «مینی‌اسکارف یا باندانا» معادل‌سازی کن تا برای مخاطب ایرانی کاملاً ملموس و قابل استفاده باشد.
+۳. مرحله سوم (نگارش مقتدرانه فارسی): خبر را به صورت یک داستان جذاب و پرکشش با لحن و ادبیات خبرگزاری‌های معتبر مد و سبک زندگی ایران بنویس. جملات روان، گیرا و از نظر دستور زبان فارسی کاملاً سلیس باشند و اصول نیم‌فاصله در آن رعایت شود.
 
-۲. دگرگونی و تنوع ساختاری (جلوگیری از خسته‌کننده بودن):
-   - هرگز یک چارچوب ثابت و تکراری برای همه پست‌ها به کار نبر! ساختار پست باید با توجه به نوع خبر تغییر کند:
-     الف) اگر خبر درباره «معرفی محصول جدید یک برند» است: پست را به شکل یک نقد مینی‌مال طراحی و مهندسی طراحی آن را شرح بده.
-     ب) اگر خبر درباره «یک ترند جهانی» است: آن را بومی‌سازی کن و هم‌نشینی آن با آیتم‌های مرسوم در ایران (مثل مانتو کتی، بارانی، پالتو، شال، مینی‌اسکارف) را توضیح بده.
-     ج) اگر خبر درباره «رویداد یا ران‌وی» است: فضا، اتمسفر و روح خلاق مجموعه را به شکل داستان‌گو و هنری روایت کن.
-   - تنوع بصری ایجاد کن؛ گاهی از نشانه‌های مینی‌مال یونیکد مانند (✦، ⚜، 🕯) یا نقاط خالی به عنوان جداکننده استفاده کن. گاهی نکته استایل را در قالب یک جمله شاعرانه در بدنه متن ذوب کن، و گاهی آن را در انتهای پست به صورت یک "💡 فرمولوژی:" کوتاه و متمایز بیاور. ساختار نباید تکراری شود!
+قوانین ساختاری و تنوع بصری (جلوگیری از خسته‌کننده بودن):
+- هرگز یک چارچوب ثابت و تکراری برای همه پست‌ها به کار نبر! ساختار پست باید با توجه به نوع خبر تغییر کند:
+  الف) اگر خبر درباره «معرفی محصول جدید یک برند» (مثلاً کیف، کتانی، عطر یا اکسسوری جدید) است: پست را به شکل یک نقد مینی‌مال طراحی و مهندسی خلاقیت آن بنویس.
+  ب) اگر خبر درباره «یک ترند جهانی» است: پالت رنگی و نحوه هم‌نشینی آن با آیتم‌های مرسوم در ایران را شرح بده.
+  ج) اگر خبر درباره «رویداد یا ران‌وی» است: اتمسفر و الهام هنری پشت مجموعه را روایت کن.
+- تنوع بصری ایجاد کن؛ گاهی از نشانه‌های مینی‌مال یونیکد مانند (✦، ⚜، 🕯) یا نقاط خالی به عنوان جداکننده استفاده کن. گاهی نکته استایل را در قالب یک جمله شاعرانه در بدنه متن ذوب کن، و گاهی آن را در انتهای پست به صورت یک "💡 فرمولوژی:" کوتاه و متمایز بیاور. ساختار نباید تکراری شود!
 
-۳. بومی‌سازی عمیق برای فضای ایران:
-   - در متن خبر توضیح بده که چرا این رویداد، محصول یا ترند جهانی برای مخاطب خوش‌پوش ایرانی الهام‌بخش است و چگونه می‌توان دراماتولوژی شهری (استایل خیابانی ایرانی) را با آن ارتقا داد.
-
-۴. قوانین فنی تلگرام و HTML:
-   - خروجی تو باید مستقیماً با کدهای HTML تلگرام تگ‌گذاری شده باشد (فقط تگ‌های مجاز تلگرام: <b> برای ضخیم، <i> برای کج).
-   - تیتر اصلی حتماً باید برجسته باشد: ✦ <b>[تیتر کوتاه و مجلل فارسی]</b>
-   - طول کل متن خروجی باید به شدت کنترل شود: **حداکثر ۹۵۰ کاراکتر** (بسیار مهم تا در کپشن عکس تلگرام جا شود و قطع نشود).
-   - رعایت دقیق نیم‌فاصله‌های فارسی (به‌ویژه در افعال و صفت‌ها: «می‌شود»، «ترندهای»، «روایتگری»).
-   - نام برندها، نام طراحان و اصطلاحات تخصصی مد را حتماً با الفبای لاتین بنویس (مثال: Chanel، بارانی، Blazer).
-   - در خط پایانی، امضای کانال را به صورت زیر بیاور:
-     {emoji} <i>@irfashionnews | مجله زیبایی‌شناسی مد</i>
+قوانین فنی تلگرام و HTML:
+- خروجی تو باید مستقیماً با کدهای HTML تلگرام تگ‌گذاری شده باشد (فقط تگ‌های مجاز تلگرام: <b> برای ضخیم، <i> برای کج).
+- تیتر اصلی حتماً باید برجسته باشد: ✦ <b>[تیتر کوتاه، مجلل و ضربه‌زن فارسی]</b>
+- طول کل متن خروجی باید به شدت کنترل شود: **حداکثر ۹۵۰ کاراکتر** (بسیار مهم تا در کپشن عکس تلگرام جا شود و قطع نشود).
+- رعایت دقیق نیم‌فاصله‌های فارسی (به‌ویژه در افعال و صفت‌ها: «می‌شود»، «ترندهای»، «روایتگری»).
+- نام برندها، نام طراحان و اصطلاحات تخصصی مد را حتماً با الفبای لاتین بنویس (مثال: Chanel، بارانی، Blazer).
+- در خط پایانی، امضای کانال را به صورت زیر بیاور:
+  {emoji} <i>@irfashionnews | مجله زیبایی‌شناسی مد</i>
 
 خبر انگلیسی:
 عنوان: {title}
 محتوا: {input_text}
 
 کپشن نهایی تلگرام (با فرمت HTML):'''
-
 
 # ═══════════════════════════════════════════════════════════
 # SECTION 3 — SCHEMA DETECTION (FIX 1)
@@ -305,14 +383,15 @@ class SchemaInfo:
     def is_v11(self) -> bool:
         """True if all v11 state fields are present."""
         return (
-            self.has_posted and self.has_status and
-            self.has_locked_at and self.has_posted_at and
-            self.has_fail_reason
+            self.has_posted
+            and self.has_status
+            and self.has_locked_at
         )
 
-    def __repr__(self):
+    def __str__(self) -> str:
         return (
-            f"SchemaInfo(posted={self.has_posted}, "
+            f"SchemaInfo("
+            f"posted={self.has_posted}, "
             f"status={self.has_status}, "
             f"locked_at={self.has_locked_at}, "
             f"content_hash={self.has_content_hash}, "
@@ -345,8 +424,10 @@ def _detect_schema(
             return True
         except AppwriteException as e:
             msg = str(e.message).lower()
+            # "attribute not found" = field does not exist
             if "attribute not found" in msg:
                 return False
+            # Other error = field probably exists, DB issue
             return True
         except Exception:
             return False
@@ -511,68 +592,44 @@ def _db_delete(
 
 
 # ═══════════════════════════════════════════════════════════
-# SECTION 5 — CORE HELPERS
+# SECTION 5 — AI VALIDATION
 # ═══════════════════════════════════════════════════════════
 
-def _clean_title(title: str) -> str:
-    """Normalizes titles to match common format."""
-    t = title.strip().lower()
-    t = re.sub(r"[^\w\s-]", "", t)
-    return re.sub(r"\s+", " ", t)
+def _is_valid_persian(text: str | None) -> bool:
+    if not text or not isinstance(text, str):
+        return False
+    stripped = text.strip()
+    if len(stripped) < MIN_PERSIAN_CHARS:
+        return False
+    has_persian = any(
+        "\u0600" <= ch <= "\u06ff"
+        or "\ufb50" <= ch <= "\ufdff"
+        or "\ufe70" <= ch <= "\ufeff"
+        for ch in stripped
+    )
+    if not has_persian:
+        return False
+    _ERROR_MARKERS = (
+        "error", "invalid_api_key", "rate_limit", "quota_exceeded",
+        "model_not_found", "context_length_exceeded", "bad request",
+        "unauthorized", "forbidden", "too many requests",
+        "service unavailable", "internal server error",
+        "user not found",
+    )
+    if any(m in stripped.lower() for m in _ERROR_MARKERS):
+        return False
+    return True
 
 
-def _make_content_hash(text: str) -> str:
-    """Sha256 hash of normalized text."""
-    normalized = re.sub(r"[^\w]", "", text.lower())
-    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
-
-
-def _make_title_hash(title: str, feed_url: str) -> str:
-    """Sha256 hash of title and feed url."""
-    normalized = _clean_title(title)
-    combined = f"{normalized}|{feed_url.strip().lower()}"
-    return hashlib.sha256(combined.encode("utf-8")).hexdigest()
-
-
-def _make_domain_hash(domain: str) -> str:
-    """Sha256 hash of domain."""
-    return hashlib.sha256(domain.strip().lower().encode("utf-8")).hexdigest()
-
-
-def _get_domain(url: str) -> str:
-    """Gets the domain from a URL."""
+def _extract_openai_content(data: dict) -> str | None:
     try:
-        parsed = urlparse(url)
-        return parsed.netloc.lower()
-    except Exception:
-        return ""
-
-
-def _query_field_safe(
-    databases, db_id: str, coll_id: str,
-    field: str, value: str, has_field: bool, sdk_mode: str,
-) -> dict | None:
-    """Performs query only if the schema field is detected as active."""
-    if not has_field:
+        return (
+            data.get("choices", [{}])[0]
+            .get("message", {})
+            .get("content", "") or ""
+        ).strip() or None
+    except (IndexError, AttributeError, TypeError):
         return None
-    try:
-        res = _db_list(
-            databases, db_id, coll_id,
-            [Query.equal(field, value)], sdk_mode,
-        )
-        return res
-    except Exception:
-        return None
-
-
-def _detect_sdk_mode(databases, database_id: str, collection_id: str) -> str:
-    """Determines if Appwrite SDK uses tablesDB/list_rows or databases/list_documents."""
-    try:
-        if hasattr(databases, "list_rows"):
-            return "new"
-    except Exception:
-        pass
-    return "legacy"
 
 
 # ═══════════════════════════════════════════════════════════
@@ -593,14 +650,10 @@ async def _validate_groq_key(log_fn=print) -> bool:
                 timeout=aiohttp.ClientTimeout(total=5),
             ) as resp:
                 valid = resp.status == 200
-                if not valid:
-                    log_fn(
-                        f"[startup] Groq key validation failed. "
-                        f"HTTP={resp.status}"
-                    )
+                log_fn(f"[startup] Groq key valid={valid} (HTTP {resp.status})")
                 return valid
     except Exception as e:
-        log_fn(f"[startup] Groq key validation error: {e}")
+        log_fn(f"[startup] Groq key probe failed: {e}")
         return False
 
 
@@ -618,14 +671,13 @@ async def _validate_openrouter_key(log_fn=print) -> bool:
                 timeout=aiohttp.ClientTimeout(total=5),
             ) as resp:
                 valid = resp.status == 200
-                if not valid:
-                    log_fn(
-                        f"[startup] OpenRouter key validation failed. "
-                        f"HTTP={resp.status}"
-                    )
+                log_fn(
+                    f"[startup] OpenRouter key valid={valid} "
+                    f"(HTTP {resp.status})"
+                )
                 return valid
     except Exception as e:
-        log_fn(f"[startup] OpenRouter key validation error: {e}")
+        log_fn(f"[startup] OpenRouter key probe failed: {e}")
         return False
 
 
@@ -640,6 +692,8 @@ async def _call_groq(
 ) -> str | None:
     """
     Groq API caller with model fallback chain.
+    Tries each model in GROQ_MODELS until one succeeds.
+    Skips decommissioned models (HTTP 400 with decommission msg).
     """
     api_key = os.environ.get("GROQ_API_KEY", "").strip()
     if not api_key:
@@ -668,6 +722,7 @@ async def _call_groq(
                 body_text = await resp.text()
 
                 if resp.status == 400:
+                    # Check if this is a decommissioned model error
                     if "decommission" in body_text.lower():
                         log_fn(
                             f"[race] Groq model {model} decommissioned — "
@@ -697,6 +752,7 @@ async def _call_groq(
                 )
                 if valid:
                     return result
+                # Invalid result — try next model
                 continue
 
         except asyncio.CancelledError:
@@ -720,6 +776,8 @@ async def _call_openrouter(
 ) -> str | None:
     """
     OpenRouter API caller with model fallback chain.
+    Tries free model first, paid model as fallback.
+    Skips on 401 (invalid key).
     """
     api_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
     if not api_key:
@@ -750,6 +808,7 @@ async def _call_openrouter(
                 body_text = await resp.text()
 
                 if resp.status == 401:
+                    # Key is invalid — no point trying other models
                     log_fn(
                         f"[race] OpenRouter: 401 invalid key — "
                         f"skipping all OR models."
@@ -757,6 +816,7 @@ async def _call_openrouter(
                     return None
 
                 if resp.status == 402:
+                    # Insufficient credits for paid model
                     log_fn(
                         f"[race] OpenRouter/{model}: 402 credits — "
                         f"trying next."
@@ -1006,18 +1066,17 @@ def _build_mehrjameh_caption(
     category: str,
 ) -> str:
     """
-    Upgraded Luxury Caption Builder (v12.0)
+    Mehrjameh editorial caption.
     Format:
-      ✦ <b>عنوان</b>
-      ─── ⚜ ───
-      روایت امروز مد و استایل
+      <b>عنوان</b>
+      ─────────────
+      مد و فشن ایرانی
 
       خلاصه خبر
 
-      💡 <b>فرمولوژی استایل:</b>
-      نکته استایلی بومی‌سازی شده
+      💡 نکته استایلی
 
-      EMOJI @irfashionnews | مجله مد و زیبایی
+      EMOJI  کانال مد و فشن ایرانی
 
       #hashtags
     """
@@ -1036,10 +1095,10 @@ def _build_mehrjameh_caption(
     emoji     = CATEGORY_EMOJI.get(category, "🌐")
     hash_line = " ".join(hashtags)
 
-    header    = f"✦ <b>{_esc(title_fa.strip())}</b>"
-    sep       = "─── ⚜ ───\n<i>روایت امروز مد و استایل</i>"
-    tip_block = f"💡 <b>فرمولوژی استایل:</b>\n{_esc(tip_fa.strip())}" if tip_fa and tip_fa.strip() else ""
-    footer    = f"{emoji} <i>@irfashionnews | مجله مد و زیبایی</i>"
+    header    = f"<b>{_esc(title_fa.strip())}</b>"
+    sep       = "─────────────\nمد و فشن ایرانی"
+    tip_block = f"💡 {_esc(tip_fa.strip())}" if tip_fa and tip_fa.strip() else ""
+    footer    = f"{emoji}  <i>کانال مد و فشن ایرانی</i>"
 
     # Calculate body budget
     fixed_parts = [header, sep]
@@ -1056,7 +1115,7 @@ def _build_mehrjameh_caption(
     safe_body = _esc(body_fa.strip())
     if body_budget <= 10:
         safe_body = ""
-        header    = f"✦ <b>{_esc(title_fa.strip())[:80]}</b>"
+        header    = f"<b>{_esc(title_fa.strip())[:80]}</b>"
     elif len(safe_body) > body_budget:
         safe_body = safe_body[:body_budget - 1] + "…"
 
@@ -1076,929 +1135,29 @@ def _build_mehrjameh_caption(
 
 
 # ═══════════════════════════════════════════════════════════
-# SECTION 9 — PERSIAN VALIDATION & CONTENT EXTRACTION
+# SECTION 9 — MAIN ENTRY POINT
 # ═══════════════════════════════════════════════════════════
-
-def _is_valid_persian(text: str | None) -> bool:
-    if not text or not isinstance(text, str):
-        return False
-    stripped = text.strip()
-    if len(stripped) < MIN_PERSIAN_CHARS:
-        return False
-    has_persian = any(
-        "\u0600" <= ch <= "\u06ff"
-        or "\ufb50" <= ch <= "\ufdff"
-        or "\ufe70" <= ch <= "\ufeff"
-        for ch in stripped
-    )
-    if not has_persian:
-        return False
-    _ERROR_MARKERS = (
-        "error", "invalid_api_key", "rate_limit", "quota_exceeded",
-        "model_not_found", "context_length_exceeded", "bad request",
-        "unauthorized", "forbidden", "too many requests",
-        "service unavailable", "internal server error",
-        "user not found",
-    )
-    if any(m in stripped.lower() for m in _ERROR_MARKERS):
-        return False
-    return True
-
-
-def _extract_openai_content(data: dict) -> str | None:
-    try:
-        return (
-            data.get("choices", [{}])[0]
-                .get("message", {})
-                .get("content")
-        )
-    except (IndexError, KeyError, AttributeError):
-        return None
-
-
-# ═══════════════════════════════════════════════════════════
-# SECTION 10 — FUZZY SIMILARITY & DEDUP ENGINE
-# ═══════════════════════════════════════════════════════════
-
-def _levenshtein_distance(s1: str, s2: str) -> int:
-    if len(s1) < len(s2):
-        return _levenshtein_distance(s2, s1)
-    if len(s2) == 0:
-        return len(s1)
-    
-    prev_row = list(range(len(s2) + 1))
-    for i, c1 in enumerate(s1):
-        curr_row = [i + 1]
-        for j, c2 in enumerate(s2):
-            insertions = prev_row[j + 1] + 1
-            deletions  = curr_row[j] + 1
-            substitutes = prev_row[j] + (0 if c1 == c2 else 1)
-            curr_row.append(min(insertions, deletions, substitutes))
-        prev_row = curr_row
-        
-    return prev_row[-1]
-
-
-def _fuzzy_similarity(s1: str, s2: str) -> float:
-    normalized1 = _clean_title(s1)
-    normalized2 = _clean_title(s2)
-    max_len = max(len(normalized1), len(normalized2))
-    if max_len == 0:
-        return 1.0
-    dist = _levenshtein_distance(normalized1, normalized2)
-    return 1.0 - (dist / max_len)
-
-
-def _load_recent_titles_posted_only(
-    databases, db_id: str, coll_id: str,
-    sdk_mode: str, count: int = 150,
-    schema=None, log_fn=print,
-) -> list[str]:
-    try:
-        queries = [
-            Query.order_desc("$createdAt"),
-            Query.limit(count),
-        ]
-        if schema and schema.has_status:
-            queries.append(Query.equal("status", STATUS_POSTED))
-        elif schema and schema.has_posted:
-            queries.append(Query.equal("posted", True))
-
-        res = _db_list(databases, db_id, coll_id, queries, sdk_mode)
-        docs = res.get("documents", []) if isinstance(res, dict) else []
-        titles = []
-        for doc in docs:
-            doc_dict = _to_dict_safe(doc)
-            title_val = doc_dict.get("title") if isinstance(doc_dict, dict) else None
-            if title_val:
-                titles.append(_clean_title(title_val))
-        return titles
-    except Exception as e:
-        log_fn(f"[dedup] _load_recent_titles: {e}")
-        return []
-
-
-def _load_recent_domain_hashes(
-    databases, db_id: str, coll_id: str,
-    sdk_mode: str, hours: int = DOMAIN_DEDUP_HOURS,
-    schema=None, log_fn=print,
-) -> set[str]:
-    if not schema or not schema.has_domain_hash:
-        return set()
-    try:
-        threshold = datetime.now(timezone.utc) - timedelta(hours=hours)
-        threshold_iso = threshold.isoformat().replace("+00:00", "Z")
-        
-        queries = [
-            Query.greater_than("$createdAt", threshold_iso),
-            Query.limit(100),
-        ]
-        if schema.has_status:
-            queries.append(Query.equal("status", STATUS_POSTED))
-        elif schema.has_posted:
-            queries.append(Query.equal("posted", True))
-
-        res = _db_list(databases, db_id, coll_id, queries, sdk_mode)
-        docs = res.get("documents", []) if isinstance(res, dict) else []
-        hashes = set()
-        for doc in docs:
-            doc_dict = _to_dict_safe(doc)
-            dh_val = doc_dict.get("domain_hash") if isinstance(doc_dict, dict) else None
-            if dh_val:
-                hashes.add(dh_val)
-        return hashes
-    except Exception as e:
-        log_fn(f"[dedup] _load_recent_domain_hashes: {e}")
-        return set()
-
-
-def _light_duplicate_check(
-    databases, db_id: str, coll_id: str,
-    link: str, content_hash: str, title_hash: str,
-    sdk_mode: str, schema=None, log_fn=print,
-) -> tuple[bool, str]:
-    try:
-        res = _db_list(
-            databases, db_id, coll_id,
-            [Query.equal("link", link[:DB_LINK_MAX])],
-            sdk_mode,
-        )
-        docs = res.get("documents", []) if isinstance(res, dict) else []
-        if docs:
-            return True, "link_exact"
-    except Exception as e:
-        log_fn(f"[dedup] *query*field_safe (link): {e}")
-
-    if schema and schema.has_content_hash:
-        try:
-            res = _query_field_safe(
-                databases, db_id, coll_id, "content_hash",
-                content_hash, schema.has_content_hash, sdk_mode,
-            )
-            docs = res.get("documents", []) if isinstance(res, dict) else []
-            if docs:
-                return True, "content_hash"
-        except Exception as e:
-            log_fn(f"[dedup] *query*field_safe (content_hash): {e}")
-
-    if schema and schema.has_title_hash:
-        try:
-            res = _query_field_safe(
-                databases, db_id, coll_id, "title_hash",
-                title_hash, schema.has_title_hash, sdk_mode,
-            )
-            docs = res.get("documents", []) if isinstance(res, dict) else []
-            if docs:
-                return True, "title_hash"
-        except Exception as e:
-            log_fn(f"[dedup] *query*field_safe (title_hash): {e}")
-
-    return False, ""
-
-
-# ═══════════════════════════════════════════════════════════
-# SECTION 11 — SCORING & CATEGORIZATION
-# ═══════════════════════════════════════════════════════════
-
-def _categorize_and_score(title: str, is_peak: bool) -> tuple[str, int]:
-    clean_t = _clean_title(title)
-    words   = set(clean_t.split())
-    
-    cat_hits = {cat: 0 for cat in CATEGORY_KEYWORDS}
-    for cat, keywords in CATEGORY_KEYWORDS.items():
-        for kw in keywords:
-            if " " in kw:
-                if kw in clean_t:
-                    cat_hits[cat] += 4
-            else:
-                if kw in words:
-                    cat_hits[cat] += 2
-
-    best_cat = "general"
-    max_hits = 0
-    for cat, hits in cat_hits.items():
-        if hits > max_hits:
-            max_hits = hits
-            best_cat = cat
-
-    score = 50
-    score += min(max_hits * 10, 40)
-    
-    if is_peak:
-        score += PEAK_HOUR_BONUS
-        
-    capitals = {"paris", "milan", "london", "york", "tokyo"}
-    if any(cap in words for cap in capitals):
-        score += 10
-        
-    return best_cat, min(score, 100)
-
-
-# ═══════════════════════════════════════════════════════════
-# SECTION 12 — RSS FEED SCANNER & IMAGE EXTRACTOR
-# ═══════════════════════════════════════════════════════════
-
-def _extract_rss_image(entry) -> str | None:
-    try:
-        if "media_content" in entry:
-            for item in entry["media_content"]:
-                if "url" in item and item.get("medium") == "image":
-                    return item["url"]
-                if "url" in item and "image" in item.get("type", ""):
-                    return item["url"]
-            if entry["media_content"] and "url" in entry["media_content"][0]:
-                return entry["media_content"][0]["url"]
-
-        if "links" in entry:
-            for link in entry["links"]:
-                if "image" in link.get("type", ""):
-                    return link["href"]
-
-        if "media_thumbnail" in entry and entry["media_thumbnail"]:
-            return entry["media_thumbnail"][0]["url"]
-
-        if "enclosures" in entry:
-            for enc in entry["enclosures"]:
-                if "image" in enc.get("type", ""):
-                    return enc["href"]
-
-        html_content = ""
-        if "content" in entry:
-            html_content = entry["content"][0]["value"]
-        elif "summary" in entry:
-            html_content = entry["summary"]
-
-        if html_content:
-            soup = BeautifulSoup(html_content, "html.parser")
-            img  = soup.find("img")
-            if img and img.get("src"):
-                return img["src"]
-
-    except Exception:
-        pass
-    return None
-
-
-async def _find_best_candidate(
-    feeds, databases, database_id, collection_id,
-    time_threshold, sdk_mode, schema, now,
-    recent_titles, is_peak, log_fn=print,
-):
-    recent_domains = _load_recent_domain_hashes(
-        databases=databases,
-        db_id=database_id,
-        coll_id=collection_id,
-        sdk_mode=sdk_mode,
-        schema=schema,
-        log_fn=log_fn,
-    )
-
-    candidates = []
-    
-    async def _fetch_feed(session: aiohttp.ClientSession, url: str) -> list:
-        try:
-            async with session.get(
-                url,
-                timeout=aiohttp.ClientTimeout(total=FEED_FETCH_TIMEOUT),
-            ) as resp:
-                text = await resp.text()
-                parsed = feedparser.parse(text)
-                return parsed.entries
-        except Exception as e:
-            log_fn(f"[feed] Error parsing {url[:40]}: {e}")
-            return []
-
-    connector = aiohttp.TCPConnector(ssl=False)
-    async with aiohttp.ClientSession(connector=connector) as session:
-        tasks   = [asyncio.create_task(_fetch_feed(session, f)) for f in feeds]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        for feed_idx, entries in enumerate(results):
-            if not isinstance(entries, list):
-                continue
-            feed_url = feeds[feed_idx]
-            
-            for entry in entries:
-                title = entry.get("title", "")
-                link  = entry.get("link", "")
-                
-                if not title or not link:
-                    continue
-
-                pub_parsed = entry.get("published_parsed")
-                if pub_parsed:
-                    pub_dt = datetime(*pub_parsed[:6], tzinfo=timezone.utc)
-                else:
-                    pub_dt = now
-
-                if pub_dt < time_threshold:
-                    continue
-
-                norm_title = _clean_title(title)
-                
-                # Unwrap recent_titles correctly if it's stored as (title, tokens) tuples
-                is_fuzz_dup = False
-                for rt in recent_titles:
-                    rt_title = rt[0] if isinstance(rt, tuple) else rt
-                    if _fuzzy_similarity(norm_title, rt_title) > FUZZY_SIMILARITY_THRESHOLD:
-                        is_fuzz_dup = True
-                        break
-                if is_fuzz_dup:
-                    continue
-
-                domain = _get_domain(link)
-                if domain:
-                    dh = _make_domain_hash(domain)
-                    if dh in recent_domains:
-                        continue
-
-                category, score = _categorize_and_score(title, is_peak)
-                description = entry.get("summary", "") or entry.get("description", "")
-                
-                candidates.append({
-                    "title":       title,
-                    "link":        link,
-                    "description": description,
-                    "feed_url":    feed_url,
-                    "pub_date":    pub_dt.isoformat().replace("+00:00", "Z"),
-                    "entry":       entry,
-                    "score":       score,
-                    "category":    category,
-                })
-
-    if not candidates:
-        return None
-
-    candidates.sort(key=lambda x: x["score"], reverse=True)
-    
-    for cand in candidates:
-        try:
-            res = _db_list(
-                databases, database_id, collection_id,
-                [Query.equal("link", cand["link"][:DB_LINK_MAX])],
-                sdk_mode,
-            )
-            docs = res.get("documents", []) if isinstance(res, dict) else []
-            if docs:
-                continue
-        except Exception:
-            pass
-
-        log_fn(
-            f"[PASS] fuzz=0.00: "
-            f"{cand['title'][:65]}"
-        )
-        return cand
-
-    return None
-
-
-# ═══════════════════════════════════════════════════════════
-# SECTION 13 — PARALLEL FULL TEXT SCRAPER & IMAGE SELECTOR
-# ═══════════════════════════════════════════════════════════
-
-def _scrape_text(url: str, log_fn=print) -> str | None:
-    try:
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            )
-        }
-        resp = requests.get(url, headers=headers, timeout=SCRAPE_TIMEOUT)
-        if resp.status_code != 200:
-            return None
-            
-        soup = BeautifulSoup(resp.text, "lxml")
-        
-        for element in soup(["script", "style", "header", "footer", "nav", "aside"]):
-            element.decompose()
-            
-        body_text = ""
-        article = soup.find("article")
-        if article:
-            body_text = article.get_text(separator=" ")
-        else:
-            divs = soup.find_all(
-                "div",
-                class_=re.compile(
-                    r"article|body|content|entry|post|story|text",
-                    re.IGNORECASE,
-                ),
-            )
-            if divs:
-                largest_div = max(divs, key=lambda d: len(d.get_text()))
-                body_text = largest_div.get_text(separator=" ")
-            else:
-                body_text = soup.get_text(separator=" ")
-
-        lines = (line.strip() for line in body_text.splitlines())
-        chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
-        text = "\n".join(chunk for chunk in chunks if chunk)
-        
-        return text[:MAX_SCRAPED_CHARS]
-    except Exception as e:
-        log_fn(f"[scrape] Scraper error: {e}")
-        return None
-
-
-def _scrape_images(url: str, rss_entry, log_fn=print) -> list:
-    images = []
-    
-    rss_img = _extract_rss_image(rss_entry)
-    if rss_img:
-        images.append(rss_img)
-
-    try:
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            )
-        }
-        resp = requests.get(url, headers=headers, timeout=SCRAPE_TIMEOUT)
-        if resp.status_code == 200:
-            soup = BeautifulSoup(resp.text, "lxml")
-            
-            og_img = soup.find("meta", property="og:image")
-            if og_img and og_img.get("content"):
-                url_og = og_img["content"]
-                if url_og not in images:
-                    images.append(url_og)
-
-            tw_img = soup.find("meta", name="twitter:image")
-            if tw_img and tw_img.get("content"):
-                url_tw = tw_img["content"]
-                if url_tw not in images:
-                    images.append(url_tw)
-
-            for img in soup.find_all("img"):
-                src = img.get("src") or img.get("data-src") or img.get("data-lazy-src")
-                if not src:
-                    continue
-                
-                if src.startswith("//"):
-                    src = "https:" + src
-                elif src.startswith("/"):
-                    parsed = urlparse(url)
-                    src = f"https://{parsed.netloc}{src}"
-
-                if not src.startswith("http"):
-                    continue
-
-                if any(x in src.lower() for x in ["logo", "icon", "avatar", "sprite", "pixel", "tracker", "spacer"]):
-                    continue
-
-                width  = img.get("width", "")
-                height = img.get("height", "")
-                try:
-                    if width and int(width) < 150:
-                        continue
-                    if height and int(height) < 150:
-                        continue
-                except ValueError:
-                    pass
-
-                if src not in images:
-                    images.append(src)
-
-    except Exception as e:
-        log_fn(f"[scrape] Image scraper error: {e}")
-
-    seen = set()
-    unique_images = []
-    for img in images:
-        if img not in seen:
-            seen.add(img)
-            unique_images.append(img)
-
-    log_fn(f"[scrape] Images: {len(unique_images)}")
-    return unique_images
-
-
-def _select_content(scraped: str | None, desc: str, title: str) -> str:
-    if scraped and len(scraped.strip()) > MIN_CONTENT_CHARS:
-        return scraped.strip()
-    if desc and len(desc.strip()) > 50:
-        soup = BeautifulSoup(desc, "html.parser")
-        text = soup.get_text()
-        if len(text.strip()) > 50:
-            return text.strip()[:MAX_RSS_CHARS]
-    return f"{title}. Full article available on page."
-
-
-# ═══════════════════════════════════════════════════════════
-# SECTION 14 — SOFT LOCK MANAGEMENT
-# ═══════════════════════════════════════════════════════════
-
-def _write_soft_lock(
-    databases, database_id, collection_id,
-    link, title, feed_url, pub_date, source_type,
-    sdk_mode, schema: SchemaInfo,
-    title_hash, content_hash, category,
-    trend_score, post_hour, domain_hash,
-    log_fn=print,
-) -> tuple[bool, str]:
-    now     = datetime.now(timezone.utc)
-    now_iso = now.strftime("%Y-%m-%dT%H:%M:%S.000+00:00")
-
-    existing = _get_existing_record(
-        databases, database_id, collection_id, link, sdk_mode, log_fn
-    )
-
-    if existing is not None:
-        existing_status = existing.get("status", "")
-        existing_posted = existing.get("posted", False)
-        existing_doc_id = existing["$id"]
-        locked_at_str   = existing.get("locked_at", "")
-
-        if existing_posted is True or existing_status == STATUS_POSTED:
-            log_fn("[lock] Already posted — duplicate.")
-            return False, "already_posted"
-
-        if existing_status == STATUS_LOCKED and locked_at_str:
-            try:
-                locked_at = datetime.fromisoformat(
-                    locked_at_str.replace("Z", "+00:00")
-                )
-                age = (now - locked_at).total_seconds()
-                if age < LOCK_TTL_SECONDS:
-                    log_fn(f"[lock] Active lock (age={age:.0f}s). Skip.")
-                    return False, "active_lock"
-                else:
-                    log_fn(f"[lock] Stale lock (age={age:.0f}s). Recovering.")
-                    _delete_record(
-                        databases, database_id, collection_id,
-                        existing_doc_id, sdk_mode, log_fn,
-                    )
-            except Exception as e:
-                log_fn(f"[lock] TTL parse: {e}. Deleting stale.")
-                _delete_record(
-                    databases, database_id, collection_id,
-                    existing_doc_id, sdk_mode, log_fn,
-                )
-        elif existing_status == STATUS_FAILED:
-            log_fn("[lock] Failed → retry. Deleting old.")
-            _delete_record(
-                databases, database_id, collection_id,
-                existing_doc_id, sdk_mode, log_fn,
-            )
-        else:
-            log_fn(f"[lock] Unknown status '{existing_status}' → stale.")
-            _delete_record(
-                databases, database_id, collection_id,
-                existing_doc_id, sdk_mode, log_fn,
-            )
-
-    if hasattr(pub_date, "tzinfo") and pub_date.tzinfo is None:
-        pub_date = pub_date.replace(tzinfo=timezone.utc)
-
-    # Omit custom created_at entirely (Appwrite sets $createdAt automatically)
-    payload: dict = {
-        "link":        link[:DB_LINK_MAX],
-        "title":       title[:DB_TITLE_MAX],
-        "published_at": pub_date.strftime("%Y-%m-%dT%H:%M:%S.000+00:00") if hasattr(pub_date, "strftime") else str(pub_date),
-        "feed_url":    feed_url[:DB_FEED_URL_MAX],
-        "source_type": source_type[:DB_SOURCE_TYPE_MAX],
-        "category":    category[:DB_CATEGORY_MAX],
-        "trend_score": int(trend_score),
-        "post_hour":   int(post_hour),
-    }
-
-    if schema.has_content_hash:
-        payload["content_hash"] = content_hash[:DB_HASH_MAX]
-    if schema.has_title_hash:
-        payload["title_hash"] = title_hash[:DB_HASH_MAX]
-    if schema.has_domain_hash:
-        payload["domain_hash"] = domain_hash[:DB_DOMAIN_HASH_MAX]
-
-    if schema.has_status:
-        payload["status"] = STATUS_LOCKED
-    if schema.has_posted:
-        payload["posted"] = False
-    if schema.has_locked_at:
-        payload["locked_at"] = now_iso
-    if schema.has_posted_at:
-        payload["posted_at"] = ""
-    if schema.has_fail_reason:
-        payload["fail_reason"] = ""
-
-    try:
-        doc    = _db_create(databases, database_id, collection_id, payload, sdk_mode)
-        doc_id = doc.get("$id") or doc.get("id", "")
-        log_fn(f"[lock] ✓ Lock acquired. doc_id={doc_id}")
-        return True, doc_id
-    except AppwriteException as e:
-        msg = str(e.message).lower()
-        if "already exists" in msg or e.code in (409, 400):
-            log_fn("[lock] Race condition — another instance won.")
-            return False, "race_lost"
-        log_fn(f"[lock] DB error: {e.message}")
-        return False, f"db_error: {e.message}"
-    except Exception as e:
-        log_fn(f"[lock] Error: {e}")
-        return False, f"error: {e}"
-
-
-def _get_existing_record(databases, database_id, collection_id, link, sdk_mode, log_fn) -> dict | None:
-    try:
-        res = _db_list(
-            databases, database_id, collection_id,
-            [Query.equal("link", link[:DB_LINK_MAX])], sdk_mode
-        )
-        docs = res.get("documents", []) if isinstance(res, dict) else []
-        if docs:
-            return _to_dict_safe(docs[0])
-    except Exception as e:
-        log_fn(f"[db] *get*existing_record: {e}")
-    return None
-
-
-def _delete_record(databases, database_id, collection_id, doc_id, sdk_mode, log_fn) -> None:
-    try:
-        _db_delete(databases, database_id, collection_id, doc_id, sdk_mode)
-    except Exception as e:
-        log_fn(f"[db] delete error: {e}")
-
-
-def _update_posted_status(
-    databases, database_id: str, collection_id: str,
-    doc_id: str, status: str, schema: SchemaInfo,
-    sdk_mode: str, fail_reason: str = "",
-) -> None:
-    data = {}
-    if schema.has_status:
-        data["status"] = status
-    if schema.has_posted:
-        data["posted"] = (status == STATUS_POSTED)
-    if schema.has_posted_at and status == STATUS_POSTED:
-        data["posted_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-    if schema.has_fail_reason and status == STATUS_FAILED:
-        data["fail_reason"] = fail_reason[:DB_REASON_MAX]
-
-    if not data:
-        if status == STATUS_FAILED:
-            try:
-                _db_delete(databases, database_id, collection_id, doc_id, sdk_mode)
-            except Exception:
-                pass
-        return
-
-    try:
-        _db_update(databases, database_id, collection_id, doc_id, data, sdk_mode)
-    except Exception:
-        pass
-
-
-def _clean_stale_locks(
-    databases, database_id: str, collection_id: str,
-    sdk_mode: str, schema: SchemaInfo, log_fn=print,
-) -> None:
-    if not schema.has_status and not schema.has_posted:
-        return
-    try:
-        stale_threshold = datetime.now(timezone.utc) - timedelta(seconds=LOCK_TTL_SECONDS)
-        stale_threshold_iso = stale_threshold.isoformat().replace("+00:00", "Z")
-
-        queries = [
-            Query.less_than("$createdAt", stale_threshold_iso),
-            Query.limit(100),
-        ]
-        if schema.has_status:
-            queries.append(Query.equal("status", STATUS_LOCKED))
-        elif schema.has_posted:
-            queries.append(Query.equal("posted", False))
-
-        res = _db_list(databases, database_id, collection_id, queries, sdk_mode)
-        docs = res.get("documents", []) if isinstance(res, dict) else []
-        for doc in docs:
-            doc_dict = _to_dict_safe(doc)
-            doc_id = doc_dict.get("$id") if isinstance(doc_dict, dict) else None
-            if doc_id:
-                log_fn(f"[lock] Releasing stale lock {doc_id}...")
-                _update_posted_status(
-                    databases, database_id, collection_id,
-                    doc_id, STATUS_FAILED, schema, sdk_mode, "stale_lock_ttl_timeout",
-                )
-    except Exception as e:
-        log_fn(f"[lock] Error cleaning stale locks: {e}")
-
-
-# ═══════════════════════════════════════════════════════════
-# SECTION 15 — TELEGRAM POSTING
-# ═══════════════════════════════════════════════════════════
-
-async def _post_to_telegram(
-    bot: Bot, chat_id: str, caption: str,
-    image_urls: list, log_fn=print,
-) -> bool:
-    posted = False
-
-    if len(image_urls) >= 2:
-        try:
-            media_group = []
-            for idx, url in enumerate(image_urls[:MAX_IMAGES]):
-                if idx == 0:
-                    media_group.append(InputMediaPhoto(media=url, caption=caption, parse_mode="HTML"))
-                else:
-                    media_group.append(InputMediaPhoto(media=url))
-                    
-            await bot.send_media_group(
-                chat_id=chat_id, media=media_group,
-                disable_notification=True,
-            )
-            log_fn(f"[tg] Album sent with embedded caption. Images={len(media_group)}")
-            posted = True
-        except Exception as e:
-            log_fn(f"[tg] Album with caption failed: {str(e)[:120]}. Falling back to single photo...")
-            if image_urls:
-                try:
-                    await bot.send_photo(
-                        chat_id=chat_id, photo=image_urls[0],
-                        caption=caption, parse_mode="HTML",
-                        disable_notification=True,
-                    )
-                    log_fn("[tg] Single photo fallback with caption succeeded.")
-                    posted = True
-                except Exception as e2:
-                    log_fn(f"[tg] Single photo fallback with caption failed: {str(e2)[:80]}")
-                    
-    elif len(image_urls) == 1:
-        try:
-            await bot.send_photo(
-                chat_id=chat_id, photo=image_urls[0],
-                caption=caption, parse_mode="HTML",
-                disable_notification=True,
-            )
-            log_fn("[tg] Single photo sent with embedded caption.")
-            posted = True
-        except Exception as e:
-            log_fn(f"[tg] Single photo with caption failed: {str(e)[:120]}")
-            
-    if not posted:
-        try:
-            await bot.send_message(
-                chat_id=chat_id,
-                text=caption,
-                parse_mode="HTML",
-                link_preview_options=LinkPreviewOptions(is_disabled=True),
-                disable_notification=True,
-            )
-            log_fn("[tg] Sent standalone text caption.")
-            posted = True
-        except Exception as e:
-            log_fn(f"[tg] Standalone text caption failed: {str(e)[:120]}")
-            
-    return posted
-
-
-def _extract_hashtags_from_text(text: str, limit: int = 4) -> list[str]:
-    t = text.lower()
-    mapping = {
-        "runway":          "#ران_وی #کت_واک",
-        "couture":         "#اوت_کوتور #کوتور",
-        "collection":      "#مجموعه_جدید #کلکسیون",
-        "show":            "#فشن_شو",
-        "gucci":           "#گوچی #Gucci",
-        "chanel":          "#شنل #Chanel",
-        "prada":           "#پرادا #Prada",
-        "balenciaga":      "#بالنسیاگا #Balenciaga",
-        "louis vuitton":   "#لویی_ویتون #LouisVuitton",
-        "dior":            "#دیور #Dior",
-        "hermes":          "#هرمس #Hermes",
-        "saint laurent":   "#سن_لوران #SaintLaurent",
-        "celine":          "#سلین #Celine",
-        "loewe":           "#لوئوه #Loewe",
-        "jacquemus":       "#ژاکموس #Jacquemus",
-        "makeup":          "#میکاپ #آرایش",
-        "skincare":        "#پوست #مراقبت_پوست",
-        "perfume":         "#عطر #ادکلن",
-        "sustainable":     "#مد_پایدار #محیط_زیست",
-        "recycled":        "#مد_پایدار #بازیافت",
-        "gala":            "#گالا #جشنواره",
-        "red carpet":      "#رد_کارپت #فرش_قرمز",
-        "met gala":        "#مت_گالا #MetGala",
-        "how to style":    "#نکته_استایل #راهنمای_استایل",
-        "aesthetic":       "#آستتیک #زیبایی_شناسی",
-        "minimalism":      "#مینیمالیسم #ساده_گرایی",
-    }
-    
-    extracted = []
-    for eng, fa_tags in mapping.items():
-        if eng in t:
-            for tag in fa_tags.split():
-                if tag not in extracted:
-                    extracted.append(tag)
-                    
-    if not extracted:
-         extracted = ["#مد", "#استایل", "#ترند_فصل", "#فشن"]
-         
-    return extracted[:limit]
-
-
-# ═══════════════════════════════════════════════════════════
-# SECTION 16 — SCHEMA MIGRATION UTILITY
-# ═══════════════════════════════════════════════════════════
-
-def _migrate_schema(databases, db_id: str, coll_id: str, log_fn=print) -> None:
-    log_fn("[migration] Starting schema migration...")
-    attributes = [
-        ("posted",      "boolean", False),
-        ("status",      "string",  False, 20),
-        ("locked_at",   "string",  False, 40),
-        ("posted_at",   "string",  False, 40),
-        ("fail_reason", "string",  False, 500),
-        ("content_hash", "string",  False, 100),
-        ("title_hash",   "string",  False, 100),
-        ("domain_hash",  "string",  False, 100),
-    ]
-
-    for attr in attributes:
-        name = attr[0]
-        kind = attr[1]
-        req  = attr[2]
-        try:
-            log_fn(f"[migration] Adding '{name}' ({kind})...")
-            if kind == "boolean":
-                databases.create_boolean_attribute(
-                    database_id=db_id,
-                    collection_id=coll_id,
-                    key=name,
-                    required=req,
-                )
-            elif kind == "string":
-                size = attr[3]
-                databases.create_string_attribute(
-                    database_id=db_id,
-                    collection_id=coll_id,
-                    key=name,
-                    size=size,
-                    required=req,
-                )
-            log_fn(f"[migration] Attribute '{name}' created. Wait 5s...")
-            import time
-            time.sleep(5)
-        except AppwriteException as e:
-            if e.code == 409:
-                log_fn(f"[migration] Attribute '{name}' already exists. OK.")
-            else:
-                log_fn(f"[migration] Error creating attribute '{name}': {e}")
-        except Exception as e:
-            log_fn(f"[migration] Error creating attribute '{name}': {e}")
-
-    log_fn("[migration] Migration completed successfully.")
-
-
-def _cleanup_history(databases, db_id: str, coll_id: str, log_fn=print) -> None:
-    log_fn("[cleanup] Scanning for failed or unposted stale records...")
-    try:
-        threshold = datetime.now(timezone.utc) - timedelta(hours=48)
-        threshold_iso = threshold.isoformat().replace("+00:00", "Z")
-
-        result = databases.list_documents(
-            database_id=db_id,
-            collection_id=coll_id,
-            queries=[
-                Query.less_than("$createdAt", threshold_iso),
-                Query.limit(100),
-            ]
-        )
-        docs = result.get("documents", [])
-        cleaned = 0
-        for doc in docs:
-            status = doc.get("status") or ""
-            posted = doc.get("posted") or False
-            doc_id = doc.get("$id")
-            
-            if status == STATUS_FAILED or (not posted and status != STATUS_POSTED):
-                log_fn(f"[cleanup] Deleting stale doc {doc_id}...")
-                databases.delete_document(
-                    database_id=db_id,
-                    collection_id=coll_id,
-                    document_id=doc_id,
-                )
-                cleaned += 1
-        log_fn(f"[cleanup] Finished. Cleaned {cleaned} documents.")
-    except Exception as e:
-        log_fn(f"[cleanup] Error executing cleanup: {e}")
-
 
 def _format_unified_caption_safety(
     raw_caption: str,
     hashtags: list[str],
     category: str,
 ) -> str:
+    """
+    Cleans up the raw unified caption from the LLM, resolves Markdown blocks,
+    ensures proper footer and appends hashtags safely.
+    """
     import re
     text = raw_caption.strip()
 
+    # Strip code block markdown if present
     if text.startswith("```"):
         text = re.sub(r"^```(?:html)?\s*", "", text, flags=re.IGNORECASE)
         text = re.sub(r"\s*```$", "", text)
     
     text = text.strip()
 
+    # Convert simple ** markdown to <b> tags if any leaked
     parts = text.split("**")
     if len(parts) > 1:
         new_text = []
@@ -2009,6 +1168,7 @@ def _format_unified_caption_safety(
                 new_text.append(part)
         text = "".join(new_text)
 
+    # Let's ensure the categories and footer are in good shape
     CATEGORY_EMOJI = {
         "runway": "👗", "brand": "🏷️", "business": "📊",
         "beauty": "💄", "sustainability": "♻️", "celebrity": "⭐",
@@ -2016,15 +1176,18 @@ def _format_unified_caption_safety(
     }
     emoji = CATEGORY_EMOJI.get(category, "🌐")
 
+    # If the footer is not already in the text, let's append it
     footer_pattern = "@irfashionnews"
     if footer_pattern not in text:
         text += f"\n\n{emoji} <i>@irfashionnews | مجله زیبایی‌شناسی مد</i>"
 
+    # Append hashtags if any, and if they aren't already there
     if hashtags:
         hash_line = " ".join(hashtags)
         if not any(tag in text for part in hashtags for tag in [part, part.lower()]):
             text += f"\n\n{hash_line}"
 
+    # Enforce strict maximum length limit for photo captions in Telegram (1024 characters)
     if len(text) > 1020:
         text = text[:1015] + "…"
 
@@ -2037,62 +1200,48 @@ async def main(event=None, context=None):
 
     log("═══ FashionBot v13.0 started ═══")
 
-    database_id = os.environ.get("APPWRITE_DATABASE_ID", "").strip()
-    token       = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-    chat_id     = os.environ.get("TELEGRAM_CHANNEL_ID", "").strip()
+    loop       = asyncio.get_running_loop()
+    start_time = loop.time()
 
-    if not database_id or not token or not chat_id:
-        error(
-            "Missing critical variables. Ensure TELEGRAM_BOT_TOKEN, "
-            "TELEGRAM_CHANNEL_ID, and APPWRITE_DATABASE_ID are set."
-        )
-        return {
-            "status": "error",
-            "reason": "missing_env_variables",
-        }
+    def elapsed() -> str:
+        return f"{loop.time() - start_time:.1f}"
 
-    client = Client()
-    endpoint = os.environ.get("APPWRITE_ENDPOINT", "").strip()
-    project  = os.environ.get("APPWRITE_PROJECT_ID", "").strip()
-    api_key  = os.environ.get("APPWRITE_API_KEY", "").strip()
+    # ── Environment ──
+    token             = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id           = os.environ.get("TELEGRAM_CHANNEL_ID", "").strip()
+    appwrite_endpoint = os.environ.get(
+        "APPWRITE_ENDPOINT", "https://cloud.appwrite.io/v1"
+    )
+    appwrite_project  = os.environ.get("APPWRITE_PROJECT_ID", "").strip()
+    appwrite_key      = os.environ.get("APPWRITE_API_KEY", "").strip()
+    database_id       = os.environ.get("APPWRITE_DATABASE_ID", "").strip()
 
-    if endpoint:
-        client.set_endpoint(endpoint)
-    if project:
-        client.set_project(project)
-    if api_key:
-        client.set_key(api_key)
+    missing = [
+        k for k, v in {
+            "TELEGRAM_BOT_TOKEN":   token,
+            "TELEGRAM_CHANNEL_ID":  chat_id,
+            "APPWRITE_PROJECT_ID":  appwrite_project,
+            "APPWRITE_API_KEY":     appwrite_key,
+            "APPWRITE_DATABASE_ID": database_id,
+        }.items() if not v
+    ]
+    if missing:
+        error(f"Missing env vars: {missing}")
+        return {"status": "error", "missing_vars": missing}
 
-    databases = Databases(client)
-    sdk_mode  = _detect_sdk_mode(databases, database_id, COLLECTION_ID)
+    # ── Clients ──
+    bot       = Bot(token=token)
+    aw_client = Client()
+    aw_client.set_endpoint(appwrite_endpoint)
+    aw_client.set_project(appwrite_project)
+    aw_client.set_key(appwrite_key)
+    databases = Databases(aw_client)
+    sdk_mode  = "new" if hasattr(databases, "list_rows") else "legacy"
     log(f"SDK mode: {sdk_mode}")
 
-    is_migration = False
-    is_cleanup   = False
-    if event and isinstance(event, dict) and "params" in event:
-        params       = event.get("params", {})
-        is_migration = params.get("migrate") or params.get("migration") or False
-        is_cleanup   = params.get("cleanup") or params.get("clear") or False
-
-    import sys
-    if "--migrate" in sys.argv:
-        is_migration = True
-    if "--cleanup" in sys.argv:
-        is_cleanup = True
-
-    if is_migration:
-        _migrate_schema(databases, database_id, COLLECTION_ID, log)
-        return {"status": "success", "action": "migration"}
-
-    if is_cleanup:
-        _cleanup_history(databases, database_id, COLLECTION_ID, log)
-        return {"status": "success", "action": "cleanup"}
-
-    start_time = datetime.now()
-    def elapsed() -> str:
-        return f"{(datetime.now() - start_time).total_seconds():.1f}"
-
+    # ── Startup: schema detection + key validation ──────────
     log(f"[{elapsed()}s] Detecting schema and validating AI keys...")
+
     schema, groq_ok, or_ok = await asyncio.gather(
         loop.run_in_executor(
             None, _detect_schema,
@@ -2108,6 +1257,16 @@ async def main(event=None, context=None):
         f"OpenRouter={'✓' if or_ok else '✗'}"
     )
 
+    if not groq_ok and not or_ok:
+        error(
+            "No working AI providers. "
+            "Check GROQ_API_KEY and OPENROUTER_API_KEY."
+        )
+        return {
+            "status": "error",
+            "reason": "no_ai_providers",
+        }
+
     now            = datetime.now(timezone.utc)
     time_threshold = now - timedelta(hours=ARTICLE_AGE_HOURS)
     current_hour   = now.hour
@@ -2117,13 +1276,12 @@ async def main(event=None, context=None):
         f"Peak={'YES' if is_peak else 'no'}"
     )
 
+    # Load posted-only titles for fuzzy dedup
     recent_titles = _load_recent_titles_posted_only(
         databases, database_id, COLLECTION_ID,
         sdk_mode, FUZZY_LOOKBACK_COUNT, schema, log,
     )
     log(f"[{elapsed()}s] {len(recent_titles)} posted titles loaded.")
-
-    _clean_stale_locks(databases, database_id, COLLECTION_ID, sdk_mode, schema, log)
 
     # ════════════════════════════════
     # PHASE 1 — RSS SCAN
@@ -2217,6 +1375,7 @@ async def main(event=None, context=None):
         return {"status": "skipped", "reason": "thin_content", "posted": False}
 
     # ════════════════════════════════
+    # ════════════════════════════════
     # PHASE 4 — UNIFIED AI GENERATION
     # ════════════════════════════════
     log(f"[{elapsed()}s] Phase 4: Generating unified premium HTML caption...")
@@ -2252,7 +1411,6 @@ async def main(event=None, context=None):
     caption = _format_unified_caption_safety(caption_raw, hashtags, category)
     log(f"[{elapsed()}s] Caption={len(caption)}ch")
 
-    # ════════════════════════════════
     # PHASE 6 — SOFT LOCK WRITE
     # ════════════════════════════════
     log(f"[{elapsed()}s] Phase 6: Soft lock...")
@@ -2284,91 +1442,1165 @@ async def main(event=None, context=None):
     log(f"[{elapsed()}s] Lock acquired. doc_id={doc_id}")
 
     # ════════════════════════════════
-    # PHASE 7 — FUZZY DEDUP CHECK
+    # PHASE 7 — POST TO TELEGRAM
     # ════════════════════════════════
-    log(f"[{elapsed()}s] Phase 7: Fuzzy dedup...")
-    recent_titles_v2 = _load_recent_titles_posted_only(
-        databases, database_id, COLLECTION_ID,
-        sdk_mode, FUZZY_LOOKBACK_COUNT, schema, log,
-    )
-    
-    is_fuzzy_dup = False
-    match_title  = ""
-    norm_title   = _clean_title(title)
-    
-    for rt in recent_titles_v2:
-        if isinstance(rt, tuple):
-            rt_title = rt[0]
-        else:
-            rt_title = rt
-            
-        sim = _fuzzy_similarity(norm_title, rt_title)
-        if sim > FUZZY_SIMILARITY_THRESHOLD:
-            is_fuzzy_dup = True
-            match_title  = rt_title
-            break
-
-    if is_fuzzy_dup:
-        error(
-            f"[{elapsed()}s] Fuzzy duplicate found during lock step! "
-            f"Matches: '{match_title[:50]}'. Releasing lock."
-        )
-        _update_posted_status(
-            databases, database_id, COLLECTION_ID,
-            doc_id, STATUS_FAILED, schema, sdk_mode, "fuzzy_duplicate_race_loss",
-        )
-        return {
-            "status": "success",
-            "posted": False,
-            "reason": "fuzzy_duplicate_race_loss",
-        }
-
-    # ════════════════════════════════
-    # PHASE 8 — POST TO TELEGRAM
-    # ════════════════════════════════
-    log(f"[{elapsed()}s] Phase 8: Posting to channel {chat_id[:10]}...")
-    bot = Bot(token=token)
-    
+    log(f"[{elapsed()}s] Phase 7: Posting...")
+    posted     = False
+    post_error = ""
     try:
-        post_success = await asyncio.wait_for(
+        posted = await asyncio.wait_for(
             _post_to_telegram(bot, chat_id, caption, image_urls, log),
             timeout=TELEGRAM_TIMEOUT,
         )
     except asyncio.TimeoutError:
-        error(f"[{elapsed()}s] Telegram post timed out.")
-        post_success = False
+        post_error = "telegram_timeout"
+        error(f"[{elapsed()}s] Telegram timed out.")
+    except Exception as e:
+        post_error = str(e)[:200]
+        error(f"[{elapsed()}s] Telegram: {e}")
 
-    if post_success:
-        log(f"[{elapsed()}s] ✓ Successfully posted!")
-        _update_posted_status(
-            databases, database_id, COLLECTION_ID,
-            doc_id, STATUS_POSTED, schema, sdk_mode,
-        )
-        posted = True
+    # ════════════════════════════════
+    # PHASE 8 — UPDATE DB STATE
+    # ════════════════════════════════
+    if schema.is_v11:
+        if posted:
+            _mark_posted(
+                databases, database_id, COLLECTION_ID,
+                doc_id, sdk_mode, log,
+            )
+            log(f"[{elapsed()}s] DB → posted=true ✓")
+        else:
+            _mark_failed(
+                databases, database_id, COLLECTION_ID,
+                doc_id, sdk_mode,
+                reason=post_error or "telegram_failed",
+                log_fn=log,
+            )
+            error(f"[{elapsed()}s] DB → status=failed")
     else:
-        error(f"[{elapsed()}s] ✗ Telegram post failed.")
-        _update_posted_status(
-            databases, database_id, COLLECTION_ID,
-            doc_id, STATUS_FAILED, schema, sdk_mode, "telegram_posting_timeout_or_error",
+        log(
+            f"[{elapsed()}s] Schema missing v11 fields — "
+            f"skipping status update. Run --migrate."
         )
-        posted = False
 
+    result = {
+        "images":     image_urls,
+        "caption":    caption,
+        "article_id": doc_id,
+        "status":     "success" if posted else "failed",
+        "title":      title[:80],
+        "category":   category,
+        "score":      score,
+    }
     log(
         f"═══ v13.0 done in {elapsed()}s | "
-        f"posted={posted} | score={score} ═══"
+        f"{'POSTED ✓' if posted else 'FAILED ✗'} ═══"
     )
-    return {
-        "status": "success",
-        "posted": posted,
-        "score":  score,
+    return result
+
+
+# ═══════════════════════════════════════════════════════════
+# SECTION 10 — FEED SCANNING & CANDIDATE SELECTION
+# ═══════════════════════════════════════════════════════════
+
+async def _find_best_candidate(
+    feeds, databases, database_id, collection_id,
+    time_threshold, sdk_mode, schema, now,
+    recent_titles, is_peak, log_fn=print,
+):
+    loop  = asyncio.get_running_loop()
+    tasks = [
+        loop.run_in_executor(
+            None, _fetch_feed, url, time_threshold, log_fn
+        )
+        for url in feeds
+    ]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    all_candidates = []
+    for i, result in enumerate(results):
+        if isinstance(result, Exception):
+            log_fn(f"[feed] Error ({feeds[i][:45]}): {result}")
+            continue
+        if result:
+            all_candidates.extend(result)
+
+    log_fn(f"[feed] {len(all_candidates)} articles collected.")
+    if not all_candidates:
+        return None
+
+    for c in all_candidates:
+        c["score"]    = _score_article(c, now, is_peak)
+        c["category"] = _detect_category(c["title"], c["description"])
+
+    all_candidates.sort(key=lambda x: x["score"], reverse=True)
+
+    log_fn("[feed] Top 5:")
+    for c in all_candidates[:5]:
+        log_fn(
+            f"  [{c['score']:>3}] [{c['category']:<14}] "
+            f"{c['title'][:58]}"
+        )
+
+    recent_domain_hashes = _load_recent_domain_hashes(
+        databases, database_id, collection_id, sdk_mode, schema, log_fn
+    )
+    seen_domains: set[str] = set()
+
+    for c in all_candidates:
+        link         = c["link"]
+        title        = c["title"]
+        feed_url     = c["feed_url"]
+        domain       = _get_domain(link)
+        content_hash = _make_content_hash(title)
+        title_hash   = _make_title_hash(title, feed_url)
+        domain_hash  = _make_domain_hash(domain)
+
+        # L1: Exact URL
+        r = _query_field_safe(
+            databases, database_id, collection_id,
+            "link", link[:DB_LINK_MAX], sdk_mode, schema, log_fn,
+        )
+        if r is True:
+            log_fn(f"[SKIP] L1: {title[:58]}")
+            continue
+
+        # L2: Content hash (if field exists)
+        if schema.has_content_hash:
+            r = _query_field_safe(
+                databases, database_id, collection_id,
+                "content_hash", content_hash, sdk_mode, schema, log_fn,
+            )
+            if r is True:
+                log_fn(f"[SKIP] L2: {title[:58]}")
+                continue
+
+        # L2b: Title hash (if field exists)
+        if schema.has_title_hash:
+            r = _query_field_safe(
+                databases, database_id, collection_id,
+                "title_hash", title_hash, sdk_mode, schema, log_fn,
+            )
+            if r is True:
+                log_fn(f"[SKIP] L2b: {title[:58]}")
+                continue
+
+        # L3: Fuzzy
+        is_fuzz, matched, fuzz_score = _fuzzy_duplicate(
+            title, recent_titles
+        )
+        if is_fuzz:
+            log_fn(
+                f"[SKIP] L3 fuzzy={fuzz_score:.2f}: "
+                f"{title[:40]} ≈ {(matched or '')[:30]}"
+            )
+            continue
+
+        # L4b: Domain informational
+        if domain_hash in recent_domain_hashes:
+            log_fn(f"[INFO] L4b: domain {domain} seen recently.")
+
+        # L4a: One domain per run
+        if domain in seen_domains:
+            log_fn(f"[SKIP] L4a domain/run: {title[:58]}")
+            continue
+
+        seen_domains.add(domain)
+        log_fn(f"[PASS] fuzz={fuzz_score:.2f}: {title[:58]}")
+        return c
+
+    log_fn("[feed] All candidates exhausted.")
+    return None
+
+
+def _fetch_feed(
+    feed_url: str,
+    time_threshold: datetime,
+    log_fn=print,
+) -> list:
+    import socket
+    try:
+        old = socket.getdefaulttimeout()
+        socket.setdefaulttimeout(FEED_FETCH_TIMEOUT)
+        feed = feedparser.parse(feed_url)
+        socket.setdefaulttimeout(old)
+    except Exception as e:
+        log_fn(f"[feed] feedparser error ({feed_url[:45]}): {e}")
+        return []
+
+    candidates = []
+    for entry in feed.entries:
+        published = (
+            entry.get("published_parsed") or entry.get("updated_parsed")
+        )
+        if not published:
+            continue
+        pub_date = datetime(*published[:6], tzinfo=timezone.utc)
+        if pub_date < time_threshold:
+            continue
+        title = (entry.get("title") or "").strip()
+        link  = (entry.get("link")  or "").strip()
+        if not title or not link:
+            continue
+        raw  = entry.get("summary") or entry.get("description") or ""
+        desc = re.sub(r"<[^>]+>", " ", raw)
+        desc = re.sub(r"\s+",     " ", desc).strip()
+        candidates.append({
+            "title": title, "link": link,
+            "description": desc, "feed_url": feed_url,
+            "pub_date": pub_date, "entry": entry,
+            "score": 0, "category": "general",
+        })
+    return candidates
+
+
+def _score_article(
+    candidate: dict, now: datetime, is_peak: bool = False
+) -> int:
+    score     = 0
+    age_hours = (now - candidate["pub_date"]).total_seconds() / 3600
+    title_lower = candidate["title"].lower()
+    desc_lower  = candidate["description"].lower()
+    combined  = (title_lower + " " + desc_lower)
+
+    # 1. Filter out highly local US/UK discount store news & irrelevant topics
+    unwanted_keywords = [
+        "walmart", "target store", "kohls", "tj maxx", "marshalls", "kohl's",
+        "retail sales", "store closing", "malls closing", "bankruptcy", "nordstrom rack",
+        "layoffs", "strike", "amazon warehouse", "retailer", "earnings report", "target's"
+    ]
+    if any(ukw in combined for ukw in unwanted_keywords):
+        return 0  # discard immediately by scoring 0
+
+    # 2. Recency scoring
+    if age_hours <= 3:
+        score += SCORE_RECENCY_MAX
+    elif age_hours <= ARTICLE_AGE_HOURS:
+        ratio  = 1 - (age_hours - 3) / (ARTICLE_AGE_HOURS - 3)
+        score += int(SCORE_RECENCY_MAX * ratio)
+
+    # 3. Product Launch & Brand releases boost
+    product_keywords = [
+        "sneaker", "handbag", "it-bag", "perfume", "drop", "capsule collection",
+        "collaboration", "collab", "limited edition", "watches", "sneakers",
+        "fragrance", "jewelry", "bag", "accessory", "accessories"
+    ]
+    if any(pkw in title_lower for pkw in product_keywords):
+        score += 15
+
+    # 4. General trend keywords
+    matched     = 0
+    for kw in TREND_KEYWORDS:
+        if matched >= 3: break
+        if kw in title_lower:
+            score += SCORE_TITLE_KEYWORD; matched += 1
+        elif kw in desc_lower:
+            score += SCORE_DESC_KEYWORD;  matched += 1
+
+    if _extract_rss_image(candidate["entry"]):
+        score += SCORE_HAS_IMAGE
+    if len(candidate["description"]) > 200:
+        score += SCORE_DESC_LENGTH
+    if is_peak:
+        score += PEAK_HOUR_BONUS
+
+    fashion_hits = sum(
+        1 for kw in FASHION_RELEVANCE_KEYWORDS if kw in combined
+    )
+    if fashion_hits >= 2:
+        score += SCORE_FASHION_RELEVANCE
+    elif fashion_hits == 1:
+        score += SCORE_FASHION_RELEVANCE // 2
+    else:
+        score = max(0, score - 30)
+
+    return min(score, 100)
+
+
+def _detect_category(title: str, description: str) -> str:
+    combined = (title + " " + description).lower()
+    for cat, keywords in CONTENT_CATEGORIES.items():
+        for kw in keywords:
+            if kw in combined:
+                return cat
+    return "general"
+
+
+def _extract_hashtags_from_text(text: str) -> list[str]:
+    lower    = text.lower()
+    hashtags = []
+    seen: set[str] = set()
+    for keyword, tags in HASHTAG_MAP.items():
+        if keyword in lower and keyword not in seen:
+            hashtags.append(tags)
+            seen.add(keyword)
+            if len(hashtags) >= MAX_HASHTAGS:
+                break
+    return hashtags
+
+
+# ═══════════════════════════════════════════════════════════
+# SECTION 11 — SCHEMA-ADAPTIVE DEDUPLICATION (FIX 1)
+# ═══════════════════════════════════════════════════════════
+
+def _query_field_safe(
+    databases,
+    database_id: str,
+    collection_id: str,
+    field: str,
+    value: str,
+    sdk_mode: str,
+    schema: SchemaInfo,
+    log_fn=print,
+) -> bool | None:
+    """
+    Query field=value, optionally filtered by posted=true.
+
+    If schema.has_posted → adds posted=True filter (v11 mode).
+    If schema missing posted → queries field only (legacy mode,
+    more conservative — may skip already-posted articles).
+
+    Returns True (found), False (not found), None (DB error=safe).
+    """
+    try:
+        if schema.has_posted:
+            queries = [
+                Query.equal(field, value),
+                Query.equal("posted", True),
+                Query.limit(1),
+            ]
+        else:
+            # Legacy mode: no posted field — query field only
+            queries = [
+                Query.equal(field, value),
+                Query.limit(1),
+            ]
+        r = _db_list(databases, database_id, collection_id, queries, sdk_mode)
+        return r["total"] > 0
+    except AppwriteException as e:
+        msg = str(e.message).lower()
+        if "attribute not found" in msg:
+            log_fn(f"[dedup] Field '{field}' not in schema — treating as safe.")
+            return False
+        log_fn(f"[dedup] _query_field_safe ({field}): {e.message}")
+        return None
+    except Exception as e:
+        log_fn(f"[dedup] _query_field_safe ({field}): {e}")
+        return None
+
+
+def _light_duplicate_check(
+    databases,
+    database_id: str,
+    collection_id: str,
+    link: str,
+    content_hash: str,
+    title_hash: str,
+    sdk_mode: str,
+    schema: SchemaInfo,
+    log_fn=print,
+) -> tuple[bool, str]:
+    """
+    Pre-AI duplicate check.
+    v11 schema: blocks posted=true only.
+    Legacy schema: blocks any existing link match.
+    """
+    # Always check link
+    r = _query_field_safe(
+        databases, database_id, collection_id,
+        "link", link[:DB_LINK_MAX], sdk_mode, schema, log_fn,
+    )
+    if r is True:
+        return True, "dup_link"
+
+    # Check content_hash only if field exists
+    if schema.has_content_hash:
+        r = _query_field_safe(
+            databases, database_id, collection_id,
+            "content_hash", content_hash, sdk_mode, schema, log_fn,
+        )
+        if r is True:
+            return True, "dup_content_hash"
+
+    # Check title_hash only if field exists
+    if schema.has_title_hash:
+        r = _query_field_safe(
+            databases, database_id, collection_id,
+            "title_hash", title_hash, sdk_mode, schema, log_fn,
+        )
+        if r is True:
+            return True, "dup_title_hash"
+
+    return False, ""
+
+
+def _load_recent_titles_posted_only(
+    databases,
+    database_id: str,
+    collection_id: str,
+    sdk_mode: str,
+    limit: int,
+    schema: SchemaInfo,
+    log_fn=print,
+) -> list:
+    """
+    Load recent titles for fuzzy matching.
+    v11 schema: posted=true only.
+    Legacy schema: all recent records (no posted filter).
+    """
+    try:
+        if schema.has_posted:
+            queries = [
+                Query.equal("posted", True),
+                Query.limit(limit),
+                Query.order_desc("$createdAt"),
+            ]
+        else:
+            queries = [
+                Query.limit(limit),
+                Query.order_desc("$createdAt"),
+            ]
+        r    = _db_list(databases, database_id, collection_id, queries, sdk_mode)
+        docs = r.get("documents", r.get("rows", []))
+        return [
+            (d.get("title", ""), _normalize_tokens(d.get("title", "")))
+            for d in docs if d.get("title")
+        ]
+    except Exception as e:
+        log_fn(f"[dedup] _load_recent_titles: {e}")
+        return []
+
+
+def _load_recent_domain_hashes(
+    databases,
+    database_id: str,
+    collection_id: str,
+    sdk_mode: str,
+    schema: SchemaInfo,
+    log_fn=print,
+) -> set:
+    cutoff     = datetime.now(timezone.utc) - timedelta(hours=DOMAIN_DEDUP_HOURS)
+    cutoff_str = cutoff.strftime("%Y-%m-%dT%H:%M:%S.000+00:00")
+    try:
+        queries = [
+            Query.greater_than("$createdAt", cutoff_str),
+            Query.limit(200),
+        ]
+        if schema.has_posted:
+            queries.append(Query.equal("posted", True))
+        r    = _db_list(databases, database_id, collection_id, queries, sdk_mode)
+        docs = r.get("documents", r.get("rows", []))
+        return {d["domain_hash"] for d in docs if d.get("domain_hash")}
+    except Exception as e:
+        log_fn(f"[dedup] _load_recent_domain_hashes: {e}")
+        return set()
+
+
+# ═══════════════════════════════════════════════════════════
+# SECTION 12 — SOFT LOCK & STATE TRANSITIONS
+# ═══════════════════════════════════════════════════════════
+
+def _write_soft_lock(
+    databases, database_id, collection_id,
+    link, title, feed_url, pub_date, source_type,
+    sdk_mode, schema: SchemaInfo,
+    title_hash, content_hash, category,
+    trend_score, post_hour, domain_hash,
+    log_fn=print,
+) -> tuple[bool, str]:
+    """
+    Acquire distributed soft lock.
+    Adapts payload based on schema fields available.
+    """
+    now     = datetime.now(timezone.utc)
+    now_iso = now.strftime("%Y-%m-%dT%H:%M:%S.000+00:00")
+
+    existing = _get_existing_record(
+        databases, database_id, collection_id, link, sdk_mode, log_fn
+    )
+
+    if existing is not None:
+        existing_status = existing.get("status", "")
+        existing_posted = existing.get("posted", False)
+        existing_doc_id = existing["$id"]
+        locked_at_str   = existing.get("locked_at", "")
+
+        if existing_posted is True or existing_status == STATUS_POSTED:
+            log_fn("[lock] Already posted — duplicate.")
+            return False, "already_posted"
+
+        if existing_status == STATUS_LOCKED and locked_at_str:
+            try:
+                locked_at = datetime.fromisoformat(
+                    locked_at_str.replace("Z", "+00:00")
+                )
+                age = (now - locked_at).total_seconds()
+                if age < LOCK_TTL_SECONDS:
+                    log_fn(f"[lock] Active lock (age={age:.0f}s). Skip.")
+                    return False, "active_lock"
+                else:
+                    log_fn(f"[lock] Stale lock (age={age:.0f}s). Recovering.")
+                    _delete_record(
+                        databases, database_id, collection_id,
+                        existing_doc_id, sdk_mode, log_fn,
+                    )
+            except Exception as e:
+                log_fn(f"[lock] TTL parse: {e}. Deleting stale.")
+                _delete_record(
+                    databases, database_id, collection_id,
+                    existing_doc_id, sdk_mode, log_fn,
+                )
+        elif existing_status == STATUS_FAILED:
+            log_fn("[lock] Failed → retry. Deleting old.")
+            _delete_record(
+                databases, database_id, collection_id,
+                existing_doc_id, sdk_mode, log_fn,
+            )
+        else:
+            log_fn(f"[lock] Unknown status '{existing_status}' → stale.")
+            _delete_record(
+                databases, database_id, collection_id,
+                existing_doc_id, sdk_mode, log_fn,
+            )
+
+    if pub_date.tzinfo is None:
+        pub_date = pub_date.replace(tzinfo=timezone.utc)
+
+    # Build payload — only include fields that exist in schema
+    payload: dict = {
+        "link":        link[:DB_LINK_MAX],
+        "title":       title[:DB_TITLE_MAX],
+        "published_at": pub_date.strftime("%Y-%m-%dT%H:%M:%S.000+00:00"),
+        "feed_url":    feed_url[:DB_FEED_URL_MAX],
+        "source_type": source_type[:DB_SOURCE_TYPE_MAX],
+        "category":    category[:DB_CATEGORY_MAX],
+        "trend_score": int(trend_score),
+        "post_hour":   int(post_hour),
     }
 
+    if schema.has_content_hash:
+        payload["content_hash"] = content_hash[:DB_HASH_MAX]
+    if schema.has_title_hash:
+        payload["title_hash"] = title_hash[:DB_HASH_MAX]
+    if schema.has_domain_hash:
+        payload["domain_hash"] = domain_hash[:DB_DOMAIN_HASH_MAX]
 
-try:
-    loop = asyncio.get_event_loop()
-except RuntimeError:
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+    # v11 state fields
+    if schema.has_status:
+        payload["status"] = STATUS_LOCKED
+    if schema.has_posted:
+        payload["posted"] = False
+    if schema.has_locked_at:
+        payload["locked_at"] = now_iso
+    if schema.has_posted_at:
+        payload["posted_at"] = ""
+    if schema.has_fail_reason:
+        payload["fail_reason"] = ""
+
+    try:
+        doc    = _db_create(databases, database_id, collection_id, payload, sdk_mode)
+        doc_id = doc.get("$id") or doc.get("id", "")
+        log_fn(f"[lock] ✓ Lock acquired. doc_id={doc_id}")
+        return True, doc_id
+    except AppwriteException as e:
+        msg = str(e.message).lower()
+        if "already exists" in msg or e.code in (409, 400):
+            log_fn("[lock] Race condition — another instance won.")
+            return False, "race_lost"
+        log_fn(f"[lock] DB error: {e.message}")
+        return False, f"db_error: {e.message}"
+    except Exception as e:
+        log_fn(f"[lock] Error: {e}")
+        return False, f"error: {e}"
+
+
+def _mark_posted(
+    databases, database_id, collection_id,
+    doc_id, sdk_mode, log_fn=print,
+) -> bool:
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000+00:00")
+    return _update_record(
+        databases, database_id, collection_id, doc_id, sdk_mode,
+        {"status": STATUS_POSTED, "posted": True, "posted_at": now_iso},
+        log_fn,
+    )
+
+
+def _mark_failed(
+    databases, database_id, collection_id,
+    doc_id, sdk_mode, reason, log_fn=print,
+) -> bool:
+    return _update_record(
+        databases, database_id, collection_id, doc_id, sdk_mode,
+        {
+            "status":      STATUS_FAILED,
+            "posted":      False,
+            "fail_reason": reason[:DB_REASON_MAX],
+        },
+        log_fn,
+    )
+
+
+def _update_record(
+    databases, database_id, collection_id,
+    doc_id, sdk_mode, fields, log_fn=print,
+) -> bool:
+    try:
+        _db_update(databases, database_id, collection_id, doc_id, fields, sdk_mode)
+        log_fn(f"[db] {doc_id} → {list(fields.keys())}")
+        return True
+    except Exception as e:
+        log_fn(f"[db] Update failed ({doc_id}): {e}")
+        return False
+
+
+def _get_existing_record(
+    databases, database_id, collection_id,
+    link, sdk_mode, log_fn=print,
+) -> dict | None:
+    try:
+        r    = _db_list(
+            databases, database_id, collection_id,
+            [Query.equal("link", link[:DB_LINK_MAX]), Query.limit(1)],
+            sdk_mode,
+        )
+        docs = r.get("documents", r.get("rows", []))
+        return docs[0] if docs else None
+    except Exception as e:
+        log_fn(f"[db] _get_existing_record: {e}")
+        return None
+
+
+def _delete_record(
+    databases, database_id, collection_id,
+    doc_id, sdk_mode, log_fn=print,
+) -> None:
+    try:
+        _db_delete(databases, database_id, collection_id, doc_id, sdk_mode)
+        log_fn(f"[db] Deleted: {doc_id}")
+    except Exception as e:
+        log_fn(f"[db] Delete failed ({doc_id}): {e}")
+
+
+# ═══════════════════════════════════════════════════════════
+# SECTION 13 — HASH & FUZZY UTILITIES
+# ═══════════════════════════════════════════════════════════
+
+def _make_content_hash(title: str) -> str:
+    tokens = _normalize_tokens(title)
+    return hashlib.sha256(
+        " ".join(sorted(tokens)).encode("utf-8")
+    ).hexdigest()
+
+def _make_title_hash(title: str, feed_url: str) -> str:
+    raw = (title.lower().strip() + feed_url[:50]).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+def _make_domain_hash(domain: str) -> str:
+    return hashlib.sha256(
+        domain.encode("utf-8")
+    ).hexdigest()[:DB_DOMAIN_HASH_MAX]
+
+def _normalize_tokens(title: str) -> frozenset:
+    title = re.sub(r"[^a-z0-9\s]", " ", title.lower())
+    return frozenset(
+        t for t in title.split()
+        if t not in TITLE_STOP_WORDS and len(t) >= 2
+    )
+
+def _jaccard(a: frozenset, b: frozenset) -> float:
+    if not a or not b: return 0.0
+    return len(a & b) / len(a | b)
+
+def _fuzzy_duplicate(
+    title: str, recent_titles: list
+) -> tuple[bool, str | None, float]:
+    if not recent_titles: return False, None, 0.0
+    incoming = _normalize_tokens(title)
+    best     = 0.0
+    match    = None
+    for stored_title, stored_tokens in recent_titles:
+        s = _jaccard(incoming, stored_tokens)
+        if s > best:
+            best  = s
+            match = stored_title
+    if best >= FUZZY_SIMILARITY_THRESHOLD:
+        return True, match, best
+    return False, None, best
+
+def _get_domain(url: str) -> str:
+    try:
+        parts = urlparse(url).netloc.replace("www.", "").split(".")
+        return ".".join(parts[-2:]) if len(parts) >= 2 else url[:30]
+    except Exception:
+        return url[:30]
+
+
+# ═══════════════════════════════════════════════════════════
+# SECTION 14 — SCRAPING
+# ═══════════════════════════════════════════════════════════
+
+def _select_content(
+    scraped_text: str | None, description: str, title: str,
+) -> str:
+    if scraped_text and len(scraped_text) >= MIN_CONTENT_CHARS:
+        return scraped_text[:MAX_SCRAPED_CHARS]
+    if description and len(description) >= MIN_CONTENT_CHARS:
+        return description[:MAX_RSS_CHARS]
+    return title
+
+
+def _scrape_text(url: str, log_fn=print) -> str | None:
+    try:
+        resp = requests.get(
+            url,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                ),
+                "Accept-Language": "en-US,en;q=0.9",
+            },
+            timeout=SCRAPE_TIMEOUT - 3,
+        )
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "lxml")
+        for tag in soup([
+            "script", "style", "nav", "footer", "header", "aside",
+            "form", "iframe", "noscript", "figcaption",
+            "button", "input", "select", "svg",
+        ]):
+            tag.decompose()
+        body = (
+            soup.find("article")
+            or soup.find("div", {"class": re.compile(r"article[-_]?body",  re.I)})
+            or soup.find("div", {"class": re.compile(r"post[-_]?content",   re.I)})
+            or soup.find("div", {"class": re.compile(r"entry[-_]?content",  re.I)})
+            or soup.find("div", {"class": re.compile(r"story[-_]?body",     re.I)})
+            or soup.find("main")
+        )
+        area      = body or soup
+        TARGET    = {"p", "h2", "h3", "h4", "li"}
+        lines     = []
+        seen_keys: set[str] = set()
+        for el in area.find_all(TARGET):
+            raw = re.sub(r"\s+", " ", el.get_text(" ").strip())
+            if len(raw) < 25: continue
+            key = raw.lower()[:80]
+            if key in seen_keys: continue
+            seen_keys.add(key)
+            tag   = el.name
+            lower = raw.lower()
+            if tag in ("h2", "h3", "h4"):
+                lines.append(f"▌ {raw}")
+            elif tag == "li":
+                if len(raw) < 30: continue
+                if any(p in lower for p in BOILERPLATE_PATTERNS): continue
+                lines.append(f"• {raw}")
+            else:
+                if any(p in lower for p in BOILERPLATE_PATTERNS): continue
+                lines.append(raw)
+        text = "\n".join(lines).strip()
+        return text[:MAX_SCRAPED_CHARS] if len(text) >= 100 else None
+    except requests.exceptions.Timeout:
+        log_fn(f"[scrape] Timeout: {url[:60]}")
+        return None
+    except requests.exceptions.HTTPError as e:
+        log_fn(f"[scrape] HTTP {e.response.status_code}: {url[:60]}")
+        return None
+    except Exception as e:
+        log_fn(f"[scrape] Error: {e}")
+        return None
+
+
+def _parse_srcset(srcset: str) -> str | None:
+    """
+    Parses a srcset attribute and extracts the absolute highest resolution image URL.
+    Example input: 'https://example.com/img_320.jpg 320w, https://example.com/img_1200.jpg 1200w'
+    """
+    if not srcset:
+        return None
+    try:
+        candidates = []
+        for part in srcset.split(","):
+            subparts = part.strip().split()
+            if not subparts:
+                continue
+            url = subparts[0]
+            width = 0
+            if len(subparts) > 1:
+                w_str = subparts[1].lower()
+                if w_str.endswith("w"):
+                    try:
+                        width = int(w_str[:-1])
+                    except ValueError:
+                        pass
+                elif w_str.endswith("x"):
+                    try:
+                        width = int(float(w_str[:-1]) * 1000)
+                    except ValueError:
+                        pass
+            candidates.append((url, width))
+        if candidates:
+            candidates.sort(key=lambda x: x[1], reverse=True)
+            return candidates[0][0]
+    except Exception:
+        pass
+    # Fallback
+    try:
+        return srcset.split(",")[0].strip().split(" ")[0]
+    except Exception:
+        return None
+
+
+def _scrape_images(url: str, rss_entry, log_fn=print) -> list:
+    images: list[str] = []
+    seen:   set[str]  = set()
+
+    def _add(img_url: str):
+        if not img_url: return
+        img_url = img_url.strip()
+        if not img_url.startswith("http") or img_url in seen: return
+        lower = img_url.lower()
+        if any(b in lower for b in IMAGE_BLOCKLIST): return
+        base     = lower.split("?")[0]
+        has_ext  = any(base.endswith(e) for e in IMAGE_EXTENSIONS)
+        has_word = any(
+            w in lower
+            for w in ["image", "photo", "img", "picture", "media", "cdn"]
+        )
+        if not has_ext and not has_word: return
+        seen.add(img_url)
+        images.append(img_url)
+
+    try:
+        resp = requests.get(
+            url,
+            headers={"User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            )},
+            timeout=8,
+        )
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "lxml")
+        for tag in soup([
+            "script", "style", "nav", "footer", "header",
+            "aside", "form", "iframe", "noscript", "button",
+        ]):
+            tag.decompose()
+        body = (
+            soup.find("article")
+            or soup.find("div", {"class": re.compile(r"article[-_]?body", re.I)})
+            or soup.find("div", {"class": re.compile(r"post[-_]?content",  re.I)})
+            or soup.find("div", {"class": re.compile(r"entry[-_]?content", re.I)})
+            or soup.find("main")
+        )
+        area = body or soup
+        for img in area.find_all("img"):
+            src = ""
+            srcset = img.get("srcset") or img.get("data-srcset")
+            if srcset:
+                src = _parse_srcset(srcset)
+            if not src:
+                src = (
+                    img.get("data-src") or img.get("data-original")
+                    or img.get("data-lazy-src") or img.get("src") or ""
+                )
+            _add(src)
+            if len(images) >= MAX_IMAGES: break
+            
+        if len(images) < MAX_IMAGES:
+            for source in area.find_all("source"):
+                srcset = source.get("srcset", "")
+                if srcset:
+                    src = _parse_srcset(srcset)
+                    _add(src)
+                if len(images) >= MAX_IMAGES: break
+    except Exception as e:
+        log_fn(f"[scrape] Image error: {e}")
+
+    if len(images) < MAX_IMAGES:
+        rss_img = _extract_rss_image(rss_entry)
+        if rss_img:
+            _add(rss_img)
+
+    log_fn(f"[scrape] Images: {len(images)}")
+    return images[:MAX_IMAGES]
+
+
+def _extract_rss_image(entry) -> str | None:
+    if entry is None: return None
+    try:
+        for m in entry.get("media_content", []):
+            if m.get("url") and m.get("medium") == "image":
+                return m["url"]
+        for m in entry.get("media_content", []):
+            url = m.get("url", "")
+            if url and any(url.lower().endswith(e) for e in IMAGE_EXTENSIONS):
+                return url
+        enc = entry.get("enclosure")
+        if enc:
+            url = enc.get("href") or enc.get("url", "")
+            if url and enc.get("type", "").startswith("image/"):
+                return url
+        thumbs = entry.get("media_thumbnail", [])
+        if thumbs and thumbs[0].get("url"):
+            return thumbs[0]["url"]
+        for field in ["summary", "description"]:
+            html = entry.get(field, "")
+            if html:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    img = BeautifulSoup(html, "html.parser").find("img")
+                if img:
+                    src = img.get("src", "")
+                    if src.startswith("http"): return src
+        if hasattr(entry, "content") and entry.content:
+            html = entry.content[0].get("value", "")
+            if html:
+                img = BeautifulSoup(html, "html.parser").find("img")
+                if img:
+                    src = img.get("src", "")
+                    if src.startswith("http"): return src
+    except Exception:
+        pass
+    return None
+
+
+# ═══════════════════════════════════════════════════════════
+# SECTION 15 — TELEGRAM POSTING
+# ═══════════════════════════════════════════════════════════
+
+async def _post_to_telegram(
+    bot: Bot, chat_id: str, caption: str,
+    image_urls: list, log_fn=print,
+) -> bool:
+    posted = False
+
+    if len(image_urls) >= 2:
+        try:
+            media_group = []
+            for idx, url in enumerate(image_urls[:MAX_IMAGES]):
+                if idx == 0:
+                    media_group.append(InputMediaPhoto(media=url, caption=caption, parse_mode="HTML"))
+                else:
+                    media_group.append(InputMediaPhoto(media=url))
+                    
+            await bot.send_media_group(
+                chat_id=chat_id, media=media_group,
+                disable_notification=True,
+            )
+            log_fn(f"[tg] Album sent with embedded caption. Images={len(media_group)}")
+            posted = True
+        except Exception as e:
+            log_fn(f"[tg] Album with caption failed: {str(e)[:120]}. Falling back to single photo...")
+            if image_urls:
+                try:
+                    await bot.send_photo(
+                        chat_id=chat_id, photo=image_urls[0],
+                        caption=caption, parse_mode="HTML",
+                        disable_notification=True,
+                    )
+                    log_fn("[tg] Single photo fallback with caption succeeded.")
+                    posted = True
+                except Exception as e2:
+                    log_fn(f"[tg] Single photo fallback with caption failed: {str(e2)[:80]}")
+                    
+    elif len(image_urls) == 1:
+        try:
+            await bot.send_photo(
+                chat_id=chat_id, photo=image_urls[0],
+                caption=caption, parse_mode="HTML",
+                disable_notification=True,
+            )
+            log_fn("[tg] Single photo sent with embedded caption.")
+            posted = True
+        except Exception as e:
+            log_fn(f"[tg] Single photo with caption failed: {str(e)[:120]}")
+            
+    if not posted:
+        try:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=caption,
+                parse_mode="HTML",
+                link_preview_options=LinkPreviewOptions(is_disabled=True),
+                disable_notification=True,
+            )
+            log_fn("[tg] Sent standalone text caption.")
+            posted = True
+        except Exception as e:
+            log_fn(f"[tg] Standalone text caption failed: {str(e)[:120]}")
+            
+    return posted
+
+
+def _run_migrate():
+    """
+    Add v11 schema fields to the Appwrite collection.
+    Fields added: status, posted, locked_at, posted_at, fail_reason.
+    Existing fields are not modified.
+    """
+    print("[migrate] Starting schema migration...")
+
+    aw_client = Client()
+    aw_client.set_endpoint(
+        os.environ.get("APPWRITE_ENDPOINT", "https://cloud.appwrite.io/v1")
+    )
+    aw_client.set_project(os.environ.get("APPWRITE_PROJECT_ID", ""))
+    aw_client.set_key(os.environ.get("APPWRITE_API_KEY", ""))
+
+    from appwrite.services.databases import Databases as _Databases
+    databases  = _Databases(aw_client)
+    db_id      = os.environ.get("APPWRITE_DATABASE_ID", "")
+    col_id     = COLLECTION_ID
+
+    # Field definitions: (key, type, required, default, extra_kwargs)
+    FIELDS_TO_ADD = [
+        ("status",      "string",  False, STATUS_LOCKED, {"size": 20}),
+        ("posted",      "boolean", False, False,         {}),
+        ("locked_at",   "string",  False, "",            {"size": 50}),
+        ("posted_at",   "string",  False, "",            {"size": 50}),
+        ("fail_reason", "string",  False, "",            {"size": 500}),
+    ]
+
+    for field_key, field_type, required, default, extra in FIELDS_TO_ADD:
+        try:
+            if field_type == "string":
+                size = extra.get("size", 255)
+                databases.create_string_attribute(
+                    database_id=db_id,
+                    collection_id=col_id,
+                    key=field_key,
+                    size=size,
+                    required=required,
+                    default=default,
+                )
+            elif field_type == "boolean":
+                databases.create_boolean_attribute(
+                    database_id=db_id,
+                    collection_id=col_id,
+                    key=field_key,
+                    required=required,
+                    default=default,
+                )
+            print(f"[migrate] ✓ Added field: {field_key} ({field_type})")
+        except AppwriteException as e:
+            if "already exists" in str(e.message).lower():
+                print(f"[migrate] ℹ Field already exists: {field_key}")
+            else:
+                print(f"[migrate] ✗ Failed to add {field_key}: {e.message}")
+        except Exception as e:
+            print(f"[migrate] ✗ Error adding {field_key}: {e}")
+
+    print("[migrate] Done. Wait ~30s for Appwrite to index new fields.")
+    print("[migrate] Then run --cleanup to clear unposted records.")
+
+
+# ═══════════════════════════════════════════════════════════
+# SECTION 17 — CLEANUP UTILITY
+# ═══════════════════════════════════════════════════════════
+
+def _run_cleanup():
+    """Delete all records where posted != true."""
+    print("[cleanup] Starting unposted record purge...")
+    aw_client = Client()
+    aw_client.set_endpoint(
+        os.environ.get("APPWRITE_ENDPOINT", "https://cloud.appwrite.io/v1")
+    )
+    aw_client.set_project(os.environ.get("APPWRITE_PROJECT_ID", ""))
+    aw_client.set_key(os.environ.get("APPWRITE_API_KEY", ""))
+    databases = Databases(aw_client)
+    db_id     = os.environ.get("APPWRITE_DATABASE_ID", "")
+    col_id    = COLLECTION_ID
+
+    deleted = 0
+    kept    = 0
+    cursor  = None
+
+    while True:
+        queries = [Query.limit(100)]
+        if cursor:
+            queries.append(Query.cursor_after(cursor))
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", DeprecationWarning)
+                result = databases.list_documents(
+                    database_id=db_id,
+                    collection_id=col_id,
+                    queries=queries,
+                )
+        except Exception as e:
+            print(f"[cleanup] Fetch error: {e}")
+            break
+
+        docs = result.get("documents", [])
+        if not docs:
+            break
+
+        for doc in docs:
+            doc_id    = doc["$id"]
+            is_posted = doc.get("posted", False) is True
+            if not is_posted:
+                try:
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore", DeprecationWarning)
+                        databases.delete_document(
+                            database_id=db_id,
+                            collection_id=col_id,
+                            document_id=doc_id,
+                        )
+                    print(f"[cleanup] DELETED: {doc.get('title', doc_id)[:60]}")
+                    deleted += 1
+                except Exception as e:
+                    print(f"[cleanup] Delete failed ({doc_id}): {e}")
+            else:
+                kept += 1
+
+        cursor = docs[-1]["$id"]
+        if len(docs) < 100:
+            break
+
+    print(f"[cleanup] Deleted={deleted} | Kept={kept}")
+
+
+# ═══════════════════════════════════════════════════════════
+# LOCAL ENTRY POINT
+# ═══════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    import sys
+
+    if "--migrate" in sys.argv:
+        # Step 1: Add v11 fields to Appwrite collection
+        _run_migrate()
+
+    elif "--cleanup" in sys.argv:
+        # Step 2: Clear unposted records (run after --migrate)
+        _run_cleanup()
+
+    elif len(sys.argv) > 1 and sys.argv[1].startswith("http"):
+        # Test single URL
+        url = sys.argv[1]
+        print(f"[LOCAL] Testing: {url}")
+
+        async def _test():
+            content  = _scrape_text(url) or url[:500]
+            body_p   = _PROMPT_BODY.format(input_text=content[:3000])
+            title_p  = _PROMPT_TITLE.format(input_text=url[:200])
+            tip_p    = _PROMPT_TIP.format(input_text=content[:1500])
+            b, t, tip = await _run_three_races(body_p, title_p, tip_p)
+            hashtags  = _extract_hashtags_from_text(content[:500])
+            caption   = _build_mehrjameh_caption(
+                t or "عنوان", b or "متن", tip or "",
+                hashtags, "general",
+            )
+            print(f"\n── CAPTION ({len(caption)}ch) ──\n{caption}\n")
+
+        asyncio.run(_test())
+
+    else:
+        asyncio.run(main())
