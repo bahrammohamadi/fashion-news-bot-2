@@ -134,6 +134,12 @@ OPENROUTER_MODELS = [
 OPENROUTER_MAX_TOKENS  = 700
 OPENROUTER_TEMPERATURE = 0.4
 
+# ── Google Gemini ──
+GEMINI_MODELS = [
+    "gemini-1.5-flash",
+    "gemini-1.5-pro",
+]
+
 # ── Lock / dedup ──
 LOCK_TTL_SECONDS           = 600
 FUZZY_SIMILARITY_THRESHOLD = 0.65
@@ -472,6 +478,23 @@ def _detect_schema(
     return info
 
 
+def _to_dict_safe(obj):
+    """
+    Safely converts Appwrite SDK objects (like DocumentList, Document)
+    to standard Python dictionaries to avoid AttributeError and Subscriptable errors.
+    """
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        return obj
+    if hasattr(obj, "to_dict"):
+        return obj.to_dict()
+    # Support instances that have a dictionary structure or __dict__
+    if hasattr(obj, "__dict__"):
+        return getattr(obj, "__dict__")
+    return obj
+
+
 # ═══════════════════════════════════════════════════════════
 # SECTION 4 — DB WRAPPER (FIX 4 — deprecation)
 # ═══════════════════════════════════════════════════════════
@@ -492,18 +515,20 @@ def _db_list(
         warnings.simplefilter("ignore", DeprecationWarning)
         if sdk_mode == "new":
             try:
-                return databases.list_rows(
+                res = databases.list_rows(
                     database_id=database_id,
                     collection_id=collection_id,
                     queries=queries,
                 )
+                return _to_dict_safe(res)
             except AttributeError:
                 pass
-        return databases.list_documents(
+        res = databases.list_documents(
             database_id=database_id,
             collection_id=collection_id,
             queries=queries,
         )
+        return _to_dict_safe(res)
 
 
 def _db_create(
@@ -518,20 +543,22 @@ def _db_create(
         warnings.simplefilter("ignore", DeprecationWarning)
         if sdk_mode == "new":
             try:
-                return databases.create_row(
+                res = databases.create_row(
                     database_id=database_id,
                     collection_id=collection_id,
                     row_id="unique()",
                     data=data,
                 )
+                return _to_dict_safe(res)
             except AttributeError:
                 pass
-        return databases.create_document(
+        res = databases.create_document(
             database_id=database_id,
             collection_id=collection_id,
             document_id="unique()",
             data=data,
         )
+        return _to_dict_safe(res)
 
 
 def _db_update(
@@ -547,20 +574,22 @@ def _db_update(
         warnings.simplefilter("ignore", DeprecationWarning)
         if sdk_mode == "new":
             try:
-                return databases.update_row(
+                res = databases.update_row(
                     database_id=database_id,
                     collection_id=collection_id,
                     row_id=doc_id,
                     data=data,
                 )
+                return _to_dict_safe(res)
             except AttributeError:
                 pass
-        return databases.update_document(
+        res = databases.update_document(
             database_id=database_id,
             collection_id=collection_id,
             document_id=doc_id,
             data=data,
         )
+        return _to_dict_safe(res)
 
 
 def _db_delete(
@@ -858,53 +887,139 @@ async def _call_openrouter(
     return None
 
 
+async def _call_gemini(
+    session,
+    prompt: str,
+    log_fn=print,
+) -> str | None:
+    """
+    Google Gemini API caller with model fallback chain.
+    """
+    import os
+    import asyncio
+    import aiohttp
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        api_key = os.environ.get("GOOGLE_API_KEY", "").strip()
+    if not api_key:
+        log_fn("[race] Gemini: no key — skipping.")
+        return None
+
+    headers = {
+        "Content-Type": "application/json"
+    }
+
+    for model in GEMINI_MODELS:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+        payload = {
+            "contents": [{
+                "parts": [{"text": prompt}]
+            }],
+            "generationConfig": {
+                "temperature": 0.4,
+                "maxOutputTokens": 700,
+            }
+        }
+        try:
+            async with session.post(
+                url,
+                json=payload,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=AI_PER_API_TIMEOUT),
+            ) as resp:
+                body_text = await resp.text()
+
+                if resp.status != 200:
+                    log_fn(
+                        f"[race] Gemini/{model} HTTP {resp.status}: "
+                        f"{body_text[:120]}"
+                    )
+                    continue
+
+                import json as _json
+                data = _json.loads(body_text)
+                try:
+                    result = data['candidates'][0]['content']['parts'][0]['text']
+                except (KeyError, IndexError):
+                    log_fn(f"[race] Gemini/{model}: failed to parse structure.")
+                    continue
+
+                valid = _is_valid_persian(result)
+                log_fn(
+                    f"[race] Gemini/{model}: "
+                    f"{len(result or '')}ch | valid={valid}"
+                )
+                if valid:
+                    return result
+                continue
+
+        except asyncio.CancelledError:
+            log_fn(f"[race] Gemini/{model}: cancelled.")
+            raise
+        except aiohttp.ClientError as e:
+            log_fn(f"[race] Gemini/{model} network error: {e}")
+            continue
+        except Exception as e:
+            log_fn(f"[race] Gemini/{model} error: {type(e).__name__}: {e}")
+            continue
+
+    log_fn("[race] Gemini: all models exhausted.")
+    return None
+
+
 async def _parallel_ai_race(
     prompt: str,
     race_timeout: int = AI_RACE_TIMEOUT,
     log_fn=print,
 ) -> str | None:
     """
-    First-response-wins parallel AI race.
-    Groq and OpenRouter fire simultaneously.
-    Each internally tries its model chain.
-    Returns first valid Persian response.
+    Priority-based AI Dispatch Engine (v12.0)
+    First tries Google Gemini (absolute priority).
+    Only if Gemini fails or has no key, falls back to concurrent race of Groq & OpenRouter.
     """
     if not prompt or not prompt.strip():
         return None
 
-    result_queue: asyncio.Queue[str | None] = asyncio.Queue()
-
-    providers = [
-        ("Groq",       _call_groq),
-        ("OpenRouter", _call_openrouter),
-    ]
-    total = len(providers)
-
-    async def _worker(name: str, caller_fn, session: aiohttp.ClientSession):
-        try:
-            result = await caller_fn(session, prompt, log_fn)
-            await result_queue.put(result)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            log_fn(f"[race] _worker({name}) unhandled: {e}")
-            await result_queue.put(None)
-
     connector = aiohttp.TCPConnector(limit=10, enable_cleanup_closed=True)
     async with aiohttp.ClientSession(connector=connector) as session:
+        # STEP 1: Google Gemini (Highest Priority)
+        log_fn("[ai] → Gemini (Priority 1) dispatching...")
+        try:
+            gemini_res = await _call_gemini(session, prompt, log_fn)
+            if _is_valid_persian(gemini_res):
+                log_fn("[ai] ✓ Gemini Succeeded (Priority 1) — skipping fallbacks.")
+                return gemini_res
+            else:
+                log_fn("[ai] ✗ Gemini failed/invalid. Trying fallbacks (Groq + OpenRouter)...")
+        except Exception as e:
+            log_fn(f"[ai] ✗ Gemini exception: {type(e).__name__}: {e}. Trying fallbacks...")
+
+        # STEP 2: Fallback Concurrent Race (Groq vs OpenRouter)
+        log_fn("[ai] → Running fallback parallel race (Groq vs OpenRouter)...")
+        result_queue: asyncio.Queue[str | None] = asyncio.Queue()
+        providers = [
+            ("Groq",       _call_groq),
+            ("OpenRouter", _call_openrouter),
+        ]
+        total = len(providers)
+
+        async def _worker(name: str, caller_fn):
+            try:
+                result = await caller_fn(session, prompt, log_fn)
+                await result_queue.put(result)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log_fn(f"[race] _worker({name}) unhandled error: {e}")
+                await result_queue.put(None)
 
         tasks: list[asyncio.Task] = [
             asyncio.create_task(
-                _worker(name, fn, session),
+                _worker(name, fn),
                 name=f"race_{name.lower()}",
             )
             for name, fn in providers
         ]
-
-        log_fn(
-            f"[race] ★ {total} providers fired "
-            f"(timeout={race_timeout}s)."
-        )
 
         winner:     str | None = None
         none_count: int        = 0
@@ -915,26 +1030,20 @@ async def _parallel_ai_race(
                     result = await result_queue.get()
                     if _is_valid_persian(result):
                         winner = result
-                        log_fn(
-                            f"[race] ✓ Winner: {len(winner)}ch."
-                        )
+                        log_fn(f"[race] ✓ Fallback Winner: {len(winner)}ch.")
                         break
                     else:
                         none_count += 1
-                        log_fn(
-                            f"[race] ✗ Invalid "
-                            f"({none_count}/{total})."
-                        )
+                        log_fn(f"[race] ✗ Fallback Invalid ({none_count}/{total}).")
         except TimeoutError:
-            log_fn(f"[race] ✗ Timed out after {race_timeout}s.")
-
+            log_fn(f"[race] ✗ Fallback race timed out after {race_timeout}s.")
         finally:
             for t in tasks:
                 if not t.done():
                     t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    return winner
+        return winner
 
 
 async def _run_three_races(
