@@ -1,7 +1,7 @@
 # ============================================================
 # Function 1: International Fashion Poster
 # Project:    @irfashionnews — FashionBotProject
-# Version:    12.0 — Premium Copywriting + Advanced Styling Prompts + Visual Layout Optimization
+# Version:    11.1 — Schema-Adaptive + Model Fixes
 # Runtime:    python-3.12 / Appwrite Cloud Functions
 # Timeout:    120 seconds
 #
@@ -324,68 +324,42 @@ TITLE_STOP_WORDS = {
 # SECTION 2 — AI PROMPT TEMPLATES (TELEGRAM OPTIMIZED)
 # ═══════════════════════════════════════════════════════════
 
-_PROMPT_TITLE = '''\
-تو سردبیر ارشد یک مجله مد و فشن لوکس و آوانگارد هستی.
+_PROMPT_UNIFIED = '''\
+تو سردبیر خلاق ارشد یک مجله دیجیتال مد، هنر و زیبایی‌شناسی لوکس به نام «مهرجامه» (آی‌آر فشن نیوز) در ایران هستی.
+وظیفه تو تولید یک پست کامل، متمایز و بسیار جذاب تلگرامی با فرمت HTML بر اساس خبر یا محصول انگلیسی زیر است.
 
-وظیفه: عنوان انگلیسی زیر را به یک تیتر فارسی مینی‌مال، شاعرانه و به غایت مجلل تبدیل کن.
+مخاطب تو: زنان و مردان خوش‌سلیقه، اهل هنر، طراحان و دنبال‌کنندگان مد آوانگارد در ایران هستند.
 
-قوانین سخت‌گیرانه زیبایی‌شناسی:
-- حداکثر ۶۰ کاراکتر (ایده‌آل ۴۵–۵۵ کاراکتر). تیتر باید در یک نگاه خوانده شود.
-- دوری کامل از واژگان کلیک‌بیت و کلیشه‌ای زرد مانند: «خیره‌کننده»، «درخشان»، «انحصاری»، «شگفت‌انگیز»، «نگاهی به»، «همه‌چیز درباره».
-- در عوض، از واژگان فاخر و عمیق استفاده کن؛ مانند: بازآفرینی، سیلوئت، اصالت، رها، مینی‌مال، جسورانه، نامتقارن، روایتگری، دگرگونی، هندسه فرم.
-- هرگز سوالی ننویس.
-- نام برندها، طراحان و رویدادها حتماً با الفبای لاتین نوشته شود (مثال: Chanel، میلان، Dior).
-- خروجی فقط و فقط باید شامل یک خط تیتر نهایی باشد، بدون هیچ متن اضافی، توضیح یا گیومه.
+قوانین ساختاری و ادبی طلایی (نسخه ۱۳.۰):
+۱. لحن نگارش:
+   - صد درصد روزنامه‌نگاری حرفه‌ای، فاخر، داستان‌گو و عمیق، متناسب با ادبیات معتبرترین رسانه‌های مد و لایف‌استایل ایران (مثل مجلات چه‌بپوشم، مهرجامه، مجلات هنری).
+   - دوری کامل از عامیانه‌نویسی، لحن‌های بازاری، زرد، تبلیغاتی یا کلیک‌بیت‌های تکراری (کلماتی مثل "خیره‌کننده"، "شگفت‌انگیز"، "باورنکردنی" مطلقاً ممنوع هستند).
+   - پالت واژگانی فاخر ایرانی را به کار ببر (مانند: سیلوئت، هم‌نشینی فرم‌ها، دگرگونی زیبایی‌شناختی، کانسپچوال، بافت، ریزش پارچه، پویایی پالت، اصالت).
 
-عنوان انگلیسی: {input_text}
+۲. دگرگونی و تنوع ساختاری (جلوگیری از خسته‌کننده بودن):
+   - هرگز یک چارچوب ثابت و تکراری برای همه پست‌ها به کار نبر! ساختار پست باید با توجه به نوع خبر تغییر کند:
+     الف) اگر خبر درباره «معرفی محصول جدید یک برند» است: پست را به شکل یک نقد مینی‌مال طراحی و مهندسی طراحی آن را شرح بده.
+     ب) اگر خبر درباره «یک ترند جهانی» است: آن را بومی‌سازی کن و هم‌نشینی آن با آیتم‌های مرسوم در ایران (مثل مانتو کتی، بارانی، پالتو، شال، مینی‌اسکارف) را توضیح بده.
+     ج) اگر خبر درباره «رویداد یا ران‌وی» است: فضا، اتمسفر و روح خلاق مجموعه را به شکل داستان‌گو و هنری روایت کن.
+   - تنوع بصری ایجاد کن؛ گاهی از نشانه‌های مینی‌مال یونیکد مانند (✦، ⚜، 🕯) یا نقاط خالی به عنوان جداکننده استفاده کن. گاهی نکته استایل را در قالب یک جمله شاعرانه در بدنه متن ذوب کن، و گاهی آن را در انتهای پست به صورت یک "💡 فرمولوژی:" کوتاه و متمایز بیاور. ساختار نباید تکراری شود!
 
-تیتر فارسی:'''
+۳. بومی‌سازی عمیق برای فضای ایران:
+   - در متن خبر توضیح بده که چرا این رویداد، محصول یا ترند جهانی برای مخاطب خوش‌پوش ایرانی الهام‌بخش است و چگونه می‌توان دراماتولوژی شهری (استایل خیابانی ایرانی) را با آن ارتقا داد.
 
+۴. قوانین فنی تلگرام و HTML:
+   - خروجی تو باید مستقیماً با کدهای HTML تلگرام تگ‌گذاری شده باشد (فقط تگ‌های مجاز تلگرام: <b> برای ضخیم، <i> برای کج).
+   - تیتر اصلی حتماً باید برجسته باشد: ✦ <b>[تیتر کوتاه و مجلل فارسی]</b>
+   - طول کل متن خروجی باید به شدت کنترل شود: **حداکثر ۹۵۰ کاراکتر** (بسیار مهم تا در کپشن عکس تلگرام جا شود و قطع نشود).
+   - رعایت دقیق نیم‌فاصله‌های فارسی (به‌ویژه در افعال و صفت‌ها: «می‌شود»، «ترندهای»، «روایتگری»).
+   - نام برندها، نام طراحان و اصطلاحات تخصصی مد را حتماً با الفبای لاتین بنویس (مثال: Chanel، بارانی، Blazer).
+   - در خط پایانی، امضای کانال را به صورت زیر بیاور:
+     {emoji} <i>@irfashionnews | مجله زیبایی‌شناسی مد</i>
 
-_PROMPT_BODY = '''\
-تو نویسنده ارشد خلاق برای یک مجله مد مینی‌مال و لوکس هستی که برای مخاطبان خوش‌سلیقه، آوانگارد و اهل هنر می‌نویسد.
+خبر انگلیسی:
+عنوان: {title}
+محتوا: {input_text}
 
-متن خبر انگلیسی زیر را تحلیل کرده و یک روایت فارسی منسجم، روان و بسیار جذاب از آن خلق کن.
-
-قوانین نگارش طلایی (نسخه ۱۲.۰):
-- متن باید یک جریان روایی پیوسته داشته باشد (حدود ۳ تا ۴ جمله منسجم، بین ۳۰۰ تا ۴۰۰ کاراکتر).
-- هرگز جملات را مقطع، بی‌روح یا بیش از حد فشرده نکن. بگذار متن نفس بکشد و جریان طبیعی زبان فارسی حفظ شود.
-- ساختار روایت:
-  ۱. جمله اول (قلاب بصری/حسی): توصیف فضا، حس، بافت یا الهام پشت ترند/خبر (مثلاً پویایی چرم یا ریزش نرم ابریشم).
-  ۲. جملات میانی (هسته رویداد و هنر طراحی): تمرکز روی رویکرد هنری، نوآوری برند یا جزئیات ساختاری مجموعه جدید.
-  ۳. جمله پایانی (پیوند و الهام‌بخشی): تحلیل ظریف اینکه این دگرگونی چطور بر سبک زندگی یا نگرش زیبایی‌شناسی امروز اثر می‌گذارد.
-- لحن داستان‌گو، شاعرانه اما مقتدر، عمیق و مجلل باشد (نه تبلیغاتی، نه بازاری).
-- نام برندها، متریال‌ها و اصطلاحات تخصصی مد فقط به صورت لاتین نوشته شود (مانند: Balenciaga, Silhouette, Tweed, Blazer).
-- رعایت کامل اصول ارتوگرافی و دستور زبان فارسی (به‌ویژه استفاده دقیق از نیم‌فاصله‌ها؛ مانند «می‌شود»، «ترندهای»، «روایتگری»).
-- بدون هیچ‌گونه بولت‌پوینت، شماره، ایموجی یا هشتگ در متن اصلی.
-- فقط متن نهایی را برگردان.
-
-خبر:
-"""{input_text}"""
-
-خلاصه فارسی:'''
-
-
-_PROMPT_TIP = '''\
-تو مشاور استایل و فرمولوژی یک مجله مد لوکس هستی.
-
-بر اساس خبر زیر، دقیقاً ۱ نکته استایلینگ عمیق، علمی و به شدت کاربردی برای ارتقای استایل خیابانی یا رسمی بومی‌سازی شده بنویس.
-
-قوانین سخت‌گیرانه استایلینگ:
-- دقیقاً ۱ نکته طلایی بنویس (حداکثر ۲ یا ۳ جمله کوتاه، در مجموع زیر ۱۸۰ کاراکتر).
-- توصیه نباید سطحی، کلیشه‌ای یا انگیزشی باشد (عباراتی مثل "شیک باشید" یا "اعتماد به نفس داشته باشید" ممنوع است).
-- نکته باید بر اساس یک فرمول یا اصل زیبایی‌شناسی مد باشد؛ مانند:
-  • قانون تعادل حجم‌ها (Volume Balance - مثلاً هم‌نشینی یک آیتم اورسایز با یک تکه فیت).
-  • بازی با بافت‌ها (Textural Play - مثلاً کنتراست میان چرم مات اسپرتی با شال حریر رها).
-  • پالت رنگ خنثی و اکسسوری شاخص (Neutral Palette with Accent).
-- حتماً نکته را برای پوشش مرسوم و باوقار ایرانی بومی‌سازی کن (اشاره به آیتم‌هایی مانند مانتو کتی، بارانی، شال، مینی‌اسکارف، پالتوی اورسایز).
-- نام اصطلاحات فنی مد و فشن را فقط به صورت لاتین بنویس.
-- فقط متن نکته را بنویس، بدون هیچ عنوان یا شماره اضافی.
-
-خبر:
-"""{input_text}"""
-
-نکات استایلی:'''
+کپشن نهایی تلگرام (با فرمت HTML):'''
 
 # ═══════════════════════════════════════════════════════════
 # SECTION 3 — SCHEMA DETECTION (FIX 1)
@@ -489,7 +463,6 @@ def _to_dict_safe(obj):
         return obj
     if hasattr(obj, "to_dict"):
         return obj.to_dict()
-    # Support instances that have a dictionary structure or __dict__
     if hasattr(obj, "__dict__"):
         return getattr(obj, "__dict__")
     return obj
@@ -902,6 +875,8 @@ async def _call_gemini(
     if not api_key:
         api_key = os.environ.get("GOOGLE_API_KEY", "").strip()
     if not api_key:
+        api_key = os.environ.get("GOOGLE_AI_KEY", "").strip()
+    if not api_key:
         log_fn("[race] Gemini: no key — skipping.")
         return None
 
@@ -973,7 +948,7 @@ async def _parallel_ai_race(
     log_fn=print,
 ) -> str | None:
     """
-    Priority-based AI Dispatch Engine (v12.0)
+    Priority-based AI Dispatch Engine (v13.0)
     First tries Google Gemini (absolute priority).
     Only if Gemini fails or has no key, falls back to concurrent race of Groq & OpenRouter.
     """
@@ -1092,18 +1067,17 @@ def _build_mehrjameh_caption(
     category: str,
 ) -> str:
     """
-    Upgraded Luxury Caption Builder (v12.0)
+    Mehrjameh editorial caption.
     Format:
-      ✦ <b>عنوان</b>
-      ─── ⚜ ───
-      روایت امروز مد و استایل
+      <b>عنوان</b>
+      ─────────────
+      مد و فشن ایرانی
 
       خلاصه خبر
 
-      💡 <b>فرمولوژی استایل:</b>
-      نکته استایلی بومی‌سازی شده
+      💡 نکته استایلی
 
-      EMOJI @irfashionnews | مجله مد و زیبایی
+      EMOJI  کانال مد و فشن ایرانی
 
       #hashtags
     """
@@ -1122,10 +1096,10 @@ def _build_mehrjameh_caption(
     emoji     = CATEGORY_EMOJI.get(category, "🌐")
     hash_line = " ".join(hashtags)
 
-    header    = f"✦ <b>{_esc(title_fa.strip())}</b>"
-    sep       = "─── ⚜ ───\n<i>روایت امروز مد و استایل</i>"
-    tip_block = f"💡 <b>فرمولوژی استایل:</b>\n{_esc(tip_fa.strip())}" if tip_fa and tip_fa.strip() else ""
-    footer    = f"{emoji} <i>@irfashionnews | مجله مد و زیبایی</i>"
+    header    = f"<b>{_esc(title_fa.strip())}</b>"
+    sep       = "─────────────\nمد و فشن ایرانی"
+    tip_block = f"💡 {_esc(tip_fa.strip())}" if tip_fa and tip_fa.strip() else ""
+    footer    = f"{emoji}  <i>کانال مد و فشن ایرانی</i>"
 
     # Calculate body budget
     fixed_parts = [header, sep]
@@ -1142,7 +1116,7 @@ def _build_mehrjameh_caption(
     safe_body = _esc(body_fa.strip())
     if body_budget <= 10:
         safe_body = ""
-        header    = f"✦ <b>{_esc(title_fa.strip())[:80]}</b>"
+        header    = f"<b>{_esc(title_fa.strip())[:80]}</b>"
     elif len(safe_body) > body_budget:
         safe_body = safe_body[:body_budget - 1] + "…"
 
@@ -1165,11 +1139,67 @@ def _build_mehrjameh_caption(
 # SECTION 9 — MAIN ENTRY POINT
 # ═══════════════════════════════════════════════════════════
 
+def _format_unified_caption_safety(
+    raw_caption: str,
+    hashtags: list[str],
+    category: str,
+) -> str:
+    """
+    Cleans up the raw unified caption from the LLM, resolves Markdown blocks,
+    ensures proper footer and appends hashtags safely.
+    """
+    import re
+    text = raw_caption.strip()
+
+    # Strip code block markdown if present
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:html)?\s*", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s*```$", "", text)
+    
+    text = text.strip()
+
+    # Convert simple ** markdown to <b> tags if any leaked
+    parts = text.split("**")
+    if len(parts) > 1:
+        new_text = []
+        for idx, part in enumerate(parts):
+            if idx % 2 == 1:
+                new_text.append(f"<b>{part}</b>")
+            else:
+                new_text.append(part)
+        text = "".join(new_text)
+
+    # Let's ensure the categories and footer are in good shape
+    CATEGORY_EMOJI = {
+        "runway": "👗", "brand": "🏷️", "business": "📊",
+        "beauty": "💄", "sustainability": "♻️", "celebrity": "⭐",
+        "trend": "🔥", "general": "🌐",
+    }
+    emoji = CATEGORY_EMOJI.get(category, "🌐")
+
+    # If the footer is not already in the text, let's append it
+    footer_pattern = "@irfashionnews"
+    if footer_pattern not in text:
+        text += f"\n\n{emoji} <i>@irfashionnews | مجله زیبایی‌شناسی مد</i>"
+
+    # Append hashtags if any, and if they aren't already there
+    if hashtags:
+        hash_line = " ".join(hashtags)
+        if not any(tag in text for part in hashtags for tag in [part, part.lower()]):
+            text += f"\n\n{hash_line}"
+
+    # Enforce strict maximum length limit for photo captions in Telegram (1024 characters)
+    if len(text) > 1020:
+        text = text[:1015] + "…"
+
+    return text
+
+
 async def main(event=None, context=None):
     log   = context.log   if context and hasattr(context, "log")   else print
     error = context.error if context and hasattr(context, "error") else print
 
-    log("═══ FashionBot v11.1 started ═══")
+    log("═══ FashionBot v13.0 started ═══")
 
     loop       = asyncio.get_running_loop()
     start_time = loop.time()
@@ -1346,47 +1376,35 @@ async def main(event=None, context=None):
         return {"status": "skipped", "reason": "thin_content", "posted": False}
 
     # ════════════════════════════════
-    # PHASE 4 — PARALLEL AI RACES
     # ════════════════════════════════
-    log(f"[{elapsed()}s] Phase 4: AI races (body + title + tip)...")
-    body_prompt  = _PROMPT_BODY.format(input_text=content[:3000])
-    title_prompt = _PROMPT_TITLE.format(input_text=title[:500])
-    tip_prompt   = _PROMPT_TIP.format(input_text=content[:1500])
-
-    body_fa, title_fa, tip_fa = await _run_three_races(
-        body_prompt, title_prompt, tip_prompt, log_fn=log,
+    # PHASE 4 — UNIFIED AI GENERATION
+    # ════════════════════════════════
+    log(f"[{elapsed()}s] Phase 4: Generating unified premium HTML caption...")
+    unified_prompt = _PROMPT_UNIFIED.format(
+        title=title[:500],
+        input_text=content[:3000],
+        category=category,
     )
+    caption_raw = await _parallel_ai_race(unified_prompt, AI_RACE_TIMEOUT, log)
 
-    title_fa = (title_fa or "").strip() or title
-    body_fa  = (body_fa  or "").strip() or None
-    tip_fa   = (tip_fa   or "").strip() or None
-
-    if not body_fa:
-        error(f"[{elapsed()}s] All AI providers failed.")
+    if not caption_raw:
+        error(f"[{elapsed()}s] AI Generation failed.")
         return {
             "status": "error",
             "reason": "translation_failed",
             "posted": False,
         }
 
-    log(
-        f"[{elapsed()}s] "
-        f"title={len(title_fa)}ch | "
-        f"body={len(body_fa)}ch | "
-        f"tip={len(tip_fa or '')}ch"
-    )
-
     # ════════════════════════════════
-    # PHASE 5 — BUILD CAPTION
+    # PHASE 5 — FORMAT & SAFETY WRAP
     # ════════════════════════════════
+    log(f"[{elapsed()}s] Phase 5: Formatting and appending hashtags...")
     combined_for_tags = f"{title} {desc} {content[:500]}"
     hashtags = _extract_hashtags_from_text(combined_for_tags)
-    caption  = _build_mehrjameh_caption(
-        title_fa, body_fa, tip_fa or "", hashtags, category
-    )
+    
+    caption = _format_unified_caption_safety(caption_raw, hashtags, category)
     log(f"[{elapsed()}s] Caption={len(caption)}ch")
 
-    # ════════════════════════════════
     # PHASE 6 — SOFT LOCK WRITE
     # ════════════════════════════════
     log(f"[{elapsed()}s] Phase 6: Soft lock...")
@@ -1469,7 +1487,7 @@ async def main(event=None, context=None):
         "score":      score,
     }
     log(
-        f"═══ v11.1 done in {elapsed()}s | "
+        f"═══ v13.0 done in {elapsed()}s | "
         f"{'POSTED ✓' if posted else 'FAILED ✗'} ═══"
     )
     return result
@@ -2287,94 +2305,65 @@ async def _post_to_telegram(
     bot: Bot, chat_id: str, caption: str,
     image_urls: list, log_fn=print,
 ) -> bool:
-    anchor_msg_id = None
-    posted        = False
+    posted = False
 
     if len(image_urls) >= 2:
         try:
-            media_group   = [
-                InputMediaPhoto(media=url)
-                for url in image_urls[:MAX_IMAGES]
-            ]
-            sent_msgs     = await bot.send_media_group(
+            media_group = []
+            for idx, url in enumerate(image_urls[:MAX_IMAGES]):
+                if idx == 0:
+                    media_group.append(InputMediaPhoto(media=url, caption=caption, parse_mode="HTML"))
+                else:
+                    media_group.append(InputMediaPhoto(media=url))
+                    
+            await bot.send_media_group(
                 chat_id=chat_id, media=media_group,
                 disable_notification=True,
             )
-            anchor_msg_id = sent_msgs[-1].message_id
-            log_fn(
-                f"[tg] ① Album: {len(sent_msgs)} images. "
-                f"anchor={anchor_msg_id}"
-            )
+            log_fn(f"[tg] Album sent with embedded caption. Images={len(media_group)}")
+            posted = True
         except Exception as e:
-            log_fn(f"[tg] ① Album failed: {str(e)[:120]}")
+            log_fn(f"[tg] Album with caption failed: {str(e)[:120]}. Falling back to single photo...")
             if image_urls:
                 try:
-                    sent          = await bot.send_photo(
+                    await bot.send_photo(
                         chat_id=chat_id, photo=image_urls[0],
+                        caption=caption, parse_mode="HTML",
                         disable_notification=True,
                     )
-                    anchor_msg_id = sent.message_id
-                    log_fn(f"[tg] ① Fallback photo. anchor={anchor_msg_id}")
+                    log_fn("[tg] Single photo fallback with caption succeeded.")
+                    posted = True
                 except Exception as e2:
-                    log_fn(f"[tg] ① Photo fallback failed: {str(e2)[:80]}")
+                    log_fn(f"[tg] Single photo fallback with caption failed: {str(e2)[:80]}")
+                    
     elif len(image_urls) == 1:
         try:
-            sent          = await bot.send_photo(
+            await bot.send_photo(
                 chat_id=chat_id, photo=image_urls[0],
+                caption=caption, parse_mode="HTML",
                 disable_notification=True,
             )
-            anchor_msg_id = sent.message_id
-            log_fn(f"[tg] ① Single photo. anchor={anchor_msg_id}")
+            log_fn("[tg] Single photo sent with embedded caption.")
+            posted = True
         except Exception as e:
-            log_fn(f"[tg] ① Photo failed: {str(e)[:120]}")
-    else:
-        log_fn("[tg] ① No images — standalone.")
-
-    if anchor_msg_id is not None:
-        await asyncio.sleep(ALBUM_CAPTION_DELAY)
-
-    try:
-        kwargs: dict = {
-            "chat_id":              chat_id,
-            "text":                 caption,
-            "parse_mode":           "HTML",
-            "link_preview_options": LinkPreviewOptions(is_disabled=True),
-            "disable_notification": True,
-        }
-        if anchor_msg_id is not None:
-            kwargs["reply_to_message_id"] = anchor_msg_id
-        await bot.send_message(**kwargs)
-        log_fn(
-            f"[tg] ③ Caption sent "
-            f"({'reply_to=' + str(anchor_msg_id) if anchor_msg_id else 'standalone'})."
-        )
-        posted = True
-    except Exception as e:
-        log_fn(f"[tg] ③ Caption failed: {str(e)[:120]}")
-        return False
-
-    if posted and FASHION_STICKERS:
-        await asyncio.sleep(STICKER_DELAY)
+            log_fn(f"[tg] Single photo with caption failed: {str(e)[:120]}")
+            
+    if not posted:
         try:
-            await bot.send_sticker(
+            await bot.send_message(
                 chat_id=chat_id,
-                sticker=random.choice(FASHION_STICKERS),
+                text=caption,
+                parse_mode="HTML",
+                link_preview_options=LinkPreviewOptions(is_disabled=True),
                 disable_notification=True,
             )
-            log_fn("[tg] ④ Sticker sent.")
+            log_fn("[tg] Sent standalone text caption.")
+            posted = True
         except Exception as e:
-            log_fn(f"[tg] ④ Sticker failed (non-fatal): {str(e)[:80]}")
-
+            log_fn(f"[tg] Standalone text caption failed: {str(e)[:120]}")
+            
     return posted
 
-
-# ═══════════════════════════════════════════════════════════
-# SECTION 16 — SCHEMA MIGRATION UTILITY
-#
-# Run: python main.py --migrate
-# Adds v11 fields to existing Appwrite collection.
-# Safe to run multiple times (skips existing fields).
-# ═══════════════════════════════════════════════════════════
 
 def _run_migrate():
     """
