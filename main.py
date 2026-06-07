@@ -128,8 +128,10 @@ GROQ_TEMPERATURE = 0.4
 # ── OpenRouter (FIX 3) ──
 # Free model tried first, paid model as fallback.
 OPENROUTER_MODELS = [
-    "meta-llama/llama-3.1-8b-instruct:free",  # free tier
-    "mistralai/mistral-7b-instruct",           # paid fallback
+    "google/gemini-2.5-flash",                  # Google Gemini 2.5 via OpenRouter (highly robust, bypasses Google 403 blocks!)
+    "meta-llama/llama-3.3-70b-instruct",       # Flagship Llama-3.3 70B (exquisite translation quality)
+    "meta-llama/llama-3.1-8b-instruct:free",  # free fallback 8B
+    "mistralai/mistral-7b-instruct:free",      # mistral free fallback
 ]
 OPENROUTER_MAX_TOKENS  = 700
 OPENROUTER_TEMPERATURE = 0.4
@@ -353,6 +355,22 @@ _PROMPT_UNIFIED = '''\
 - نام برندها، نام طراحان و اصطلاحات تخصصی مد را حتماً با الفبای لاتین بنویس (مثال: Chanel، بارانی، Blazer).
 - در خط پایانی، امضای کانال را به صورت زیر بیاور:
   {emoji} <i>@irfashionnews | مجله زیبایی‌شناسی مد</i>
+
+💎 نمونه‌های عینی جهت الهام گرفتن (نحوه قالب‌بندی و لحن لوکس):
+
+نمونه ۱ (معرفی محصول جدید برند):
+✦ <b>سفر به اعماق هنر با کفش‌های جدید Dior</b>
+─── ⚜ ───
+برند Dior در آخرین همکاری خود با هنرمندان آوانگارد، از کتانی‌های کانسپچوال جدیدی رونمایی کرده که مرزهای میان مجسمه‌سازی و طراحی کفش را جابجا کرده است. این مجموعه با الهام از سیلوئت‌های دهه ۹۰ میلادی، بافتی از چرم مات و جزئیات ارگانیک برجسته را به نمایش می‌گذارد. خلاقیت طراح در استفاده از خطوط نامتقارن، پویایی خاصی به این محصول بخشیده است. این اثر هنری، انتخابی بی‌نظیر برای ارتقای استایل‌های خیابانی مینی‌مال و هم‌نشینی با بارانی‌های کلاسیک اورسایز در فضای شهری امروز است.
+🏷️ <i>@irfashionnews | مجله زیبایی‌شناسی مد</i>
+
+نمونه ۲ (ترند و استایل بومی‌سازی شده):
+✦ <b>ظهور دوباره جیر؛ پویایی پالت‌های نود در خیابان‌ها</b>
+─── ⚜ ───
+با آغاز فصل جدید، بافت غنی و اصیل جیر بار دیگر به صدر ترندهای جهانی بازگشته است. این بار، طراحان بر کنتراست میان ساختار محکم جیر و ریزش نرم حریر تمرکز کرده‌اند. هم‌نشینی پالت رنگی خنثی مانند کرم، شتری و زیتونی با اکسسوری‌های فلزی شاخص، حسی از مجلل بودن مینی‌مال را القا می‌کند.
+💡 <b>فرمولوژی استایل:</b>
+برای انطباق این ترند جهانی با پوشش مرسوم شهری، پیشنهاد می‌کنیم یک مانتو کتی از جنس جیر شتری را با شال حریر مشکی و مینی‌اسکارف‌های ابریشمی ست کنید تا تضاد بافت‌ها، تعادلی ساختاریافته به استایل شما ببخشد.
+🔥 <i>@irfashionnews | مجله زیبایی‌شناسی مد</i>
 
 خبر انگلیسی:
 عنوان: {title}
@@ -2212,6 +2230,32 @@ def _scrape_text(url: str, log_fn=print) -> str | None:
     except Exception as e:
         log_fn(f"[scrape] Error: {e}")
         return None
+
+
+def _normalize_image_url(url: str) -> str:
+    """
+    Removes common resizing parameters from CDN image URLs to get the original,
+    highest resolution image. Helps in deduplicating same images of different sizes.
+    """
+    if not url:
+        return ""
+    try:
+        # Shopify CDN resize parameters
+        url = re.sub(r'_(?:[0-9]+x[0-9]*|[0-9]*x[0-9]+|small|medium|large|grande|master)\.(jpe?g|png|webp)', r'.\1', url, flags=re.I)
+        # Vogue / Condé Nast CDN resize parameters
+        url = re.sub(r'/(?:w_[0-9]+,h_[0-9]+,c_limit|w_[0-9]+,c_limit|h_[0-9]+,c_limit|w_[0-9]+|h_[0-9]+)/', r'/', url, flags=re.I)
+        # general width/height query parameters
+        parsed = urlparse(url)
+        query_parts = []
+        if parsed.query:
+            for part in parsed.query.split("&"):
+                if not any(k in part.lower() for k in ["width", "height", "w", "h", "resize", "size"]):
+                    query_parts.append(part)
+        new_query = "&".join(query_parts)
+        url = parsed._replace(query=new_query).geturl()
+    except Exception:
+        pass
+    return url
 
 
 def _parse_srcset(srcset: str) -> str | None:
