@@ -26,6 +26,14 @@ import random
 import hashlib
 import asyncio
 import warnings
+import logging
+
+# Deep suppress all warnings to avoid Appwrite Native Log interference
+warnings.filterwarnings("ignore")
+logging.getLogger("requests").setLevel(logging.CRITICAL)
+logging.getLogger("urllib3").setLevel(logging.CRITICAL)
+def _no_warn(*args, **kwargs): pass
+warnings.warn = _no_warn
 import feedparser
 import aiohttp
 import requests
@@ -39,6 +47,13 @@ from appwrite.exception import AppwriteException
 from appwrite.query import Query
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", message=".*urllib3.*")
+warnings.filterwarnings("ignore", message=".*chardet.*")
+try:
+    from requests.packages.urllib3.exceptions import InsecureRequestWarning
+    warnings.simplefilter('ignore', InsecureRequestWarning)
+except ImportError:
+    pass
 
 
 # ═══════════════════════════════════════════════════════════
@@ -533,9 +548,27 @@ def _to_dict_safe(obj):
         return obj
     if hasattr(obj, "to_dict"):
         return obj.to_dict()
+    if hasattr(obj, "to_map"):
+        return obj.to_map()
+    if hasattr(obj, "documents") and hasattr(obj, "total"):
+        return {
+            "total": obj.total,
+            "documents": [_to_dict_safe(d) for d in obj.documents]
+        }
     if hasattr(obj, "__dict__"):
-        return getattr(obj, "__dict__")
-    return obj
+        d = getattr(obj, "__dict__")
+        if d: return d
+    
+    # fallback for objects that use properties but have no dict
+    res = {}
+    for key in dir(obj):
+        if not key.startswith("_") and not callable(getattr(obj, key)):
+            val = getattr(obj, key)
+            if isinstance(val, list):
+                res[key] = [_to_dict_safe(v) for v in val]
+            else:
+                res[key] = val
+    return res
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1561,26 +1594,24 @@ async def main(event=None, context=None):
     # ════════════════════════════════
     # PHASE 8 — UPDATE DB STATE
     # ════════════════════════════════
-    if schema.is_v11:
-        if posted:
-            _mark_posted(
-                databases, database_id, COLLECTION_ID,
-                doc_id, sdk_mode, log,
-            )
-            log(f"[{elapsed()}s] DB → posted=true ✓")
-        else:
-            _mark_failed(
-                databases, database_id, COLLECTION_ID,
-                doc_id, sdk_mode,
-                reason=post_error or "telegram_failed",
-                log_fn=log,
-            )
-            error(f"[{elapsed()}s] DB → status=failed")
-    else:
-        log(
-            f"[{elapsed()}s] Schema missing v11 fields — "
-            f"skipping status update. Run --migrate."
+    if posted:
+        _mark_posted(
+            databases, database_id, COLLECTION_ID,
+            doc_id, sdk_mode, schema, log,
         )
+        log(f"[{elapsed()}s] DB → posted=true ✓")
+    else:
+        _mark_failed(
+            databases, database_id, COLLECTION_ID,
+            doc_id, sdk_mode, schema,
+            reason=post_error or "telegram_failed",
+            log_fn=log,
+        )
+        error(f"[{elapsed()}s] DB → status=failed")
+        # Legacy mode: if it failed, delete it so it can be retried
+        if not schema.has_status and not schema.has_posted:
+            log(f"[{elapsed()}s] Legacy mode: deleting failed lock so it can be retried...")
+            _delete_record(databases, database_id, COLLECTION_ID, doc_id, sdk_mode, log)
 
     result = {
         "images":     image_urls,
@@ -1900,10 +1931,10 @@ def _normalize_persian_text(text: str) -> str:
     for old, new in replacements.items():
         text = text.replace(old, new)
     
-    # Fix double spaces
-    text = re.sub(r'\s+', ' ', text)
+    # Fix double spaces (but preserve newlines)
+    text = re.sub(r'[ \t]+', ' ', text)
     # Fix punctuation spacing
-    text = re.sub(r'\s+([،؛:.!؟])', r'\1', text)
+    text = re.sub(r'[ \t]+([،؛:.!؟])', r'\1', text)
     
     return text.strip()
 
@@ -2029,7 +2060,22 @@ def _load_recent_titles_posted_only(
                 Query.limit(limit),
                 Query.order_desc("$createdAt"),
             ]
-        r    = _db_list(databases, database_id, collection_id, queries, sdk_mode)
+        
+        # Try fetching with order_desc
+        try:
+            r = _db_list(databases, database_id, collection_id, queries, sdk_mode)
+        except Exception:
+            # Fallback for old Appwrite instances or missing composite index
+            queries = [Query.limit(limit)]
+            if schema.has_posted:
+                queries.append(Query.equal("posted", True))
+            try:
+                r = _db_list(databases, database_id, collection_id, queries, sdk_mode)
+            except Exception:
+                # Absolute fallback
+                queries = [Query.limit(limit)]
+                r = _db_list(databases, database_id, collection_id, queries, sdk_mode)
+            
         docs = r.get("documents", r.get("rows", []))
         return [
             (d.get("title", ""), _normalize_tokens(d.get("title", "")))
@@ -2057,7 +2103,14 @@ def _load_recent_domain_hashes(
         ]
         if schema.has_posted:
             queries.append(Query.equal("posted", True))
-        r    = _db_list(databases, database_id, collection_id, queries, sdk_mode)
+        try:
+            r = _db_list(databases, database_id, collection_id, queries, sdk_mode)
+        except Exception:
+            queries = [Query.limit(200)]
+            if schema.has_posted:
+                queries.append(Query.equal("posted", True))
+            r = _db_list(databases, database_id, collection_id, queries, sdk_mode)
+            
         docs = r.get("documents", r.get("rows", []))
         return {d["domain_hash"] for d in docs if d.get("domain_hash")}
     except Exception as e:
@@ -2126,6 +2179,10 @@ def _write_soft_lock(
                 existing_doc_id, sdk_mode, log_fn,
             )
         else:
+            if not schema.has_status and not schema.has_posted:
+                log_fn("[lock] Legacy record found. Treating as already posted.")
+                return False, "already_posted_legacy"
+            
             log_fn(f"[lock] Unknown status '{existing_status}' → stale.")
             _delete_record(
                 databases, database_id, collection_id,
@@ -2185,28 +2242,39 @@ def _write_soft_lock(
 
 def _mark_posted(
     databases, database_id, collection_id,
-    doc_id, sdk_mode, log_fn=print,
+    doc_id, sdk_mode, schema: SchemaInfo, log_fn=print,
 ) -> bool:
     now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000+00:00")
+    fields = {}
+    if schema.has_status: fields["status"] = STATUS_POSTED
+    if schema.has_posted: fields["posted"] = True
+    if schema.has_posted_at: fields["posted_at"] = now_iso
+    
+    if not fields:
+        return True
+        
     return _update_record(
         databases, database_id, collection_id, doc_id, sdk_mode,
-        {"status": STATUS_POSTED, "posted": True, "posted_at": now_iso},
+        fields,
         log_fn,
     )
 
 
 def _mark_failed(
     databases, database_id, collection_id,
-    doc_id, sdk_mode, reason, log_fn=print,
+    doc_id, sdk_mode, schema: SchemaInfo, reason: str, log_fn=print,
 ) -> bool:
+    fields = {}
+    if schema.has_status: fields["status"] = STATUS_FAILED
+    if schema.has_posted: fields["posted"] = False
+    if schema.has_fail_reason: fields["fail_reason"] = reason[:DB_REASON_MAX]
+    
+    if not fields:
+        return True
+        
     return _update_record(
         databases, database_id, collection_id, doc_id, sdk_mode,
-        {
-            "status":      STATUS_FAILED,
-            "posted":      False,
-            "fail_reason": reason[:DB_REASON_MAX],
-        },
-        log_fn,
+        fields, log_fn,
     )
 
 
