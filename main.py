@@ -1452,6 +1452,37 @@ async def main(event=None, context=None):
         return {"status": "success", "posted": False, "reason": dup_reason}
 
     # ════════════════════════════════
+    # ════════════════════════════════
+    # PHASE 2.5 — SOFT LOCK WRITE
+    # ════════════════════════════════
+    log(f"[{elapsed()}s] Phase 2.5: Soft lock...")
+    lock_acquired, lock_result = _write_soft_lock(
+        databases=databases,
+        database_id=database_id,
+        collection_id=COLLECTION_ID,
+        link=link,
+        title=title,
+        feed_url=feed_url,
+        pub_date=pub_date,
+        source_type=SOURCE_TYPE,
+        sdk_mode=sdk_mode,
+        schema=schema,
+        title_hash=title_hash,
+        content_hash=content_hash,
+        category=category,
+        trend_score=score,
+        post_hour=current_hour,
+        domain_hash=domain_hash,
+        log_fn=log,
+    )
+
+    if not lock_acquired:
+        error(f"[{elapsed()}s] Lock failed ({lock_result}).")
+        return {"status": "skipped", "reason": lock_result, "posted": False}
+
+    doc_id = lock_result
+    log(f"[{elapsed()}s] Lock acquired. doc_id={doc_id}")
+
     # PHASE 3 — PARALLEL SCRAPE
     # ════════════════════════════════
     log(f"[{elapsed()}s] Phase 3: Scraping...")
@@ -1481,6 +1512,7 @@ async def main(event=None, context=None):
 
     if len(content) < MIN_CONTENT_CHARS:
         error(f"[{elapsed()}s] Thin content ({len(content)}ch).")
+        _mark_failed(databases, database_id, COLLECTION_ID, doc_id, sdk_mode, schema, reason="thin_content", log_fn=log)
         return {"status": "skipped", "reason": "thin_content", "posted": False}
 
     # ════════════════════════════════
@@ -1527,6 +1559,7 @@ async def main(event=None, context=None):
 
     if not caption_raw:
         error(f"[{elapsed()}s] AI Generation failed.")
+        _mark_failed(databases, database_id, COLLECTION_ID, doc_id, sdk_mode, schema, reason="ai_failed", log_fn=log)
         return {
             "status": "error",
             "reason": "translation_failed",
@@ -1543,37 +1576,6 @@ async def main(event=None, context=None):
     caption = _format_unified_caption_safety(caption_raw, hashtags, category)
     log(f"[{elapsed()}s] Caption={len(caption)}ch")
 
-    # PHASE 6 — SOFT LOCK WRITE
-    # ════════════════════════════════
-    log(f"[{elapsed()}s] Phase 6: Soft lock...")
-    lock_acquired, lock_result = _write_soft_lock(
-        databases=databases,
-        database_id=database_id,
-        collection_id=COLLECTION_ID,
-        link=link,
-        title=title,
-        feed_url=feed_url,
-        pub_date=pub_date,
-        source_type=SOURCE_TYPE,
-        sdk_mode=sdk_mode,
-        schema=schema,
-        title_hash=title_hash,
-        content_hash=content_hash,
-        category=category,
-        trend_score=score,
-        post_hour=current_hour,
-        domain_hash=domain_hash,
-        log_fn=log,
-    )
-
-    if not lock_acquired:
-        error(f"[{elapsed()}s] Lock failed ({lock_result}).")
-        return {"status": "skipped", "reason": lock_result, "posted": False}
-
-    doc_id = lock_result
-    log(f"[{elapsed()}s] Lock acquired. doc_id={doc_id}")
-
-    # ════════════════════════════════
     # PHASE 7 — POST TO TELEGRAM
     # ════════════════════════════════
     log(f"[{elapsed()}s] Phase 7: Posting...")
@@ -1963,18 +1965,13 @@ def _query_field_safe(
     Returns True (found), False (not found), None (DB error=safe).
     """
     try:
-        if schema.has_posted:
-            queries = [
-                Query.equal(field, value),
-                Query.equal("posted", True),
-                Query.limit(1),
-            ]
-        else:
-            # Legacy mode: no posted field — query field only
-            queries = [
-                Query.equal(field, value),
-                Query.limit(1),
-            ]
+        # We should NOT filter by posted=True here. 
+        # If an article is locked, failed, or posted, we want to treat it as duplicate
+        # so we don't pick it again and get stuck in infinite retry loops.
+        queries = [
+            Query.equal(field, value),
+            Query.limit(1),
+        ]
         r = _db_list(databases, database_id, collection_id, queries, sdk_mode)
         return r["total"] > 0
     except AppwriteException as e:
