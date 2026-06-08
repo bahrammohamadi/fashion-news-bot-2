@@ -1,17 +1,17 @@
 # ============================================================
 # Function 1: International Fashion Poster
 # Project:    @irfashionnews — FashionBotProject
-# Version:    12.0 — Fashion Intelligence Agent
+# Version:    12.1 — Enhanced Persian & Images
 # Runtime:    python-3.12 / Appwrite Cloud Functions
 # Timeout:    120 seconds
 #
-# NEW IN v12.0:
-#   - Fashion Intelligence Agent mode (data-driven, not magazine)
-#   - Tracked 19 brands + 6 media sources with scoring boost
-#   - Two output formats: NEWS and PRODUCT ALERT
-#   - Enhanced filtering: no celebrity gossip
-#   - Image normalization for highest resolution
-#   - PROMPT_MODE env var (intelligence|magazine)
+# NEW IN v12.1:
+#   - Enhanced Persian grammar (نیم‌فاصله، ویراستاری)
+#   - Improved prompts with نمونه‌های کامل
+#   - Better image handling (normalize + dedup)
+#   - Stronger celebrity filter
+#   - Fixed deprecation warnings
+#   - Improved brand scoring
 #
 # ============================================================
 
@@ -370,27 +370,54 @@ _PROMPT_INTELLIGENCE_NEWS = '''تو یک عامل هوشمند تحلیل باز
 
 فیلتر: منتشر نکن اخبار سلبریتی، شایعات، تبلیغات خالص، یا اخبار کم‌اهمیت. فقط منتشر کن: لانچ محصول، کالکشن جدید، تغییر مدیر خلاق، همکاری‌ها، پایداری، ترندهای وایرال.
 
+**قوانین ویراستاری فارسی (بسیار مهم):**
+- نیم‌فاصله را دقیق رعایت کن: می‌شود، می‌کند، برندهای، شرکت‌های، ترندهای
+- از «گیومه فارسی» برای نقل قول استفاده کن
+- ویرگول و نقطه‌گذاری استاندارد فارسی
+- افعال را کامل بنویس: «است» نه «هست»، «می‌باشد» نه «میباشد»
+- از «ها» جدا بنویس: برندها، محصول‌ها
+- اعداد را فارسی بنویس: ۱۰ نه 10
+
 فرمت خروجی دقیق (HTML تلگرام، فقط <b> و <i>):
-🔥 <b>[تیتر فارسی کوتاه و دقیق]</b>
+🔥 <b>[تیتر فارسی کوتاه و دقیق - حداکثر 12 کلمه]</b>
 
 <b>خلاصه:</b>
-[2-3 پاراگراف کوتاه، حرفه‌ای، بدون هایپ. داده‌محور بنویس]
+[2 پاراگراف کوتاه، حرفه‌ای، بدون هایپ. داده‌محور بنویس. جمله اول مهم‌ترین نکته]
 
 <b>چرا مهم است:</b>
-[توضیح اهمیت تجاری در 2 جمله]
+[توضیح اهمیت تجاری در 2 جمله کوتاه و دقیق]
 
 <b>امتیاز ترند:</b> [1-10]/10
 <b>تأثیر بازار:</b> Low / Medium / High
 <b>فرصت برای فروشندگان:</b>
-[یک نکته عملیاتی برای فروشندگان ایرانی]
+[یک نکته عملیاتی برای فروشندگان ایرانی - قابل اجرا]
 
 <b>منبع:</b> {source}
 
 قوانین:
 - زبان فارسی روان، حرفه‌ای، بدون صفت اضافه
 - نام برندها لاتین بماند
-- حداکثر 900 کاراکتر
+- حداکثر 850 کاراکتر
 - در پایان اضافه کن: {emoji} <i>@irfashionnews | دیده‌بان مد</i>
+
+**نمونه ایده‌آل:**
+🔥 <b>زارا کالکشن پاییزه را با تمرکز بر پایداری عرضه کرد</b>
+
+<b>خلاصه:</b>
+زارا از کالکشن پاییز ۲۰۲۴ با ۴۰ درصد مواد بازیافتی رونمایی کرد. این مجموعه شامل ۱۲۰ آیتم با قیمت متوسط ۴۵ یورو است.
+
+کالکشن جدید با الهام از مینیمالیسم اسکاندیناوی طراحی شده و در ۲۱۰۰ فروشگاه جهانی عرضه می‌شود.
+
+<b>چرا مهم است:</b>
+این حرکت نشان‌دهنده تغییر استراتژی فست‌فشن به سمت پایداری است. زارا قصد دارد تا ۲۰۲۵، ۱۰۰ درصد پنبه ارگانیک استفاده کند.
+
+<b>امتیاز ترند:</b> 8/10
+<b>تأثیر بازار:</b> High
+<b>فرصت برای فروشندگان:</b>
+تمرکز بر محصولات پایدار با قیمت متوسط - تقاضا در ایران رو به رشد است
+
+<b>منبع:</b> businessoffashion.com
+🏷️ <i>@irfashionnews | دیده‌بان مد</i>
 
 خبر:
 عنوان: {title}
@@ -398,28 +425,56 @@ _PROMPT_INTELLIGENCE_NEWS = '''تو یک عامل هوشمند تحلیل باز
 
 _PROMPT_INTELLIGENCE_PRODUCT = '''تو یک عامل هوشمند تحلیل بازار مد هستی. محصول جدید را تحلیل کن.
 
+**قوانین ویراستاری فارسی:**
+- نیم‌فاصله: می‌شود، کتانی‌های، طراحی‌شده
+- «گیومه فارسی»، اعداد فارسی: ۱۰، ۲۰۲۴
+- افعال کامل: است، می‌باشد
+
 فرمت خروجی دقیق (HTML تلگرام):
-🆕 <b>NEW PRODUCT ALERT: [نام محصول فارسی]</b>
+🆕 <b>[نام محصول فارسی - کوتاه]</b>
 
 <b>برند:</b> [Brand]
 <b>محصول:</b> [Product Name]
 <b>دسته:</b> [Category]
 
 <b>ویژگی‌های کلیدی:</b>
-- [ویژگی 1]
-- [ویژگی 2]
-- [ویژگی 3]
+• [ویژگی 1 - فنی]
+• [ویژگی 2 - متریال]
+• [ویژگی 3 - قیمت/دسترسی]
 
 <b>چرا متمایز است:</b>
-[2 جمله تحلیل]
+[2 جمله تحلیل فنی]
 
 <b>پتانسیل ترند:</b> [1-10]/10
 <b>بینش تجاری:</b>
-[فرصت برای بازار ایران]
+[فرصت برای بازار ایران - 1 جمله عملی]
 
 <b>منبع:</b> {source}
+{emoji} <i>@irfashionnews</i>
 
-قوانین: فارسی حرفه‌ای، داده‌محور، حداکثر 850 کاراکتر، برندها لاتین. پایان: {emoji} <i>@irfashionnews</i>
+قوانین: فارسی حرفه‌ای، داده‌محور، حداکثر 800 کاراکتر، برندها لاتین.
+
+**نمونه:**
+🆕 <b>کتانی جدید نایکی با فناوری بازیافتی</b>
+
+<b>برند:</b> Nike
+<b>محصول:</b> Air Max 2024
+<b>دسته:</b> کتانی ورزشی
+
+<b>ویژگی‌های کلیدی:</b>
+• زیره از ۷۵٪ مواد بازیافتی
+• طراحی ارگونومیک جدید
+• قیمت: ۱۴۰ دلار
+
+<b>چرا متمایز است:</b>
+نایکی برای اولین بار فناوری بازیافت را در سری اصلی Air Max به کار برده است. این محصول ۲۰٪ سبک‌تر از نسل قبل است.
+
+<b>پتانسیل ترند:</b> 9/10
+<b>بینش تجاری:</b>
+تقاضا برای کتانی‌های پایدار در ایران ۳۵٪ رشد داشته است
+
+<b>منبع:</b> hypebeast.com
+🏷️ <i>@irfashionnews</i>
 
 خبر:
 عنوان: {title}
@@ -548,8 +603,10 @@ def _db_list(
     falls back to list_documents (legacy SDK).
     Suppresses DeprecationWarning on legacy path.
     """
+    import warnings
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", DeprecationWarning)
+        warnings.filterwarnings("ignore", category=DeprecationWarning, module="appwrite")
         if sdk_mode == "new":
             try:
                 res = databases.list_rows(
@@ -1233,6 +1290,9 @@ def _format_unified_caption_safety(
                 new_text.append(part)
         text = "".join(new_text)
 
+    # v12.1: Apply Persian normalization
+    text = _normalize_persian_text(text)
+
     # Let's ensure the categories and footer are in good shape
     CATEGORY_EMOJI = {
         "runway": "👗", "brand": "🏷️", "business": "📊",
@@ -1244,7 +1304,7 @@ def _format_unified_caption_safety(
     # If the footer is not already in the text, let's append it
     footer_pattern = "@irfashionnews"
     if footer_pattern not in text:
-        text += f"\n\n{emoji} <i>@irfashionnews | مجله زیبایی‌شناسی مد</i>"
+        text += f"\n\n{emoji} <i>@irfashionnews | دیده‌بان مد</i>"
 
     # Append hashtags if any, and if they aren't already there
     if hashtags:
@@ -1263,7 +1323,7 @@ async def main(event=None, context=None):
     log   = context.log   if context and hasattr(context, "log")   else print
     error = context.error if context and hasattr(context, "error") else print
 
-    log("═══ FashionBot v12.0 Intelligence Agent started ═══")
+    log("═══ FashionBot v12.1 Intelligence Agent started ═══")
 
     loop       = asyncio.get_running_loop()
     start_time = loop.time()
@@ -1581,7 +1641,7 @@ async def main(event=None, context=None):
         "score":      score,
     }
     log(
-        f"═══ v12.0 done in {elapsed()}s | "
+        f"═══ v12.1 done in {elapsed()}s | "
         f"{'POSTED ✓' if posted else 'FAILED ✗'} ═══"
     )
     return result
@@ -1758,7 +1818,8 @@ def _score_article(
         "layoffs", "strike", "amazon warehouse", "retailer", "earnings report", "target's",
         # v12: filter celebrity gossip
         "kardashian dating", "breakup", "divorce", "spotted with", "paparazzi",
-        "gossip", "rumor", "affair", "pregnant", "baby bump"
+        "gossip", "rumor", "affair", "pregnant", "baby bump",
+        "tony awards", "oscar", "grammy", "red carpet exclusive", "celebrity spotted"
     ]
     if any(ukw in combined for ukw in unwanted_keywords):
         return 0  # discard immediately by scoring 0
@@ -1806,8 +1867,13 @@ def _score_article(
         score = max(0, score - 30)
 
     # v12: boost tracked brands
-    if any(brand in combined for brand in TRACKED_BRANDS):
-        score += 20
+    is_tracked_brand = any(brand in combined for brand in TRACKED_BRANDS)
+    if is_tracked_brand:
+        score += 25
+    else:
+        # Penalize non-tracked brands slightly
+        score = max(0, score - 10)
+    
     # v12: boost tracked media sources
     if any(media in candidate["feed_url"].lower() for media in ["voguebusiness", "businessoffashion", "wwd", "hypebeast", "highsnobiety", "fashionnetwork"]):
         score += 10
@@ -1817,6 +1883,13 @@ def _score_article(
 
 def _detect_category(title: str, description: str) -> str:
     combined = (title + " " + description).lower()
+    # v12.1: Check brands first for better accuracy
+    if any(brand in combined for brand in TRACKED_BRANDS):
+        # Check if it's about collection/runway specifically
+        if any(kw in combined for kw in ["runway", "fashion week", "couture", "show"]):
+            return "runway"
+        return "brand"
+    
     for cat, keywords in CONTENT_CATEGORIES.items():
         for kw in keywords:
             if kw in combined:
@@ -1849,6 +1922,39 @@ def _is_product_launch(title: str, content: str) -> bool:
     brand_hit = any(b in text for b in TRACKED_BRANDS)
     signal_hit = any(s in text for s in product_signals)
     return brand_hit and signal_hit
+
+
+def _normalize_persian_text(text: str) -> str:
+    """Apply Persian grammar and orthography fixes (v12.1)."""
+    if not text:
+        return text
+    
+    # Fix common spacing issues
+    replacements = {
+        ' می ': ' می‌',
+        ' نمی ': ' نمی‌',
+        ' ها ': '‌ها ',
+        ' های ': '‌های ',
+        ' تر ': '‌تر ',
+        ' ترین ': '‌ترین ',
+        ' ام ': '‌ام ',
+        ' ات ': '‌ات ',
+        ' اش ': '‌اش ',
+        ' ای ': '‌ای ',
+        '0': '۰', '1': '۱', '2': '۲', '3': '۳', '4': '۴',
+        '5': '۵', '6': '۶', '7': '۷', '8': '۸', '9': '۹',
+        'ي': 'ی', 'ك': 'ک',
+    }
+    
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+    
+    # Fix double spaces
+    text = re.sub(r'\s+', ' ', text)
+    # Fix punctuation spacing
+    text = re.sub(r'\s+([،؛:.!؟])', r'\1', text)
+    
+    return text.strip()
 
 
 # ═══════════════════════════════════════════════════════════
@@ -2520,10 +2626,19 @@ async def _post_to_telegram(
 ) -> bool:
     posted = False
 
+    # v12.1: Ensure all product images are included (up to 10)
     if len(image_urls) >= 2:
         try:
             media_group = []
-            for idx, url in enumerate(image_urls[:MAX_IMAGES]):
+            # Normalize all URLs first
+            normalized_urls = [_normalize_image_url(url) for url in image_urls[:MAX_IMAGES]]
+            # Remove duplicates after normalization
+            seen_urls = []
+            for url in normalized_urls:
+                if url not in seen_urls:
+                    seen_urls.append(url)
+            
+            for idx, url in enumerate(seen_urls):
                 if idx == 0:
                     media_group.append(InputMediaPhoto(media=url, caption=caption, parse_mode="HTML"))
                 else:
