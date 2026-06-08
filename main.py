@@ -1312,8 +1312,18 @@ def _format_unified_caption_safety(
         if safe_cut == -1:
             safe_cut = 980
             
-        text = text[:safe_cut] + "…\n</i></b>" # Close potentially open tags
-        text = text.replace("<b></b>", "").replace("<i></i>", "")
+        text = text[:safe_cut] + "…"
+        
+    # Final safety check: use BeautifulSoup to auto-close any dangling HTML tags
+    # so Telegram doesn't crash on "unexpected end tag"
+    try:
+        from bs4 import BeautifulSoup
+        # Replacing linebreaks to preserve them since BS4 might eat them in some contexts
+        text = text.replace("\n", "<br>")
+        soup = BeautifulSoup(text, 'html.parser')
+        text = str(soup).replace("<br>", "\n").replace("<br/>", "\n")
+    except Exception:
+        pass
 
     return text
 
