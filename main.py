@@ -369,6 +369,8 @@ _PROMPT_INTELLIGENCE_NEWS = '''تو یک عامل هوشمند تحلیل باز
 رسانه‌های رصد: Vogue Business, Business of Fashion, WWD, Fashion Network, Hypebeast, Highsnobiety
 
 فیلتر: منتشر نکن اخبار سلبریتی، شایعات، تبلیغات خالص، یا اخبار کم‌اهمیت. فقط منتشر کن: لانچ محصول، کالکشن جدید، تغییر مدیر خلاق، همکاری‌ها، پایداری، ترندهای وایرال.
+**قوانین مهم:**
+- هیچ جمله، پاراگراف یا بخشی را تکرار نکن! خروجی باید کاملاً منحصربه‌فرد و بدون تکرار باشد.
 
 **قوانین ویراستاری فارسی (بسیار مهم):**
 - نیم‌فاصله را دقیق رعایت کن: می‌شود، می‌کند، برندهای، شرکت‌های، ترندهای
@@ -379,22 +381,21 @@ _PROMPT_INTELLIGENCE_NEWS = '''تو یک عامل هوشمند تحلیل باز
 - اعداد را فارسی بنویس: ۱۰ نه 10
 
 فرمت خروجی دقیق (HTML تلگرام، فقط <b> و <i>):
-🔥 <b>[تیتر فارسی کوتاه و دقیق - حداکثر 12 کلمه]</b>
+✦ <b>[تیتر کوتاه، مجلل و ضربه‌زن فارسی - حداکثر ۱۰-۱۲ کلمه]</b>
 
-<b>خلاصه:</b>
-[2 پاراگراف کوتاه، حرفه‌ای، بدون هایپ. داده‌محور بنویس. جمله اول مهم‌ترین نکته]
+[پاراگراف اول: خلاصه داستانی و گیرا از خبر - ۲-۳ جمله جذاب]
 
-<b>چرا مهم است:</b>
-[توضیح اهمیت تجاری در 2 جمله کوتاه و دقیق]
+[بدنه: جزئیات خلاقیت، متریال، پالت رنگی، الهام در ۱-۲ پاراگراف]
 
-<b>امتیاز ترند:</b> [1-10]/10
-<b>تأثیر بازار:</b> Low / Medium / High
-<b>فرصت برای فروشندگان:</b>
-[یک نکته عملیاتی برای فروشندگان ایرانی - قابل اجرا]
+💡 <b>فرمولوژی استایل:</b>
+[۱-۲ جمله نکته کاربردی و الهام‌بخش برای ست کردن در استایل ایرانی - ملموس و قابل اجرا]
 
 <b>منبع:</b> {source}
 
 قوانین:
+- زبان فارسی روان، حرفه‌ای، بدون صفت اضافه
+- از نشانه‌های بصری متنوع مثل ✦ ─── ⚜ ─── 🕯 💡 استفاده کن
+- ساختار را برای هر خبر متفاوت نگه دار
 - زبان فارسی روان، حرفه‌ای، بدون صفت اضافه
 - نام برندها لاتین بماند
 - حداکثر 850 کاراکتر
@@ -452,6 +453,8 @@ _PROMPT_INTELLIGENCE_PRODUCT = '''تو یک عامل هوشمند تحلیل ب�
 <b>منبع:</b> {source}
 {emoji} <i>@irfashionnews</i>
 
+**قوانین مهم:**
+- هیچ جمله یا بخشی را تکرار نکن! خروجی باید منحصربه‌فرد باشد.
 قوانین: فارسی حرفه‌ای، داده‌محور، حداکثر 800 کاراکتر، برندها لاتین.
 
 **نمونه:**
@@ -2627,7 +2630,7 @@ async def _post_to_telegram(
     posted = False
 
     # v12.1: Ensure all product images are included (up to 10)
-    if len(image_urls) >= 2:
+    if len(image_urls) >= 1:
         try:
             media_group = []
             # Normalize all URLs first
@@ -2664,198 +2667,3 @@ async def _post_to_telegram(
                 except Exception as e2:
                     log_fn(f"[tg] Single photo fallback with caption failed: {str(e2)[:80]}")
                     
-    elif len(image_urls) == 1:
-        try:
-            await bot.send_photo(
-                chat_id=chat_id, photo=image_urls[0],
-                caption=caption, parse_mode="HTML",
-                disable_notification=True,
-            )
-            log_fn("[tg] Single photo sent with embedded caption.")
-            posted = True
-        except Exception as e:
-            log_fn(f"[tg] Single photo with caption failed: {str(e)[:120]}")
-            
-    if not posted:
-        try:
-            await bot.send_message(
-                chat_id=chat_id,
-                text=caption,
-                parse_mode="HTML",
-                link_preview_options=LinkPreviewOptions(is_disabled=True),
-                disable_notification=True,
-            )
-            log_fn("[tg] Sent standalone text caption.")
-            posted = True
-        except Exception as e:
-            log_fn(f"[tg] Standalone text caption failed: {str(e)[:120]}")
-            
-    return posted
-
-
-def _run_migrate():
-    """
-    Add v11 schema fields to the Appwrite collection.
-    Fields added: status, posted, locked_at, posted_at, fail_reason.
-    Existing fields are not modified.
-    """
-    print("[migrate] Starting schema migration...")
-
-    aw_client = Client()
-    aw_client.set_endpoint(
-        os.environ.get("APPWRITE_ENDPOINT", "https://cloud.appwrite.io/v1")
-    )
-    aw_client.set_project(os.environ.get("APPWRITE_PROJECT_ID", ""))
-    aw_client.set_key(os.environ.get("APPWRITE_API_KEY", ""))
-
-    from appwrite.services.databases import Databases as _Databases
-    databases  = _Databases(aw_client)
-    db_id      = os.environ.get("APPWRITE_DATABASE_ID", "")
-    col_id     = COLLECTION_ID
-
-    # Field definitions: (key, type, required, default, extra_kwargs)
-    FIELDS_TO_ADD = [
-        ("status",      "string",  False, STATUS_LOCKED, {"size": 20}),
-        ("posted",      "boolean", False, False,         {}),
-        ("locked_at",   "string",  False, "",            {"size": 50}),
-        ("posted_at",   "string",  False, "",            {"size": 50}),
-        ("fail_reason", "string",  False, "",            {"size": 500}),
-    ]
-
-    for field_key, field_type, required, default, extra in FIELDS_TO_ADD:
-        try:
-            if field_type == "string":
-                size = extra.get("size", 255)
-                databases.create_string_attribute(
-                    database_id=db_id,
-                    collection_id=col_id,
-                    key=field_key,
-                    size=size,
-                    required=required,
-                    default=default,
-                )
-            elif field_type == "boolean":
-                databases.create_boolean_attribute(
-                    database_id=db_id,
-                    collection_id=col_id,
-                    key=field_key,
-                    required=required,
-                    default=default,
-                )
-            print(f"[migrate] ✓ Added field: {field_key} ({field_type})")
-        except AppwriteException as e:
-            if "already exists" in str(e.message).lower():
-                print(f"[migrate] ℹ Field already exists: {field_key}")
-            else:
-                print(f"[migrate] ✗ Failed to add {field_key}: {e.message}")
-        except Exception as e:
-            print(f"[migrate] ✗ Error adding {field_key}: {e}")
-
-    print("[migrate] Done. Wait ~30s for Appwrite to index new fields.")
-    print("[migrate] Then run --cleanup to clear unposted records.")
-
-
-# ═══════════════════════════════════════════════════════════
-# SECTION 17 — CLEANUP UTILITY
-# ═══════════════════════════════════════════════════════════
-
-def _run_cleanup():
-    """Delete all records where posted != true."""
-    print("[cleanup] Starting unposted record purge...")
-    aw_client = Client()
-    aw_client.set_endpoint(
-        os.environ.get("APPWRITE_ENDPOINT", "https://cloud.appwrite.io/v1")
-    )
-    aw_client.set_project(os.environ.get("APPWRITE_PROJECT_ID", ""))
-    aw_client.set_key(os.environ.get("APPWRITE_API_KEY", ""))
-    databases = Databases(aw_client)
-    db_id     = os.environ.get("APPWRITE_DATABASE_ID", "")
-    col_id    = COLLECTION_ID
-
-    deleted = 0
-    kept    = 0
-    cursor  = None
-
-    while True:
-        queries = [Query.limit(100)]
-        if cursor:
-            queries.append(Query.cursor_after(cursor))
-        try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", DeprecationWarning)
-                result = databases.list_documents(
-                    database_id=db_id,
-                    collection_id=col_id,
-                    queries=queries,
-                )
-        except Exception as e:
-            print(f"[cleanup] Fetch error: {e}")
-            break
-
-        docs = result.get("documents", [])
-        if not docs:
-            break
-
-        for doc in docs:
-            doc_id    = doc["$id"]
-            is_posted = doc.get("posted", False) is True
-            if not is_posted:
-                try:
-                    with warnings.catch_warnings():
-                        warnings.simplefilter("ignore", DeprecationWarning)
-                        databases.delete_document(
-                            database_id=db_id,
-                            collection_id=col_id,
-                            document_id=doc_id,
-                        )
-                    print(f"[cleanup] DELETED: {doc.get('title', doc_id)[:60]}")
-                    deleted += 1
-                except Exception as e:
-                    print(f"[cleanup] Delete failed ({doc_id}): {e}")
-            else:
-                kept += 1
-
-        cursor = docs[-1]["$id"]
-        if len(docs) < 100:
-            break
-
-    print(f"[cleanup] Deleted={deleted} | Kept={kept}")
-
-
-# ═══════════════════════════════════════════════════════════
-# LOCAL ENTRY POINT
-# ═══════════════════════════════════════════════════════════
-
-if __name__ == "__main__":
-    import sys
-
-    if "--migrate" in sys.argv:
-        # Step 1: Add v11 fields to Appwrite collection
-        _run_migrate()
-
-    elif "--cleanup" in sys.argv:
-        # Step 2: Clear unposted records (run after --migrate)
-        _run_cleanup()
-
-    elif len(sys.argv) > 1 and sys.argv[1].startswith("http"):
-        # Test single URL
-        url = sys.argv[1]
-        print(f"[LOCAL] Testing: {url}")
-
-        async def _test():
-            content  = _scrape_text(url) or url[:500]
-            body_p   = _PROMPT_BODY.format(input_text=content[:3000])
-            title_p  = _PROMPT_TITLE.format(input_text=url[:200])
-            tip_p    = _PROMPT_TIP.format(input_text=content[:1500])
-            b, t, tip = await _run_three_races(body_p, title_p, tip_p)
-            hashtags  = _extract_hashtags_from_text(content[:500])
-            caption   = _build_mehrjameh_caption(
-                t or "عنوان", b or "متن", tip or "",
-                hashtags, "general",
-            )
-            print(f"\n── CAPTION ({len(caption)}ch) ──\n{caption}\n")
-
-        asyncio.run(_test())
-
-    else:
-        asyncio.run(main())
