@@ -1297,8 +1297,12 @@ def _format_unified_caption_safety(
             text += f"\n\n{hash_line}"
 
     # Enforce strict maximum length limit for photo captions in Telegram (1024 characters)
+    # Telegram max caption is 1024. If we cut it exactly at 1015, we might cut tags.
+    # So we'll try to find a safe spot to cut, or just close tags.
     if len(text) > 1020:
-        text = text[:1015] + "…"
+        # A rough but safer trim
+        text = text[:1000] + "…\n</i></b>" # Close potentially open tags
+        text = text.replace("<b></b>", "").replace("<i></i>", "")
 
     return text
 
