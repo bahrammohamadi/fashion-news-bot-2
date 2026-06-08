@@ -1,50 +1,18 @@
 # ============================================================
 # Function 1: International Fashion Poster
 # Project:    @irfashionnews — FashionBotProject
-# Version:    11.1 — Schema-Adaptive + Model Fixes
+# Version:    12.0 — Fashion Intelligence Agent
 # Runtime:    python-3.12 / Appwrite Cloud Functions
 # Timeout:    120 seconds
 #
-# FIXES FROM v11.0:
+# NEW IN v12.0:
+#   - Fashion Intelligence Agent mode (data-driven, not magazine)
+#   - Tracked 19 brands + 6 media sources with scoring boost
+#   - Two output formats: NEWS and PRODUCT ALERT
+#   - Enhanced filtering: no celebrity gossip
+#   - Image normalization for highest resolution
+#   - PROMPT_MODE env var (intelligence|magazine)
 #
-#   FIX 1 — SCHEMA ADAPTATION:
-#     Problem: "posted" field missing → all dedup queries fail
-#     Solution:
-#       - _detect_schema_fields() runs at startup
-#       - Detects which fields exist in the collection
-#       - _query_field_safe() uses only fields that exist
-#       - When "posted" absent → falls back to link-only dedup
-#       - Schema migration utility added (_migrate_schema)
-#       - All dedup functions accept has_posted_field flag
-#
-#   FIX 2 — GROQ MODEL UPDATE:
-#     Problem: llama3-70b-8192 decommissioned → HTTP 400
-#     Solution:
-#       - Primary:  llama-3.3-70b-versatile
-#       - Fallback: llama-3.1-8b-instant (if primary 400s)
-#       - Model tried in order, first success wins
-#
-#   FIX 3 — OPENROUTER KEY VALIDATION:
-#     Problem: 401 "User not found" → silent failure
-#     Solution:
-#       - Key validated at startup with lightweight probe
-#       - Invalid key → provider skipped cleanly
-#       - Free model fallback: meta-llama/llama-3.1-8b-instruct:free
-#       - Paid model: mistralai/mistral-7b-instruct
-#
-#   FIX 4 — SDK DEPRECATION WARNINGS:
-#     Problem: list_documents deprecated since 1.8.0
-#     Solution:
-#       - All DB calls use _db_list() wrapper
-#       - _db_list() tries list_rows first, falls back to list_documents
-#       - Deprecation warnings suppressed cleanly
-#
-# SCHEMA MIGRATION (run once if posted field is missing):
-#   python main.py --migrate
-#   Adds posted/status/locked_at/posted_at/fail_reason fields.
-#
-# ONE-TIME CLEANUP (run once to clear unposted records):
-#   python main.py --cleanup
 # ============================================================
 
 
@@ -122,8 +90,8 @@ GROQ_MODELS = [
     "llama-3.1-8b-instant",      # fallback — fast, always available
     "gemma2-9b-it",              # last resort
 ]
-GROQ_MAX_TOKENS  = 700
-GROQ_TEMPERATURE = 0.4
+GROQ_MAX_TOKENS  = 900
+GROQ_TEMPERATURE = 0.3
 
 # ── OpenRouter (FIX 3) ──
 # Free model tried first, paid model as fallback.
@@ -133,8 +101,8 @@ OPENROUTER_MODELS = [
     "meta-llama/llama-3.1-8b-instruct:free",  # free fallback 8B
     "mistralai/mistral-7b-instruct:free",      # mistral free fallback
 ]
-OPENROUTER_MAX_TOKENS  = 700
-OPENROUTER_TEMPERATURE = 0.4
+OPENROUTER_MAX_TOKENS  = 900
+OPENROUTER_TEMPERATURE = 0.3
 
 # ── Google Gemini ──
 GEMINI_MODELS = [
@@ -164,6 +132,19 @@ SCORE_DESC_KEYWORD      = 5
 SCORE_HAS_IMAGE         = 10
 SCORE_DESC_LENGTH       = 10
 SCORE_FASHION_RELEVANCE = 20
+
+# ── Fashion Intelligence Agent - Tracked Entities (v12) ──
+TRACKED_BRANDS = {
+    "zara", "h&m", "hm", "uniqlo", "mango", "cos", "massimo dutti",
+    "nike", "adidas", "puma", "new balance",
+    "louis vuitton", "dior", "chanel", "gucci", "prada", "miu miu",
+    "saint laurent", "loewe", "coach"
+}
+TRACKED_MEDIA = {
+    "vogue business", "business of fashion", "bof",
+    "wwd", "fashion network", "hypebeast", "highsnobiety"
+}
+PROMPT_MODE = os.environ.get("PROMPT_MODE", "intelligence")  # intelligence | magazine
 
 FASHION_RELEVANCE_KEYWORDS = {
     "chanel", "dior", "gucci", "prada", "louis vuitton", "lv",
@@ -277,6 +258,7 @@ FASHION_STICKERS = [
 
 RSS_FEEDS = [
     "https://www.vogue.com/feed/rss",
+    "https://www.voguebusiness.com/feed",
     "https://wwd.com/feed/",
     "https://fashionista.com/feed",
     "https://www.harpersbazaar.com/rss/fashion.xml",
@@ -295,6 +277,8 @@ RSS_FEEDS = [
     "https://www.teenvogue.com/feed/rss",
     "https://www.glossy.co/feed/",
     "https://www.highsnobiety.com/feed/",
+    "https://hypebeast.com/feed",
+    "https://ww.fashionnetwork.com/feed/",
     "https://fashionmagazine.com/feed/",
 ]
 
@@ -377,6 +361,69 @@ _PROMPT_UNIFIED = '''\
 محتوا: {input_text}
 
 کپشن نهایی تلگرام (با فرمت HTML):'''
+
+# ── NEW: Fashion Intelligence Agent Prompts (v12) ──
+_PROMPT_INTELLIGENCE_NEWS = '''تو یک عامل هوشمند تحلیل بازار مد (Fashion Intelligence Agent) هستی. ماموریت تو رصد برندهای جهانی و انتشار فقط اخبار با ارزش بالا به زبان فارسی است.
+
+برندهای رصد: Zara, H&M, Uniqlo, Mango, COS, Massimo Dutti, Nike, Adidas, Puma, New Balance, Louis Vuitton, Dior, Chanel, Gucci, Prada, Miu Miu, Saint Laurent, Loewe, Coach
+رسانه‌های رصد: Vogue Business, Business of Fashion, WWD, Fashion Network, Hypebeast, Highsnobiety
+
+فیلتر: منتشر نکن اخبار سلبریتی، شایعات، تبلیغات خالص، یا اخبار کم‌اهمیت. فقط منتشر کن: لانچ محصول، کالکشن جدید، تغییر مدیر خلاق، همکاری‌ها، پایداری، ترندهای وایرال.
+
+فرمت خروجی دقیق (HTML تلگرام، فقط <b> و <i>):
+🔥 <b>[تیتر فارسی کوتاه و دقیق]</b>
+
+<b>خلاصه:</b>
+[2-3 پاراگراف کوتاه، حرفه‌ای، بدون هایپ. داده‌محور بنویس]
+
+<b>چرا مهم است:</b>
+[توضیح اهمیت تجاری در 2 جمله]
+
+<b>امتیاز ترند:</b> [1-10]/10
+<b>تأثیر بازار:</b> Low / Medium / High
+<b>فرصت برای فروشندگان:</b>
+[یک نکته عملیاتی برای فروشندگان ایرانی]
+
+<b>منبع:</b> {source}
+
+قوانین:
+- زبان فارسی روان، حرفه‌ای، بدون صفت اضافه
+- نام برندها لاتین بماند
+- حداکثر 900 کاراکتر
+- در پایان اضافه کن: {emoji} <i>@irfashionnews | دیده‌بان مد</i>
+
+خبر:
+عنوان: {title}
+متن: {input_text}'''
+
+_PROMPT_INTELLIGENCE_PRODUCT = '''تو یک عامل هوشمند تحلیل بازار مد هستی. محصول جدید را تحلیل کن.
+
+فرمت خروجی دقیق (HTML تلگرام):
+🆕 <b>NEW PRODUCT ALERT: [نام محصول فارسی]</b>
+
+<b>برند:</b> [Brand]
+<b>محصول:</b> [Product Name]
+<b>دسته:</b> [Category]
+
+<b>ویژگی‌های کلیدی:</b>
+- [ویژگی 1]
+- [ویژگی 2]
+- [ویژگی 3]
+
+<b>چرا متمایز است:</b>
+[2 جمله تحلیل]
+
+<b>پتانسیل ترند:</b> [1-10]/10
+<b>بینش تجاری:</b>
+[فرصت برای بازار ایران]
+
+<b>منبع:</b> {source}
+
+قوانین: فارسی حرفه‌ای، داده‌محور، حداکثر 850 کاراکتر، برندها لاتین. پایان: {emoji} <i>@irfashionnews</i>
+
+خبر:
+عنوان: {title}
+متن: {input_text}'''
 
 # ═══════════════════════════════════════════════════════════
 # SECTION 3 — SCHEMA DETECTION (FIX 1)
@@ -908,8 +955,8 @@ async def _call_gemini(
                 "parts": [{"text": prompt}]
             }],
             "generationConfig": {
-                "temperature": 0.4,
-                "maxOutputTokens": 700,
+                "temperature": 0.3,
+                "maxOutputTokens": 900,
             }
         }
         try:
@@ -1216,7 +1263,7 @@ async def main(event=None, context=None):
     log   = context.log   if context and hasattr(context, "log")   else print
     error = context.error if context and hasattr(context, "error") else print
 
-    log("═══ FashionBot v13.0 started ═══")
+    log("═══ FashionBot v12.0 Intelligence Agent started ═══")
 
     loop       = asyncio.get_running_loop()
     start_time = loop.time()
@@ -1396,20 +1443,43 @@ async def main(event=None, context=None):
     # ════════════════════════════════
     # PHASE 4 — UNIFIED AI GENERATION
     # ════════════════════════════════
-    log(f"[{elapsed()}s] Phase 4: Generating unified premium HTML caption...")
+    log(f"[{elapsed()}s] Phase 4: Generating caption (mode={PROMPT_MODE})...")
     CATEGORY_EMOJI = {
         "runway": "👗", "brand": "🏷️", "business": "📊",
         "beauty": "💄", "sustainability": "♻️", "celebrity": "⭐",
         "trend": "🔥", "general": "🌐",
     }
     emoji = CATEGORY_EMOJI.get(category, "🌐")
-    unified_prompt = _PROMPT_UNIFIED.format(
-        title=title[:500],
-        input_text=content[:3000],
-        category=category,
-        emoji=emoji,
-    )
-    caption_raw = await _parallel_ai_race(unified_prompt, AI_RACE_TIMEOUT, log)
+    
+    # v12: Intelligence Agent mode
+    if PROMPT_MODE == "intelligence":
+        is_product = _is_product_launch(title, content)
+        if is_product:
+            prompt = _PROMPT_INTELLIGENCE_PRODUCT.format(
+                title=title[:500],
+                input_text=content[:3000],
+                source=link,
+                emoji=emoji,
+            )
+            log(f"[{elapsed()}s] Using PRODUCT prompt")
+        else:
+            prompt = _PROMPT_INTELLIGENCE_NEWS.format(
+                title=title[:500],
+                input_text=content[:3000],
+                source=link,
+                emoji=emoji,
+            )
+            log(f"[{elapsed()}s] Using NEWS prompt")
+    else:
+        # legacy magazine mode
+        prompt = _PROMPT_UNIFIED.format(
+            title=title[:500],
+            input_text=content[:3000],
+            category=category,
+            emoji=emoji,
+        )
+    
+    caption_raw = await _parallel_ai_race(prompt, AI_RACE_TIMEOUT, log)
 
     if not caption_raw:
         error(f"[{elapsed()}s] AI Generation failed.")
@@ -1511,7 +1581,7 @@ async def main(event=None, context=None):
         "score":      score,
     }
     log(
-        f"═══ v13.0 done in {elapsed()}s | "
+        f"═══ v12.0 done in {elapsed()}s | "
         f"{'POSTED ✓' if posted else 'FAILED ✗'} ═══"
     )
     return result
@@ -1685,7 +1755,10 @@ def _score_article(
     unwanted_keywords = [
         "walmart", "target store", "kohls", "tj maxx", "marshalls", "kohl's",
         "retail sales", "store closing", "malls closing", "bankruptcy", "nordstrom rack",
-        "layoffs", "strike", "amazon warehouse", "retailer", "earnings report", "target's"
+        "layoffs", "strike", "amazon warehouse", "retailer", "earnings report", "target's",
+        # v12: filter celebrity gossip
+        "kardashian dating", "breakup", "divorce", "spotted with", "paparazzi",
+        "gossip", "rumor", "affair", "pregnant", "baby bump"
     ]
     if any(ukw in combined for ukw in unwanted_keywords):
         return 0  # discard immediately by scoring 0
@@ -1732,6 +1805,13 @@ def _score_article(
     else:
         score = max(0, score - 30)
 
+    # v12: boost tracked brands
+    if any(brand in combined for brand in TRACKED_BRANDS):
+        score += 20
+    # v12: boost tracked media sources
+    if any(media in candidate["feed_url"].lower() for media in ["voguebusiness", "businessoffashion", "wwd", "hypebeast", "highsnobiety", "fashionnetwork"]):
+        score += 10
+
     return min(score, 100)
 
 
@@ -1755,6 +1835,20 @@ def _extract_hashtags_from_text(text: str) -> list[str]:
             if len(hashtags) >= MAX_HASHTAGS:
                 break
     return hashtags
+
+
+def _is_product_launch(title: str, content: str) -> bool:
+    """Detect if article is about new product launch (v12)."""
+    text = (title + " " + content[:300]).lower()
+    product_signals = [
+        "launches", "unveils", "debuts", "drops", "introduces",
+        "new collection", "capsule", "limited edition",
+        "sneaker", "handbag", "bag", "perfume", "fragrance",
+        "collaboration", "collab"
+    ]
+    brand_hit = any(b in text for b in TRACKED_BRANDS)
+    signal_hit = any(s in text for s in product_signals)
+    return brand_hit and signal_hit
 
 
 # ═══════════════════════════════════════════════════════════
@@ -2305,6 +2399,8 @@ def _scrape_images(url: str, rss_entry, log_fn=print) -> list:
     def _add(img_url: str):
         if not img_url: return
         img_url = img_url.strip()
+        # v12: normalize to highest resolution
+        img_url = _normalize_image_url(img_url)
         if not img_url.startswith("http") or img_url in seen: return
         lower = img_url.lower()
         if any(b in lower for b in IMAGE_BLOCKLIST): return
