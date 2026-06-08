@@ -122,9 +122,11 @@ OPENROUTER_TEMPERATURE = 0.3
 # ── Google Gemini ──
 GEMINI_MODELS = [
     "gemini-2.5-flash",
+    "gemini-1.5-flash-latest",
     "gemini-1.5-flash",
     "gemini-2.5-pro",
-    "gemini-1.5-pro",
+    "gemini-1.5-pro-latest",
+    "gemini-pro",
 ]
 
 # ── Lock / dedup ──
@@ -1297,11 +1299,20 @@ def _format_unified_caption_safety(
             text += f"\n\n{hash_line}"
 
     # Enforce strict maximum length limit for photo captions in Telegram (1024 characters)
-    # Telegram max caption is 1024. If we cut it exactly at 1015, we might cut tags.
-    # So we'll try to find a safe spot to cut, or just close tags.
+    # Telegram max caption is 1024.
     if len(text) > 1020:
-        # A rough but safer trim
-        text = text[:1000] + "…\n</i></b>" # Close potentially open tags
+        # Try to find the last double newline before 980 chars
+        safe_cut = text.rfind("\n\n", 0, 980)
+        if safe_cut == -1:
+            # Fallback to last single newline
+            safe_cut = text.rfind("\n", 0, 980)
+        if safe_cut == -1:
+            # Fallback to last space
+            safe_cut = text.rfind(" ", 0, 980)
+        if safe_cut == -1:
+            safe_cut = 980
+            
+        text = text[:safe_cut] + "…\n</i></b>" # Close potentially open tags
         text = text.replace("<b></b>", "").replace("<i></i>", "")
 
     return text
@@ -1866,7 +1877,8 @@ def _score_article(
     if any(media in candidate["feed_url"].lower() for media in ["voguebusiness", "businessoffashion", "wwd", "hypebeast", "highsnobiety", "fashionnetwork"]):
         score += 10
 
-    return min(score, 100)
+    # Avoid hard cap so we can differentiate between excellent articles
+    return score
 
 
 def _detect_category(title: str, description: str) -> str:
@@ -2697,3 +2709,5 @@ async def _post_to_telegram(
                     posted = True
                 except:
                     pass
+
+    return posted
