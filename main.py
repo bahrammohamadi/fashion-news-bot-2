@@ -40,7 +40,7 @@ import requests
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 from bs4 import BeautifulSoup
-from telegram import Bot, InputMediaPhoto, LinkPreviewOptions
+from telegram import Bot, InputMediaPhoto, LinkPreviewOptions, InputPollOption
 from appwrite.client import Client
 from appwrite.services.databases import Databases
 from appwrite.exception import AppwriteException
@@ -122,10 +122,9 @@ OPENROUTER_TEMPERATURE = 0.3
 # ── Google Gemini ──
 GEMINI_MODELS = [
     "gemini-2.5-flash",
-    "gemini-1.5-flash-latest",
+    "gemini-2.0-flash",
     "gemini-1.5-flash",
-    "gemini-2.5-pro",
-    "gemini-1.5-pro-latest",
+    "gemini-1.5-pro",
     "gemini-pro",
 ]
 
@@ -1416,6 +1415,138 @@ async def main(event=None, context=None):
         sdk_mode, FUZZY_LOOKBACK_COUNT, schema, log,
     )
     log(f"[{elapsed()}s] {len(recent_titles)} posted titles loaded.")
+
+    # ═══════════════════════════════════════════════════════════
+    # NEW: CONTENT STRATEGIST (Determine what to post)
+    # ═══════════════════════════════════════════════════════════
+    now_ir = now + timedelta(hours=3, minutes=30)
+    current_hour_ir = now_ir.hour
+    
+    post_type = "news"
+    
+    # 1. Morning Greeting Check
+    if 8 <= current_hour_ir <= 10:
+        try:
+            r_morning = _db_list(
+                databases, database_id, COLLECTION_ID,
+                [Query.equal("category", "morning"), Query.greater_than("$createdAt", (now - timedelta(hours=12)).strftime("%Y-%m-%dT%H:%M:%S.000+00:00")), Query.limit(1)],
+                sdk_mode
+            )
+            if r_morning.get("total", 0) == 0:
+                post_type = "morning"
+        except Exception as e:
+            # Fallback for missing Appwrite indices: fetch recent and filter in python
+            try:
+                r_fallback = _db_list(databases, database_id, COLLECTION_ID, [Query.limit(30)], sdk_mode)
+                recent_docs = r_fallback.get("documents", r_fallback.get("rows", []))
+                cutoff = now - timedelta(hours=12)
+                has_recent_morning = False
+                for d in recent_docs:
+                    if d.get("category") == "morning":
+                        # Simplistic time check based on $createdAt if available
+                        cat_time = d.get("$createdAt")
+                        if cat_time:
+                            cat_dt = datetime.fromisoformat(cat_time.replace("Z", "+00:00"))
+                            if cat_dt > cutoff:
+                                has_recent_morning = True
+                                break
+                        else:
+                            has_recent_morning = True # If no time, assume true to avoid spam
+                if not has_recent_morning:
+                    post_type = "morning"
+            except Exception:
+                post_type = "news"
+            
+    # 2. Random Poll Check (e.g. 15% chance in the evening/night)
+    if post_type == "news" and 17 <= current_hour_ir <= 22 and random.random() < 0.15:
+        try:
+            r_poll = _db_list(
+                databases, database_id, COLLECTION_ID,
+                [Query.equal("category", "poll"), Query.greater_than("$createdAt", (now - timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%S.000+00:00")), Query.limit(1)],
+                sdk_mode
+            )
+            if r_poll.get("total", 0) == 0:
+                post_type = "poll"
+        except Exception as e:
+            # Fallback for missing Appwrite indices: fetch recent and filter in python
+            try:
+                r_fallback = _db_list(databases, database_id, COLLECTION_ID, [Query.limit(50)], sdk_mode)
+                recent_docs = r_fallback.get("documents", r_fallback.get("rows", []))
+                cutoff = now - timedelta(days=2)
+                has_recent_poll = False
+                for d in recent_docs:
+                    if d.get("category") == "poll":
+                        cat_time = d.get("$createdAt")
+                        if cat_time:
+                            cat_dt = datetime.fromisoformat(cat_time.replace("Z", "+00:00"))
+                            if cat_dt > cutoff:
+                                has_recent_poll = True
+                                break
+                        else:
+                            has_recent_poll = True
+                if not has_recent_poll:
+                    post_type = "poll"
+            except Exception:
+                post_type = "news"
+
+    log(f"[{elapsed()}s] Strategist decided post_type: {post_type}")
+
+    if post_type == "morning":
+        caption_raw = await _parallel_ai_race(_PROMPT_MORNING_VIBES, AI_RACE_TIMEOUT, log)
+        if caption_raw:
+            caption = _format_unified_caption_safety(caption_raw, [], "general")
+            # We use a static aesthetic image for mornings or fallback to text
+            morning_pic = random.choice([
+                "https://images.unsplash.com/photo-1495474472207-47e534d490b2?q=80&w=1024&auto=format&fit=crop", # coffee aesthetic
+                "https://images.unsplash.com/photo-1509319117193-57bab727e09d?q=80&w=1024&auto=format&fit=crop", # minimal fashion
+                "https://images.unsplash.com/photo-1445205170230-053b83016050?q=80&w=1024&auto=format&fit=crop"  # morning coat
+            ])
+            try:
+                await bot.send_photo(chat_id=chat_id, photo=morning_pic, caption=caption, parse_mode="HTML")
+                payload = {
+                    "link": f"morning://{now_ir.strftime('%Y-%m-%d')}",
+                    "title": "Morning Vibes",
+                    "category": "morning",
+                }
+                if schema.has_posted: payload["posted"] = True
+                if schema.has_status: payload["status"] = STATUS_POSTED
+                _db_create(databases, database_id, COLLECTION_ID, payload, sdk_mode)
+                log(f"[{elapsed()}s] ☀️ Morning post sent successfully.")
+                return {"status": "success", "type": "morning"}
+            except Exception as e:
+                log(f"[{elapsed()}s] Morning post failed: {e}")
+        post_type = "news" # Fallback to news if morning fails
+
+    elif post_type == "poll":
+        poll_raw = await _parallel_ai_race(_PROMPT_POLL_GENERATOR, AI_RACE_TIMEOUT, log)
+        if poll_raw:
+            try:
+                import json
+                poll_text = poll_raw.strip()
+                if poll_text.startswith("```"):
+                    poll_text = re.sub(r"^```(?:json)?\s*", "", poll_text, flags=re.IGNORECASE)
+                    poll_text = re.sub(r"\s*```$", "", poll_text)
+                poll_data = json.loads(poll_text)
+                q = poll_data.get("question", "کدام استایل را ترجیح می‌دهید؟")
+                opts = poll_data.get("options", ["کلاسیک", "مدرن"])[:10] # Max 10 options in Telegram
+                
+                await bot.send_poll(chat_id=chat_id, question=q, options=opts)
+                payload = {
+                    "link": f"poll://{int(now.timestamp())}",
+                    "title": q[:250],
+                    "category": "poll",
+                }
+                if schema.has_posted: payload["posted"] = True
+                if schema.has_status: payload["status"] = STATUS_POSTED
+                _db_create(databases, database_id, COLLECTION_ID, payload, sdk_mode)
+                log(f"[{elapsed()}s] 📊 Poll sent successfully.")
+                return {"status": "success", "type": "poll"}
+            except Exception as e:
+                log(f"[{elapsed()}s] Poll post failed: {e}")
+        post_type = "news" # Fallback to news if poll fails
+
+    # ═══════════════════════════════════════════════════════════
+
 
     # ════════════════════════════════
     # PHASE 1 — RSS SCAN
@@ -2721,3 +2852,50 @@ async def _post_to_telegram(
                     pass
 
     return posted
+
+# ═══════════════════════════════════════════════════════════
+# SECTION 13 — CONTENT STRATEGIST & ENGAGEMENT (NEW)
+# ═══════════════════════════════════════════════════════════
+
+_PROMPT_MORNING_VIBES = '''تو سردبیر خلاق مجله لوکس مد «مهرجامه» (آی‌آر فشن نیوز) هستی.
+وظیفه تو نوشتن یک پست کوتاه، انرژی‌بخش و بسیار شیک برای شروع روز (صبح‌بخیر) است.
+
+مخاطب: علاقه‌مندان به مد، استایل، هنر و لایف‌استایل آوانگارد در ایران.
+
+قوانین:
+- متن باید احساس طراوت، زیبایی، قدرت و شیک‌بودن را القا کند.
+- از یک نقل قول کوتاه از طراحان بزرگ مد (مثل کوکو شنل، کارل لاگرفلد، دیور و...) یا یک جمله مینیمال لایف‌استایل استفاده کن.
+- نیم‌فاصله‌ها کاملاً رعایت شود.
+- از ایموجی‌های مینیمال مثل ☕️، 🕊️، ✨، 🤍 استفاده کن.
+- طول متن بسیار کوتاه باشد (حداکثر ۴۰۰ کاراکتر).
+- تگ‌های مجاز HTML فقط <b> و <i> است.
+
+فرمت خروجی تلگرام:
+✨ <b>[یک تیتر کوتاه صبحگاهی و شیک]</b>
+
+[متن اصلی شامل یک جمله زیبای فشن/لایف‌استایل و آرزوی یک روز عالی]
+
+[نقل قول کوتاه با فونت کج (ایتالیک)]
+
+{emoji} <i>@irfashionnews | مجله زیبایی‌شناسی مد</i>
+'''
+
+_PROMPT_POLL_GENERATOR = '''تو استایلیست ارشد و استراتژیست تعامل در یک مجله لوکس مد (مهرجامه) هستی.
+وظیفه تو طراحی یک نظرسنجی (Poll) بسیار جذاب و چالشی برای مخاطبان ایرانی است.
+
+موضوع نظرسنجی باید یکی از موارد زیر باشد (به صورت تصادفی یکی را انتخاب کن):
+- دو راهی استایل (مثلا: در یک قرار کاری مهم، ترنچ کت یا مانتو کتی؟)
+- انتخاب ترند فصل (مثلا: رنگ ترند پاییز امسال؟ شرابی یا زیتونی؟)
+- انتخاب آیتم کلاسیک (مثلا: کیف شانل کلاسیک یا دیور لیدی؟)
+
+قوانین:
+- سوال باید کوتاه، جذاب و دقیق باشد (حداکثر ۱۰۰ کاراکتر).
+- دقیقاً ۲ تا ۴ گزینه (Option) بده. هر گزینه باید کوتاه و وسوسه‌انگیز باشد (حداکثر ۴۰ کاراکتر).
+- خروجی تو باید دقیقاً با فرمت JSON و بدون هیچ متن اضافه‌ای باشد. هیچ قالب markdown مثل ```json را ننویس. فقط خود جیسون را برگردان.
+
+ساختار JSON خروجی:
+{
+  "question": "سوال جذاب تو اینجا",
+  "options": ["گزینه ۱", "گزینه ۲", "گزینه ۳"]
+}
+'''
