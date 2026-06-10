@@ -1,9 +1,18 @@
 # ============================================================
 # Function 1: International Fashion Poster
 # Project:    @irfashionnews — FashionBotProject
-# Version:    12.1 — Enhanced Persian & Images
+# Version:    12.2 — Single-caption albums + Product-first
 # Runtime:    python-3.12 / Appwrite Cloud Functions
 # Timeout:    120 seconds
+#
+# NEW IN v12.2:
+#   - FIX: duplicate post/caption bug (album + fallback both sent).
+#     * No retry after TimedOut/RetryAfter (message likely delivered)
+#     * Image URLs pre-validated so the album rarely fails at all
+#     * Larger HTTP timeouts on the Bot client
+#   - Product-first selection: new brand products always outrank
+#     general news; weak general news (score < MIN_NEWS_SCORE) is skipped.
+#   - New env vars: PRODUCT_FIRST (default 1), MIN_NEWS_SCORE (default 70)
 #
 # NEW IN v12.1:
 #   - Enhanced Persian grammar (نیم‌فاصله، ویراستاری)
@@ -41,6 +50,8 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 from telegram import Bot, InputMediaPhoto, LinkPreviewOptions, InputPollOption
+from telegram.error import TimedOut, RetryAfter, BadRequest
+from telegram.request import HTTPXRequest
 from appwrite.client import Client
 from appwrite.services.databases import Databases
 from appwrite.exception import AppwriteException
@@ -161,6 +172,15 @@ TRACKED_MEDIA = {
     "wwd", "fashion network", "hypebeast", "highsnobiety"
 }
 PROMPT_MODE = os.environ.get("PROMPT_MODE", "intelligence")  # intelligence | magazine
+
+# ── v12.2: Product-first strategy ──
+# PRODUCT_FIRST=1  → always prefer new-product/brand-launch articles;
+#                    general news is only posted when no product candidate exists.
+# MIN_NEWS_SCORE   → general (non-product) news below this score is skipped
+#                    entirely, so the channel isn't flooded with random news.
+PRODUCT_FIRST  = os.environ.get("PRODUCT_FIRST", "1").strip() not in ("0", "false", "no")
+MIN_NEWS_SCORE = int(os.environ.get("MIN_NEWS_SCORE", "70"))
+SCORE_PRODUCT_LAUNCH = 40   # was 15 — strong boost for product launches
 
 FASHION_RELEVANCE_KEYWORDS = {
     "chanel", "dior", "gucci", "prada", "louis vuitton", "lv",
@@ -1363,7 +1383,18 @@ async def main(event=None, context=None):
         return {"status": "error", "missing_vars": missing}
 
     # ── Clients ──
-    bot       = Bot(token=token)
+    # v12.2 FIX: generous timeouts so send_media_group doesn't raise a
+    # client-side TimedOut while Telegram has actually delivered the album
+    # (this was causing duplicate posts: album + single-photo fallback).
+    bot = Bot(
+        token=token,
+        request=HTTPXRequest(
+            connect_timeout=20.0,
+            read_timeout=60.0,
+            write_timeout=60.0,
+            pool_timeout=20.0,
+        ),
+    )
     aw_client = Client()
     aw_client.set_endpoint(appwrite_endpoint)
     aw_client.set_project(appwrite_project)
@@ -1818,16 +1849,43 @@ async def _find_best_candidate(
         return None
 
     for c in all_candidates:
-        c["score"]    = _score_article(c, now, is_peak)
-        c["category"] = _detect_category(c["title"], c["description"])
+        c["score"]      = _score_article(c, now, is_peak)
+        c["category"]   = _detect_category(c["title"], c["description"])
+        c["is_product"] = _is_product_launch(c["title"], c["description"])
 
-    all_candidates.sort(key=lambda x: x["score"], reverse=True)
+    # ── v12.2: PRODUCT-FIRST strategy ──
+    # Product/brand-launch articles always rank above general news, so the
+    # channel posts mostly new brand products instead of generic headlines.
+    if PRODUCT_FIRST:
+        all_candidates.sort(
+            key=lambda x: (x["is_product"], x["score"]), reverse=True
+        )
+        n_products = sum(1 for c in all_candidates if c["is_product"])
+        log_fn(
+            f"[feed] Product-first ON: {n_products} product candidates / "
+            f"{len(all_candidates)} total."
+        )
+        # If no product candidate at all, only allow strong general news
+        if n_products == 0:
+            before = len(all_candidates)
+            all_candidates = [
+                c for c in all_candidates if c["score"] >= MIN_NEWS_SCORE
+            ]
+            log_fn(
+                f"[feed] No products found. General news filtered by "
+                f"MIN_NEWS_SCORE={MIN_NEWS_SCORE}: {before} → {len(all_candidates)}"
+            )
+            if not all_candidates:
+                log_fn("[feed] Nothing strong enough to post. Skipping this run.")
+                return None
+    else:
+        all_candidates.sort(key=lambda x: x["score"], reverse=True)
 
     log_fn("[feed] Top 5:")
     for c in all_candidates[:5]:
         log_fn(
             f"  [{c['score']:>3}] [{c['category']:<14}] "
-            f"{c['title'][:58]}"
+            f"{'🛍️' if c['is_product'] else '  '} {c['title'][:58]}"
         )
 
     recent_domain_hashes = _load_recent_domain_hashes(
@@ -1836,6 +1894,12 @@ async def _find_best_candidate(
     seen_domains: set[str] = set()
 
     for c in all_candidates:
+        # v12.2: even when products exist but are all duplicates,
+        # don't fall back to weak general news.
+        if PRODUCT_FIRST and not c.get("is_product") and c["score"] < MIN_NEWS_SCORE:
+            log_fn(f"[SKIP] weak news (score={c['score']}<{MIN_NEWS_SCORE}): {c['title'][:50]}")
+            continue
+
         link         = c["link"]
         title        = c["title"]
         feed_url     = c["feed_url"]
@@ -1971,14 +2035,16 @@ def _score_article(
         ratio  = 1 - (age_hours - 3) / (ARTICLE_AGE_HOURS - 3)
         score += int(SCORE_RECENCY_MAX * ratio)
 
-    # 3. Product Launch & Brand releases boost
+    # 3. Product Launch & Brand releases boost (v12.2: much stronger)
     product_keywords = [
         "sneaker", "handbag", "it-bag", "perfume", "drop", "capsule collection",
         "collaboration", "collab", "limited edition", "watches", "sneakers",
-        "fragrance", "jewelry", "bag", "accessory", "accessories"
+        "fragrance", "jewelry", "bag", "accessory", "accessories",
+        "launches", "unveils", "debuts", "drops", "introduces",
+        "new collection", "capsule",
     ]
     if any(pkw in title_lower for pkw in product_keywords):
-        score += 15
+        score += SCORE_PRODUCT_LAUNCH
 
     # 4. General trend keywords
     matched     = 0
@@ -2793,65 +2859,137 @@ def _extract_rss_image(entry) -> str | None:
 # SECTION 15 — TELEGRAM POSTING
 # ═══════════════════════════════════════════════════════════
 
+def _probe_image_url(url: str, timeout: int = 6) -> bool:
+    """Quickly verify that an image URL is actually fetchable by Telegram.
+
+    Telegram rejects the WHOLE media group if even one URL is bad, which
+    previously triggered the single-photo fallback and caused the channel
+    to receive the same news twice (album + extra photo with a 2nd caption).
+    """
+    try:
+        r = requests.head(
+            url, timeout=timeout, allow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        if r.status_code in (405, 403):  # some CDNs block HEAD
+            r = requests.get(
+                url, timeout=timeout, stream=True, allow_redirects=True,
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+        if r.status_code != 200:
+            return False
+        ctype = (r.headers.get("Content-Type") or "").lower()
+        if ctype and not ctype.startswith("image/"):
+            return False
+        # Telegram limit for photos by URL is 5 MB
+        clen = r.headers.get("Content-Length")
+        if clen and int(clen) > 5 * 1024 * 1024:
+            return False
+        return True
+    except Exception:
+        return False
+
+
 async def _post_to_telegram(
     bot: Bot, chat_id: str, caption: str,
     image_urls: list, log_fn=print,
 ) -> bool:
-    posted = False
+    """v12.2 — EXACTLY ONE message (one caption) per news item.
 
-    # v12.1: Ensure all product images are included (up to 10)
-    if len(image_urls) >= 1:
+    Strategy:
+      1. Normalize + dedup + pre-validate image URLs.
+      2. Send ONE media group with the caption embedded on the first photo.
+      3. NEVER fall back after a TimedOut/RetryAfter — the album may already
+         be delivered, and re-sending caused the duplicate-caption bug.
+      4. Only on a definitive BadRequest (Telegram rejected the album) do we
+         retry once with fewer/safer images, then once as a single photo.
+    """
+    if not image_urls:
+        return False
+
+    loop = asyncio.get_running_loop()
+
+    # ── 1. Normalize + dedup ──
+    normalized, seen = [], set()
+    for url in image_urls:
+        u = _normalize_image_url(url)
+        if u and u not in seen:
+            seen.add(u)
+            normalized.append(u)
+
+    # ── 1b. Pre-validate URLs in parallel (drop dead/oversized images) ──
+    try:
+        checks = await asyncio.wait_for(
+            asyncio.gather(*[
+                loop.run_in_executor(None, _probe_image_url, u)
+                for u in normalized[:MAX_IMAGES]
+            ]),
+            timeout=15,
+        )
+        valid_urls = [u for u, ok in zip(normalized[:MAX_IMAGES], checks) if ok]
+    except asyncio.TimeoutError:
+        valid_urls = normalized[:MAX_IMAGES]
+
+    if not valid_urls:
+        valid_urls = normalized[:1]  # last resort: try the first one anyway
+    log_fn(f"[tg] Images: {len(image_urls)} raw → {len(valid_urls)} valid")
+
+    async def _send_album(urls: list) -> bool:
+        media_group = [
+            InputMediaPhoto(media=u, caption=caption, parse_mode="HTML")
+            if i == 0 else InputMediaPhoto(media=u)
+            for i, u in enumerate(urls)
+        ]
+        await bot.send_media_group(
+            chat_id=chat_id, media=media_group,
+            disable_notification=True,
+        )
+        log_fn(f"[tg] Album sent (single caption). Images={len(media_group)}")
+        return True
+
+    # ── 2. Attempt 1: full album ──
+    try:
+        return await _send_album(valid_urls)
+    except (TimedOut, RetryAfter) as e:
+        # CRITICAL: the request may have actually succeeded server-side.
+        # Re-sending here is what produced the duplicated caption/post.
+        log_fn(
+            f"[tg] {type(e).__name__} on album — assuming delivered, "
+            f"NOT retrying to avoid duplicate post."
+        )
+        return True
+    except BadRequest as e:
+        log_fn(f"[tg] Album rejected: {str(e)[:120]}. Retrying smaller album...")
+    except Exception as e:
+        log_fn(f"[tg] Album failed: {str(e)[:120]}. Retrying smaller album...")
+
+    # ── 3. Attempt 2: smaller album (first 3 images) ──
+    if len(valid_urls) > 1:
         try:
-            media_group = []
-            # Normalize all URLs first
-            normalized_urls = [_normalize_image_url(url) for url in image_urls[:MAX_IMAGES]]
-            # Remove duplicates after normalization
-            seen_urls = []
-            for url in normalized_urls:
-                if url not in seen_urls:
-                    seen_urls.append(url)
-            
-            for idx, url in enumerate(seen_urls):
-                if idx == 0:
-                    media_group.append(InputMediaPhoto(media=url, caption=caption, parse_mode="HTML"))
-                else:
-                    media_group.append(InputMediaPhoto(media=url))
-                    
-            await bot.send_media_group(
-                chat_id=chat_id, media=media_group,
+            return await _send_album(valid_urls[:3])
+        except (TimedOut, RetryAfter):
+            log_fn("[tg] Timeout on retry — assuming delivered, stopping.")
+            return True
+        except Exception as e:
+            log_fn(f"[tg] Smaller album failed: {str(e)[:100]}")
+
+    # ── 4. Attempt 3: single photo (only reached if NO album was sent) ──
+    for single_url in valid_urls:
+        try:
+            await bot.send_photo(
+                chat_id=chat_id, photo=single_url,
+                caption=caption, parse_mode="HTML",
                 disable_notification=True,
             )
-            log_fn(f"[tg] Album sent with embedded caption. Images={len(media_group)}")
-            posted = True
-        except Exception as e:
-            log_fn(f"[tg] Album with caption failed: {str(e)[:120]}. Falling back to single photo...")
-            # Fallback: if media_group fails, maybe one image is bad. Try sending the first one that works.
-            for single_url in seen_urls:
-                try:
-                    await bot.send_photo(
-                        chat_id=chat_id, photo=single_url,
-                        caption=caption, parse_mode="HTML",
-                        disable_notification=True,
-                    )
-                    log_fn("[tg] Single photo fallback with caption succeeded.")
-                    posted = True
-                    break
-                except Exception as e2:
-                    log_fn(f"[tg] Single photo fallback failed for {single_url}: {str(e2)[:80]}")
-            
-            if not posted and image_urls:
-                # Absolute fallback if all seen_urls failed for some reason
-                try:
-                    await bot.send_photo(
-                        chat_id=chat_id, photo=image_urls[0],
-                        caption=caption, parse_mode="HTML",
-                        disable_notification=True,
-                    )
-                    posted = True
-                except:
-                    pass
+            log_fn("[tg] Single photo with caption sent.")
+            return True
+        except (TimedOut, RetryAfter):
+            log_fn("[tg] Timeout on single photo — assuming delivered.")
+            return True
+        except Exception as e2:
+            log_fn(f"[tg] Single photo failed: {str(e2)[:80]}")
 
-    return posted
+    return False
 
 # ═══════════════════════════════════════════════════════════
 # SECTION 13 — CONTENT STRATEGIST & ENGAGEMENT (NEW)
