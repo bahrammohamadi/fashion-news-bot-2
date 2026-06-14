@@ -1,7 +1,7 @@
 # ============================================================
 # Function 1: International Fashion Poster
 # Project:    @irfashionnews — FashionBotProject
-# Version:    13.1 — Master Multi-Provider Edition (GitHub Models + Multiple Keys + Full Parallel Race)
+# Version:    13.2 — Master Universal Thematic & Telegram Engagement Edition
 # Runtime:    python-3.12 / Appwrite Cloud Functions
 # Timeout:    120 seconds
 #
@@ -366,16 +366,19 @@ TITLE_STOP_WORDS = {
 
 
 # ═══════════════════════════════════════════════════════════
-# SECTION 2 — AI PROMPT TEMPLATES (TELEGRAM OPTIMIZED)
+# SECTION 2 — AI PROMPT TEMPLATES (v13.2 - EDITORIAL & THEMATIC OPTIMIZED)
 # ═══════════════════════════════════════════════════════════
 
-_PROMPT_UNIFIED = '''تو سردبیر خلاق ارشد، مترجم حرفه‌ای و معمار محتوای مجله دیجیتال لوکس مد به نام «مهرجامه» (@irfashionnews) در ایران هستی.
-وظیفه تو تولید یک پست کامل، متمایز و بسیار جذاب تلگرامی با فرمت HTML بر اساس خبر یا معرفی محصول انگلیسی زیر است.
+_PROMPT_UNIFIED = '''تو یک استراتژیست ارشد محتوا، توسعه‌دهنده هوشمند مد و سردبیر خلاق مجله لوکس «مهرجامه» (@irfashionnews) در ایران هستی.
+وظیفه تو تولید یک پست کامل، متمایز و بسیار جذاب تلگرامی با فرمت HTML بر اساس خبر یا معرفی محصول انگلیسی زیر است تا تعامل مخاطبان ایرانی را به حداکثر برساند.
 
-**تمرکز استراتژیک محصولات کانال ما (بسیار مهم):**
-بیشتر محصولات و توجه کانال ما روی **شومیز (Blouses/Tops)**، **شلوار (Pants/Trousers)**، **دامن (Skirts)** و **کت (Coats/Jackets/Blazers/Suits)** از برندهای مطرح است. حتماً در خروجی خود، در صورت وجود یا ارتباط با خبر، روی این ۴ دسته محصول مانور ویژه بده و جذابیت‌های طراحی و استایل آن‌ها را توصیف کن.
+**فضای فصلی و مناسبتی کنونی کانال:**
+{occasion}
 
-**فرآیند شناختی ترجمه و خلاصه‌سازی (پرامپت ترکیبی):**
+**اولویت‌های مطلق محتوا (Core Focus):**
+بیشتر محصولات و توجه کانال ما روی **شومیز (blouse)**، **شلوار (pants/trousers)**، **کت و کتونی/بلیزر (coat/jacket/blazer)** و **دامن (skirt)** از برندهای مطرح است. حتماً در خروجی خود روی این ۴ دسته محصول مانور ویژه بده و جذابیت‌های طراحی و استایل آن‌ها را توصیف کن.
+
+**ساختار پرامپت ترکیبی حرفه‌ای (ترجمه دقیق + ویرایش editorial):**
 ۱. **ترجمه وفادارانه و سلیس:** اصل خبر و نکات فنی را به دقیق‌ترین و روان‌ترین شکل ممکن به فارسی برگردان. از ترجمه ماشینی، تحت‌اللفظی و جملات سنگین یا گنگ به‌شدت اجتناب کن. اصطلاحات تخصصی مد را به بهترین معادل فارسی تبدیل کن یا با املای صحیح لاتین بنویس.
 ۲. **خلاصه‌سازی حرفه‌ای:** اصل پیام و جذاب‌ترین بخش‌های خبر یا کالکشن را گلچین و خلاصه کن تا در حوصله مخاطب شبکه اجتماعی (تلگرام) بگنجد و زیاده‌گویی نشود.
 
@@ -385,18 +388,18 @@ _PROMPT_UNIFIED = '''تو سردبیر خلاق ارشد، مترجم حرفه�
 - نام برندها (مانند Zara, Dior, Chanel, Gucci) حتماً با الفبای لاتین نوشته شوند.
 - از «گیومه فارسی» برای نقل‌قول‌ها استفاده کن و تمام اعداد را فارسی بنویس (مانند ۱۰، ۲۰۲۶، ۱۰۰).
 - خروجی باید مستقیماً با کدهای HTML تلگرام تگ‌گذاری شده باشد (فقط تگ‌های مجاز <b> و <i>) و هیچ‌گونه تگ اضافه (مانند ```html) نداشته باشد.
-- طول کل متن خروجی باید به شدت کنترل شود: **حداکثر ۸۵0 کاراکتر** (بسیار مهم تا در کپشن عکس تلگرام جا شود و قطع نشود).
+- طول کل متن خروجی باید به شدت کنترل شود: **زیر ۱۰۲۰ کاراکتر** (ترجیحاً حداکثر ۸۵۰ کاراکتر) تا در کپشن عکس تلگرام جا شود و قطع نشود.
 
 💎 قالب نهایی تلگرام:
-✨ <b>[تیتر کوتاه، مجلل و ضربه‌زن فارسی با یک ایموجی متناسب]</b>
+✨ <b>[تیتر جذاب، کوتاه و شیک فارسی با یک ایموجی متناسب]</b>
 
-[دو الی سه جمله ترجمه و خلاصه بسیار روان و جذاب از اصل خبر یا معرفی محصول]
+[دو الی سه جمله ترجمه دقیق و خلاصه editorial (body) بسیار روان و داستان‌گونه از اصل خبر یا معرفی محصول]
 
 🧥 <b>جزئیات طراحی و نوآوری:</b>
 [یک پاراگراف کوتاه یا چند بولت‌پوینت مینیمال درباره متریال، برش‌ها یا نکات خاص طراحی به‌ویژه شومیز، شلوار، دامن یا کت]
 
-💡 <b>راهنمای استایل (فرمولوژی):</b>
-[یک پیشنهاد شیک و الهام‌بخش برای ست کردن این آیتم‌ها در استایل روزمره یا رسمی]
+💡 <b>نکته استایلی (Tip):</b>
+[یک پیشنهاد شیک و الهام‌بخش برای ست کردن این آیتم‌ها در استایل روزمره یا رسمی برای مخاطب ایرانی]
 
 {emoji} <i>@irfashionnews | مجله زیبایی‌شناسی مد</i>
 
@@ -404,15 +407,18 @@ _PROMPT_UNIFIED = '''تو سردبیر خلاق ارشد، مترجم حرفه�
 عنوان: {title}
 محتوا: {input_text}'''
 
-_PROMPT_INTELLIGENCE_NEWS = '''تو سردبیر خلاق ارشد، مترجم حرفه‌ای و معمار محتوای مجله لوکس مد «مهرجامه» (@irfashionnews) هستی.
-ماموریت تو تبدیل متن انگلیسی خبر زیر به یک پست تلگرامی بسیار جذاب، لوکس، دقیق و متمایز به زبان فارسی است.
+_PROMPT_INTELLIGENCE_NEWS = '''تو یک استراتژیست ارشد محتوا، توسعه‌دهنده هوشمند مد و سردبیر خلاق مجله لوکس «مهرجامه» (@irfashionnews) هستی.
+ماموریت تو تبدیل متن انگلیسی خبر زیر به یک پست تلگرامی بسیار حرفه‌ای، جذاب، باکیفیت و متمایز به زبان فارسی است تا تعامل مخاطبان ایرانی را حداکثر کند.
 
-**تمرکز استراتژیک کانال (بسیار مهم):**
-کانال ما به‌طور ویژه روی **شومیز (Blouses/Tops)**، **شلوار (Pants/Trousers)**، **دامن (Skirts)** و **کت (Coats/Jackets/Blazers/Suits)** از برندهای معتبر جهانی تمرکز دارد. 
-اگر در متن این خبر یا رویداد، اشاره‌ای به این آیتم‌ها، ترندهای مرتبط با آن‌ها یا کالکشن‌های جدیدشان شده است، حتماً آن را در کانون توجه قرار بده و با لحنی تحلیلی و جذاب بازگو کن.
+**فضای فصلی و مناسبتی کنونی کانال:**
+{occasion}
 
-**پرامپت ترکیبی (ترجمه وفادارانه + خلاصه‌سازی حرفه‌ای):**
-۱. **ترجمه دقیق و وفادارانه:** اصل خبر، رویدادهای تجاری/هنری، تحولات برندها و نقل‌قول‌ها را به‌صورت کاملاً دقیق ترجمه کن. به هیچ‌وجه از ترجمه تحت‌اللفظی یا جملات نامفهوم ماشینی استفاده نکن. جملات باید اقتدار و اصالت یک مجله رده‌بالای مد را بازتاب دهند.
+**اولویت‌های مطلق محتوا (Core Focus):**
+کانال ما به‌طور ویژه روی **شومیز (blouse)**، **شلوار (pants/trousers)**، **کت و کتونی/بلیزر (coat/jacket/blazer)** و **دامن (skirt)** از برندهای معتبر جهانی تمرکز دارد. 
+اگر در متن این خبر یا رویداد عمومی (runway, trend, sustainability, business, celebrity) اشاره‌ای به این آیتم‌ها، ترندهای مرتبط با آن‌ها یا کالکشن‌های جدیدشان شده است، حتماً آن را در کانون توجه تحلیلی خود قرار بده.
+
+**ساختار پرامپت ترکیبی حرفه‌ای (ترجمه دقیق + ویرایش editorial):**
+۱. **ترجمه دقیق + روان‌سازی و ویرایش Editorial:** اصل خبر، رویدادهای تجاری/هنری، تحولات برندها و نقل‌قول‌ها را به‌صورت کاملاً دقیق ترجمه کن. به هیچ‌وجه از ترجمه تحت‌اللفظی یا جملات نامفهوم ماشینی استفاده نکن. جملات باید اقتدار و اصالت یک مجله رده‌بالای مد را بازتاب دهند.
 ۲. **خلاصه‌سازی و چکیده‌نویسی:** بخش‌های حاشیه‌ای و طولانی خبر را حذف کن و مغز متفکر و پیام اصلی خبر را در قالبی خلاصه، کوبنده و مناسب برای دنبال‌کنندگان کانال تلگرام ارائه بده.
 
 **قوانین ویراستاری فارسی (سخت‌گیرانه):**
@@ -425,58 +431,55 @@ _PROMPT_INTELLIGENCE_NEWS = '''تو سردبیر خلاق ارشد، مترجم 
 **ساختار بصری و قالب نهایی تلگرام:**
 ✨ <b>[تیتر خبری جذاب، کوبنده و کوتاه فارسی با یک ایموجی متناسب]</b>
 
-[دو الی سه جمله ترجمه و خلاصه دقیق، سلیس و داستان‌گونه که پیام اصلی خبر را به زیبایی روایت می‌کند]
+[دو الی سه جمله ترجمه دقیق و خلاصه editorial (body) سلیس و داستان‌گونه که پیام اصلی خبر را به زیبایی روایت می‌کند]
 
 <b>ابعاد و تحلیل خبر:</b>
-[یک پاراگراف کوتاه یا چند بولت‌پوینت تحلیلی درباره پیامدهای این خبر برای ترندها، بازار یا طراحی لباس (به‌ویژه شومیز، شلوار، دامن یا کت)]
+[یک پاراگراف کوتاه یا چند بولت‌پوینت تحلیلی درباره پیامدهای این خبر برای ترندها، بازار یا صنعت مد (به‌ویژه شومیز، شلوار، دامن یا کت)]
 
-💡 <b>چشم‌انداز استایل / ترند:</b>
-[یک نکته کاربردی یا نتیجه‌گیری جالب برای علاقه‌مندان به مد و پوشاک]
+💡 <b>نکته استایلی / ترند (Tip):</b>
+[یک نکته کاربردی، الهام‌بخش یا نتیجه‌گیری جالب برای دنبال‌کنندگان کانال]
 
 <b>منبع:</b> {source}
 {emoji} <i>@irfashionnews | مجله زیبایی‌شناسی مد</i>
 
 **کنترل طول متن:**
-- طول متن نهایی حتماً باید **حداکثر ۸۵۰ کاراکتر** باشد تا در کپشن تصاویر تلگرام جا شود و ناقص نماند.
+- طول متن نهایی حتماً باید **زیر ۱۰۲۰ کاراکتر** (ترجیحاً حداکثر ۸۵۰ کاراکتر) باشد تا در کپشن تصاویر تلگرام جا شود و خوانا بماند.
 
 متن انگلیسی خبر:
 عنوان: {title}
 محتوا: {input_text}'''
 
-_PROMPT_INTELLIGENCE_PRODUCT = '''تو سردبیر خلاق ارشد، مترجم حرفه‌ای و معمار محتوای مجله لوکس مد «مهرجامه» (@irfashionnews) هستی.
-ماموریت تو تبدیل متن انگلیسی زیر (که درباره معرفی محصول یا کالکشن جدید یک برند است) به یک کپشن تلگرامی بسیار جذاب، دقیق، شیک و متمایز به زبان فارسی است.
+_PROMPT_INTELLIGENCE_PRODUCT = '''تو یک استراتژیست ارشد محتوا، توسعه‌دهنده هوشمند مد و سردبیر خلاق مجله لوکس «مهرجامه» (@irfashionnews) هستی.
+ماموریت تو تبدیل متن انگلیسی زیر (معرفی محصول یا کالکشن جدید) به یک کپشن تلگرامی بسیار حرفه‌ای، جذاب، باکیفیت و متمایز به زبان فارسی است تا تعامل مخاطبان ایرانی را به حداکثر برساند.
 
-**تمرکز تخصصی محصولات کانال ما (بسیار مهم):**
-محصولات اصلی و تخصصی کانال ما **شومیز (Blouses/Tops)**، **شلوار (Pants/Trousers)**، **دامن (Skirts)** و **کت (Coats/Jackets/Blazers/Suits)** هستند. 
-اگر در این کالکشن یا معرفی محصول، آیتم‌هایی از این ۴ دسته (شومیز، شلوار، دامن، کت) وجود دارد، حتماً تمرکز اصلی خروجی را روی آن‌ها بگذار و جزئیات طراحی، پارچه، دوخت و استایل آن‌ها را با لحنی تبلیغاتی و باوقار برجسته کن.
+**فضای فصلی و مناسبتی کنونی کانال:**
+{occasion}
 
-**پرامپت ترکیبی (ترجمه وفادارانه + خلاصه‌سازی حرفه‌ای):**
-۱. **ترجمه وفادارانه و سلیس:** اطلاعات فنی، نام متریال، ویژگی‌های طراحی و نوآوری‌ها را به‌طور دقیق و وفادارانه ترجمه کن. از ترجمه تحت‌اللفظی، جملات ماشینی یا ساختارهای عجیب کاملاً بپرهیز. کلمات تخصصی مد را به بهترین و شیک‌ترین معادل فارسی تبدیل کن یا با املای صحیح لاتین بنویس.
-۲. **خلاصه‌سازی و چکیده‌نویسی جذاب:** از زیاده‌گویی و حاشیه‌روی خودداری کن. اصل مطلب و جذاب‌ترین نکات کالکشن/محصول را در قالبی خلاصه، پرانرژی و مناسب برای مخاطبان شیک‌پوش کانال ارائه بده.
+**اولویت‌های مطلق محتوا (Core Focus):**
+محصولات اصلی ما **شومیز (blouse)**، **شلوار (pants/trousers)**، **کت و کتونی/بلیزر (coat/jacket/blazer)** و **دامن (skirt)** هستند. اگر آیتم‌هایی از این ۴ دسته در خبر/کالکشن وجود دارد، بالاترین اولویت و توجه را به آن‌ها اختصاص بده و جزئیات برش، پارچه و استایل آن‌ها را باوقار و لوکس برجسته کن.
 
-**قوانین ویراستاری فارسی (سخت‌گیرانه):**
-- نیم‌فاصله‌ها را با دقت کامل رعایت کن (طراحی‌شده، ویژگی‌های، می‌شود، شومیزهای، برندهای، می‌پوشد، کالکشن‌های).
-- افعال را کامل و کتابی/رسمی بنویس (است، می‌باشد، طراحی کرده‌اند) و از لحن محاوره‌ای یا عامیانه دوری کن.
-- نام برندها (مانند Zara, H&M, Dior, Chanel, Mango) حتماً با الفبای لاتین نوشته شوند.
-- از «گیومه فارسی» برای نقل‌قول‌ها استفاده کن و تمام اعداد را فارسی بنویس (مانند ۱۰، ۲۰۲۶، ۱۰۰).
-- خروجی باید مستقیماً با کدهای HTML تلگرام تگ‌گذاری شده باشد (فقط تگ‌های مجاز <b> و <i>) و هیچ‌گونه تگ اضافه (مانند ```html) نداشته باشد.
+**ساختار پرامپت ترکیبی حرفه‌ای (ترجمه دقیق + ویرایش editorial):**
+۱. **ترجمه دقیق + روان‌سازی و ویرایش Editorial:** متن را به‌طور دقیق و وفادارانه به فارسی برگردان و با لحن لوکس، شیک و اقتدار یک مجله معتبر مد ویرایش کن. از ترجمه تحت‌اللفظی یا جملات ماشینی بپرهیز. کلمات تخصصی مد را به بهترین معادل فارسی تبدیل کن یا با املای لاتین بنویس.
+۲. **رعایت قوانین ویراستاری:** نیم‌فاصله‌ها را کاملاً و با وسواس رعایت کن (می‌شود، برندهای، می‌پوشد، طراحی‌شده، شومیزهای، کالکشن‌های). تمام اعداد فارسی باشند (مانند ۱۰، ۲۰۲۶، ۱۰۰) و از «گیومه فارسی» استفاده شود.
 
-**ساختار بصری و قالب نهایی تلگرام:**
-✨ <b>[یک تیتر جذاب، تبلیغاتی و کوتاه فارسی با یک ایموجی متناسب]</b>
+**قالب نهایی تلگرام (فقط تگ‌های HTML شامل <b> و <i>):**
+خروجی باید دقیقاً شامل ساختار زیر با ایموجی‌های مینیمال باشد و بدون هیچ تگ اضافه (مثل ```html) تولید شود:
 
-[دو الی سه جمله ترجمه و خلاصه بسیار روان و جذاب که ماهیت کالکشن، نوآوری برند و محصولات جدید را معرفی می‌کند]
+✨ <b>[یک تیتر جذاب، تبلیغاتی، کوتاه و شیک فارسی با یک ایموجی متناسب]</b>
+
+[دو الی سه جمله ترجمه دقیق و خلاصه editorial (body) بسیار روان و جذاب که ماهیت کالکشن، نوآوری برند و محصولات جدید را روایت می‌کند]
 
 <b>جزئیات طراحی و پارچه:</b>
 [یک پاراگراف کوتاه یا چند بولت‌پوینت شیک درباره برش‌ها، پالت رنگی یا متریال؛ با تاکید ویژه بر شومیز، شلوار، دامن یا کت]
 
-💡 <b>راهنمای استایل (فرمولوژی):</b>
-[یک پیشنهاد الهام‌بخش و کاربردی برای ست کردن این آیتم‌ها در استایل روزمره، رسمی یا لایه‌لایه]
+💡 <b>نکته استایلی (Tip):</b>
+[یک پیشنهاد الهام‌بخش، حرفه‌ای و کاربردی برای ست کردن این آیتم‌ها در استایل روزمره یا رسمی برای مخاطب ایرانی]
 
 <b>منبع:</b> {source}
 {emoji} <i>@irfashionnews | مجله زیبایی‌شناسی مد</i>
 
 **کنترل طول متن:**
-- متن نهایی حتماً باید **حداکثر ۸۵۰ کاراکتر** باشد تا در کپشن آلبوم تصاویر تلگرام به‌خوبی نمایش داده شود و قطع نشود.
+- متن نهایی حتماً باید **زیر ۱۰۲۰ کاراکتر** (ترجیحاً حداکثر ۸۵۰ کاراکتر) باشد تا در کپشن آلبوم تصاویر تلگرام به‌خوبی نمایش داده شود و خوانا بماند.
 
 متن انگلیسی خبر/محصول:
 عنوان: {title}
@@ -1268,11 +1271,118 @@ def _format_unified_caption_safety(
     return text
 
 
+# ═══════════════════════════════════════════════════════════
+# NEW: FASHION CALENDAR STRATEGIST (Iranian & Global Occasions & Thematic Engine)
+# ═══════════════════════════════════════════════════════════
+
+class FashionCalendarStrategist:
+    """
+    A powerful Python strategist that calculates Iranian (Jalali/Shamsi) dates,
+    identifies national/global occasions (Norooz, Yalda, Met Gala, Fashion Weeks),
+    determines seasonal thematic focus, and establishes optimal posting frequencies.
+    """
+    def __init__(self, now_utc: datetime):
+        self.now_ir = now_utc + timedelta(hours=3, minutes=30)
+        self.gy     = self.now_ir.year
+        self.gm     = self.now_ir.month
+        self.gd     = self.now_ir.day
+        self.jy, self.jm, self.jd = self._gregorian_to_jalali(self.gy, self.gm, self.gd)
+
+    @staticmethod
+    def _gregorian_to_jalali(gy, gm, gd):
+        g_d_m = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334]
+        gy2   = gy if gm > 2 else gy - 1
+        days  = (355666 + (365 * gy) + ((gy2 + 3) // 4) - ((gy2 + 99) // 100) + ((gy2 + 399) // 400) + gd + g_d_m[gm - 1])
+        jy    = -1595 + (33 * (days // 12053))
+        days %= 12053
+        jy   += 4 * (days // 1461)
+        days %= 1461
+        if days > 365:
+            jy  += (days - 1) // 365
+            days = (days - 1) % 365
+        if days < 186:
+            jm = 1 + (days // 31)
+            jd = 1 + (days % 31)
+        else:
+            jm = 7 + ((days - 186) // 30)
+            jd = 1 + ((days - 186) % 30)
+        return jy, jm, jd
+
+    def get_daily_strategy(self) -> dict:
+        occasion_name        = ""
+        thematic_focus       = ""
+        thematic_keywords    = []
+        target_posts_per_day = 4  # Default regular posting frequency (3-5 posts daily)
+
+        # 1. Iranian (Jalali) Occasions & Seasonal Shifts
+        if self.jm == 12 and self.jd >= 15:
+            occasion_name        = "پیشواز نوروز و خرید بهاری"
+            thematic_focus       = "کالکشن‌های عیدانه، استایل بهاری، شومیزهای مجلسی و کت و شلوارهای شیک"
+            thematic_keywords    = ["spring", "norooz", "new collection", "blouse", "suit", "بهار", "عید", "شومیز", "کت"]
+            target_posts_per_day = 6  # 3-6 posts daily during peak shopping season
+        elif self.jm == 1 and self.jd <= 13:
+            occasion_name        = "عید نوروز و دید و بازدید"
+            thematic_focus       = "استایل شیک و باوقار نوروزی، ترکیب رنگ‌های شاد بهاری، دامن و شومیز"
+            thematic_keywords    = ["spring", "floral", "bright", "skirt", "blouse", "نوروز", "بهار", "دامن"]
+            target_posts_per_day = 5
+        elif self.jm == 9 and self.jd >= 25:
+            occasion_name        = "شب یلدا و آغاز زمستان"
+            thematic_focus       = "استایل یلدایی، پالت رنگی اصیل (زرشکی، قرمز، سبز)، پالتوهای گرم و پشمی"
+            thematic_keywords    = ["red", "green", "velvet", "coat", "winter", "یلدا", "قرمز", "پالتو", "زرشکی"]
+            target_posts_per_day = 6
+        elif self.jm in (4, 5, 6):
+            occasion_name        = "فصل تابستان و پوشاک خنک"
+            thematic_focus       = "استایل خنک تابستانی، لباس‌های لینن و پنبه‌ای، شلوار و شومیزهای راحت و روشن"
+            thematic_keywords    = ["summer", "linen", "cotton", "light", "pants", "blouse", "تابستان", "خنک", "لینن"]
+        elif self.jm in (7, 8):
+            occasion_name        = "فصل پاییز و لایه‌لایه‌پوشی"
+            thematic_focus       = "استایل پاییزی، ترنچ کت، کت‌های ساختاریافته، رنگ‌های نود و گرم (کرم، قهوه‌ای، آجری)"
+            thematic_keywords    = ["autumn", "fall", "trench", "coat", "blazer", "layering", "پاییز", "ترنچ کت", "کت"]
+        elif self.jm in (10, 11):
+            occasion_name        = "فصل زمستان و پالتوهای لوکس"
+            thematic_focus       = "پالتوهای لوکس پشمی، کاپشن‌های شیک، کت و شلوارهای گرم و باوقار"
+            thematic_keywords    = ["winter", "wool", "overcoat", "suit", "jacket", "زمستان", "پالتو", "پشمی"]
+
+        # 2. Global Gregorian Events
+        if (self.gm == 9 and self.gd >= 5) or (self.gm == 10 and self.gd <= 5):
+            occasion_name += " | هفته‌های مد جهانی (Fashion Weeks SS)"
+            thematic_keywords.extend(["runway", "fashion week", "ss26", "catwalk", "collection"])
+            target_posts_per_day = 6
+        elif (self.gm == 2 and self.gd >= 10) or (self.gm == 3 and self.gd <= 10):
+            occasion_name += " | هفته‌های مد جهانی (Fashion Weeks FW)"
+            thematic_keywords.extend(["runway", "fashion week", "fw26", "catwalk", "collection"])
+            target_posts_per_day = 6
+        elif self.gm == 5 and 1 <= self.gd <= 7 and self.now_ir.weekday() == 0:
+            occasion_name     = "مراسم مت گالا (Met Gala)"
+            thematic_focus    = "تحلیل استایل‌های فرش قرمز مت گالا، طراحی‌های آوانگارد و شاهکارهای هنری"
+            thematic_keywords.extend(["met gala", "red carpet", "couture", "vogue"])
+            target_posts_per_day = 6
+        elif self.gm == 8 and self.gd == 21:
+            occasion_name     = "روز جهانی مد (World Fashion Day)"
+            thematic_focus    = "گرامیداشت اصالت طراحی، تاریخچه خانه‌های مد لوکس و شاهکارهای ماندگار"
+            thematic_keywords.extend(["luxury", "iconic", "designer", "vogue"])
+            target_posts_per_day = 5
+        elif (self.gm == 12 and self.gd >= 20) or (self.gm == 1 and self.gd <= 5):
+            occasion_name += " | تعطیلات سال نو میلادی و Resort"
+            thematic_keywords.extend(["holiday", "resort", "sparkle", "festive", "party"])
+        elif self.gm == 2 and 10 <= self.gd <= 14:
+            occasion_name     = "روز ولنتاین (Valentine's)"
+            thematic_focus    = "استایل‌های رمانتیک، پالت رنگی قرمز و صورتی، لباس‌های مجلسی و اکسسوری‌های خاص"
+            thematic_keywords.extend(["valentine", "red", "pink", "romantic", "gift", "ولنتاین"])
+
+        return {
+            "occasion_name":        occasion_name or "عادی (رصد روزانه بازار مد)",
+            "thematic_focus":       thematic_focus or "تمرکز بر جدیدترین شومیز، شلوار، دامن و کت‌ها از برندهای معتبر",
+            "thematic_keywords":    thematic_keywords,
+            "target_posts_per_day": target_posts_per_day,
+        }
+
+
 async def main(event=None, context=None):
     log   = context.log   if context and hasattr(context, "log")   else print
     error = context.error if context and hasattr(context, "error") else print
 
-    log("═══ FashionBot v12.1 Intelligence Agent started ═══")
+    log("═══ FashionBot v13.2 Universal Thematic & Engagement Agent started ═══")
 
     loop       = asyncio.get_running_loop()
     start_time = loop.time()
@@ -1518,6 +1628,7 @@ async def main(event=None, context=None):
                 now=now,
                 recent_titles=recent_titles,
                 is_peak=is_peak,
+                cal_strategy=cal_strategy,
                 log_fn=log,
             ),
             timeout=FEEDS_SCAN_TIMEOUT,
@@ -1645,6 +1756,7 @@ async def main(event=None, context=None):
                 input_text=content[:3000],
                 source=link,
                 emoji=emoji,
+                occasion=occasion_context,
             )
             log(f"[{elapsed()}s] Using PRODUCT prompt")
         else:
@@ -1653,6 +1765,7 @@ async def main(event=None, context=None):
                 input_text=content[:3000],
                 source=link,
                 emoji=emoji,
+                occasion=occasion_context,
             )
             log(f"[{elapsed()}s] Using NEWS prompt")
     else:
@@ -1662,6 +1775,7 @@ async def main(event=None, context=None):
             input_text=content[:3000],
             category=category,
             emoji=emoji,
+            occasion=occasion_context,
         )
     
     caption_raw = await _parallel_ai_race(prompt, AI_RACE_TIMEOUT, log)
@@ -1747,7 +1861,7 @@ async def main(event=None, context=None):
 async def _find_best_candidate(
     feeds, databases, database_id, collection_id,
     time_threshold, sdk_mode, schema, now,
-    recent_titles, is_peak, log_fn=print,
+    recent_titles, is_peak, cal_strategy, log_fn=print,
 ):
     loop  = asyncio.get_running_loop()
     tasks = [
@@ -1761,7 +1875,6 @@ async def _find_best_candidate(
     all_candidates = []
     for i, result in enumerate(results):
         if isinstance(result, Exception):
-            log_fn(f"[feed] Error ({feeds[i][:45]}): {result}")
             continue
         if result:
             all_candidates.extend(result)
@@ -1771,14 +1884,14 @@ async def _find_best_candidate(
         return None
 
     for c in all_candidates:
-        c["score"]           = _score_article(c, now, is_peak)
+        c["score"]           = _score_article(c, now, is_peak, cal_strategy, log_fn)
         c["category"]        = _detect_category(c["title"], c["description"])
         c["is_product"]      = _is_product_launch(c["title"], c["description"])
         c["is_core_apparel"] = _is_core_apparel(c["title"], c["description"])
 
-    # ── v13.0: CORE-PRODUCT-FIRST strategy ──
-    # Core apparel (Blouse, Pants, Skirt, Coat) from brands outranks other product launches,
-    # which outrank general news. General news is strictly throttled.
+    # ── v13.2: CORE-PRODUCT-FIRST strategy ──
+    # Core apparel (Blouse, Pants, Skirt, Coat) from brands outranks other products,
+    # which outrank general news. Enforces dynamic post throttling based on seasonal strategy.
     if PRODUCT_FIRST:
         all_candidates.sort(
             key=lambda x: (x["is_core_apparel"], x["is_product"], x["score"]), reverse=True
@@ -1789,22 +1902,18 @@ async def _find_best_candidate(
             f"[feed] Core-Product-first ON: {n_core} core apparel / {n_products} total products / "
             f"{len(all_candidates)} total."
         )
-        # If no product candidate at all, only allow strong general news and enforce strict news throttling
+        
+        # Enforce News and General Throttling
         if n_products == 0:
             before = len(all_candidates)
             strict_min_score = max(MIN_NEWS_SCORE, 85)
             all_candidates = [
                 c for c in all_candidates if c["score"] >= strict_min_score
             ]
-            log_fn(
-                f"[feed] No products found. General news filtered by "
-                f"strict_min_score={strict_min_score}: {before} → {len(all_candidates)}"
-            )
             if not all_candidates:
                 log_fn("[feed] Nothing strong enough to post. Skipping this run.")
                 return None
 
-            # Enforce news throttling: Do not post general news if another post was made recently
             try:
                 r_recent = _db_list(
                     databases, database_id, collection_id,
@@ -1812,15 +1921,17 @@ async def _find_best_candidate(
                 )
                 recent_docs = r_recent.get("documents", r_recent.get("rows", []))
                 
-                cutoff_any_hours  = 4   # Don't post news if any post was made in last 4 hours
-                cutoff_news_hours = 12  # Don't post news if another general news was posted in last 12 hours
+                # Dynamic post throttling based on recommended calendar daily limit (3-6 posts daily)
+                target_daily      = cal_strategy.get("target_posts_per_day", 4)
+                cutoff_any_hours  = max(2.5, 24.0 / target_daily)
+                cutoff_news_hours = 12  # Strict 12 hour throttling on general news
                 
                 skip_news = False
                 for d in recent_docs:
-                    if not d.get("posted", True): continue
-                    if d.get("status") == "failed": continue
+                    if not d.get("posted", True) or d.get("status") == "failed":
+                        continue
                     
-                    cat = d.get("category", "")
+                    cat      = d.get("category", "")
                     cat_time = d.get("$createdAt") or d.get("pub_date") or d.get("posted_at")
                     if not cat_time: continue
                     
@@ -1975,7 +2086,7 @@ def _fetch_feed(
 
 
 def _score_article(
-    candidate: dict, now: datetime, is_peak: bool = False
+    candidate: dict, now: datetime, is_peak: bool = False, cal_strategy: dict = None, log_fn=print
 ) -> int:
     score     = 0
     age_hours = (now - candidate["pub_date"]).total_seconds() / 3600
@@ -2064,6 +2175,11 @@ def _score_article(
     # v12: boost tracked media sources
     if any(media in candidate["feed_url"].lower() for media in ["voguebusiness", "businessoffashion", "wwd", "hypebeast", "highsnobiety", "fashionnetwork"]):
         score += 10
+
+    # 3.8 Thematic Occasion Bonus (v13.2)
+    if cal_strategy and cal_strategy.get("thematic_keywords"):
+        if any(tkw in combined for tkw in cal_strategy["thematic_keywords"]):
+            score += 60
 
     # Avoid hard cap so we can differentiate between excellent articles
     return score
@@ -3015,22 +3131,31 @@ _PROMPT_MORNING_VIBES = '''تو سردبیر خلاق مجله لوکس مد «�
 {emoji} <i>@irfashionnews | مجله زیبایی‌شناسی مد</i>
 '''
 
-_PROMPT_POLL_GENERATOR = '''تو استایلیست ارشد و استراتژیست تعامل در یک مجله لوکس مد (مهرجامه) هستی.
-وظیفه تو طراحی یک نظرسنجی (Poll) بسیار جذاب و چالشی برای مخاطبان ایرانی است.
+_PROMPT_POLL_GENERATOR = '''تو یک استراتژیست ارشد محتوا، توسعه‌دهنده هوشمند مد، استایلیست و طراح تعامل مجله لوکس «مهرجامه» (@irfashionnews) هستی.
+ماموریت تو تولید یک نظرسنجی (Poll) یا کوییز (Quiz) فشن بسیار جذاب، باکیفیت و تعاملی برای مخاطبان ایرانی کانال تلگرام است تا میزان مشارکت (engagement) را به حداکثر برساند.
 
-موضوع نظرسنجی باید یکی از موارد زیر باشد (به صورت تصادفی یکی را انتخاب کن):
-- دو راهی استایل (مثلا: در یک قرار کاری مهم، ترنچ کت یا مانتو کتی؟)
-- انتخاب ترند فصل (مثلا: رنگ ترند پاییز امسال؟ شرابی یا زیتونی؟)
-- انتخاب آیتم کلاسیک (مثلا: کیف شانل کلاسیک یا دیور لیدی؟)
+**فضای مناسبتی و فصلی کنونی کانال:**
+{occasion}
 
-قوانین:
-- سوال باید کوتاه، جذاب و دقیق باشد (حداکثر ۱۰۰ کاراکتر).
-- دقیقاً ۲ تا ۴ گزینه (Option) بده. هر گزینه باید کوتاه و وسوسه‌انگیز باشد (حداکثر ۴۰ کاراکتر).
-- خروجی تو باید دقیقاً با فرمت JSON و بدون هیچ متن اضافه‌ای باشد. هیچ قالب markdown مثل ```json را ننویس. فقط خود جیسون را برگردان.
+**موضوعات استراتژیک پیشنهادی (یکی را با سلیقه حرفه‌ای خود انتخاب کن):**
+۱. **دوراهی استایل (Style Dilemma - Core Apparel Focus):** مقایسه دو آیتم پوشیدنی جذاب (مثلاً: «در یک قرار کاری مهم، ترنچ کت کلاسیک را ترجیح می‌دهید یا مانتو کتی ساختاریافته؟» یا «برای استایل روزمره این فصل، کدام مدل شومیز، شلوار یا دامن را می‌پسندید؟»).
+۲. **نبرد برندهای مطرح (Brand Battle):** مقایسه سبک طراحی و هویت برندها (مثلاً Zara در برابر Mango یا Chanel در برابر Dior).
+۳. **کوییز تخصصی مد (Fashion Quiz):** یک سوال جذاب و آموزنده درباره تاریخچه مد، اصطلاحات فشن، پارچه‌ها یا ترندها (با تعیین گزینه صحیح و ارائه یک جمله توضیح).
 
-ساختار JSON خروجی:
+**قوانین خروجی تلگرام:**
+- خروجی تو باید **فقط و مستقیماً یک ساختار JSON معتبر و تمیز** باشد و هیچ متن اضافه یا تگ ```json در ابتدا و انتها نداشته باشد.
+- حداکثر تعداد گزینه‌ها ۱۰ عدد است (ترجیحاً بین ۳ الی ۴ گزینه شیک، وسوسه‌انگیز و کوتاه).
+- در صورت انتخاب حالت quiz، حتماً شماره گزینه صحیح (`correct_option_id` از 0) و یک جمله توضیح آموزنده (`explanation`) ارائه بده. در حالت regular این دو فیلد را null بگذار.
+
+ساختار JSON مورد انتظار:
 {
-  "question": "سوال جذاب تو اینجا",
-  "options": ["گزینه ۱", "گزینه ۲", "گزینه ۳"]
-}
-'''
+  "type": "regular",  // یا "quiz"
+  "question": "[سوال جذاب، کوتاه و چالش‌برانگیز فارسی]",
+  "options": [
+    "[گزینه اول با یک ایموجی شیک]",
+    "[گزینه دوم]",
+    "[گزینه سوم]"
+  ],
+  "correct_option_id": 0,  // در حالت regular برابر null و در حالت quiz شماره ایندکس گزینه صحیح
+  "explanation": "[در حالت regular برابر null و در حالت quiz یک جمله توضیح آموزنده و الهام‌بخش]"
+}'''
