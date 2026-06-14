@@ -1,7 +1,7 @@
 # ============================================================
 # Function 1: International Fashion Poster
 # Project:    @irfashionnews — FashionBotProject
-# Version:    13.2 — Master Universal Thematic & Telegram Engagement Edition
+# Version:    13.3 — Ultimate Product-First Master Album Edition (Full Image Extraction + Pure Album)
 # Runtime:    python-3.12 / Appwrite Cloud Functions
 # Timeout:    120 seconds
 #
@@ -352,6 +352,8 @@ IMAGE_BLOCKLIST  = [
     "doubleclick", "googletagmanager", "googlesyndication",
     "facebook.com/tr", "analytics", "pixel", "beacon",
     "tracking", "counter", "stat.", "stats.",
+    "swatch", "thumbnail", "thumb/", "/thumbs/", "icon",
+    "logo", "svg", "banner", "avatar", "placeholder",
 ]
 
 TITLE_STOP_WORDS = {
@@ -388,7 +390,7 @@ _PROMPT_UNIFIED = '''تو یک استراتژیست ارشد محتوا، توس
 - نام برندها (مانند Zara, Dior, Chanel, Gucci) حتماً با الفبای لاتین نوشته شوند.
 - از «گیومه فارسی» برای نقل‌قول‌ها استفاده کن و تمام اعداد را فارسی بنویس (مانند ۱۰، ۲۰۲۶، ۱۰۰).
 - خروجی باید مستقیماً با کدهای HTML تلگرام تگ‌گذاری شده باشد (فقط تگ‌های مجاز <b> و <i>) و هیچ‌گونه تگ اضافه (مانند ```html) نداشته باشد.
-- طول کل متن خروجی باید به شدت کنترل شود: **زیر ۱۰۲۰ کاراکتر** (ترجیحاً حداکثر ۸۵۰ کاراکتر) تا در کپشن عکس تلگرام جا شود و قطع نشود.
+- طول کل متن خروجی باید به شدت کنترل شود: **زیر ۱۰۰۰ کاراکتر** (ترجیحاً حداکثر ۸۰۰ کاراکتر) تا در کپشن عکس تلگرام جا شود و قطع نشود.
 
 💎 قالب نهایی تلگرام:
 ✨ <b>[تیتر جذاب، کوتاه و شیک فارسی با یک ایموجی متناسب]</b>
@@ -443,7 +445,7 @@ _PROMPT_INTELLIGENCE_NEWS = '''تو یک استراتژیست ارشد محتو�
 {emoji} <i>@irfashionnews | مجله زیبایی‌شناسی مد</i>
 
 **کنترل طول متن:**
-- طول متن نهایی حتماً باید **زیر ۱۰۲۰ کاراکتر** (ترجیحاً حداکثر ۸۵۰ کاراکتر) باشد تا در کپشن تصاویر تلگرام جا شود و خوانا بماند.
+- طول متن نهایی حتماً باید **زیر ۱۰۰۰ کاراکتر** (ترجیحاً حداکثر ۸۰۰ کاراکتر) باشد تا در کپشن تصاویر تلگرام جا شود و خوانا بماند.
 
 متن انگلیسی خبر:
 عنوان: {title}
@@ -479,7 +481,7 @@ _PROMPT_INTELLIGENCE_PRODUCT = '''تو یک استراتژیست ارشد محت
 {emoji} <i>@irfashionnews | مجله زیبایی‌شناسی مد</i>
 
 **کنترل طول متن:**
-- متن نهایی حتماً باید **زیر ۱۰۲۰ کاراکتر** (ترجیحاً حداکثر ۸۵۰ کاراکتر) باشد تا در کپشن آلبوم تصاویر تلگرام به‌خوبی نمایش داده شود و خوانا بماند.
+- متن نهایی حتماً باید **زیر ۱۰۰۰ کاراکتر** (ترجیحاً حداکثر ۸۰۰ کاراکتر) باشد تا در کپشن آلبوم تصاویر تلگرام به‌خوبی نمایش داده شود و خوانا بماند.
 
 متن انگلیسی خبر/محصول:
 عنوان: {title}
@@ -1243,7 +1245,7 @@ def _format_unified_caption_safety(
 
     # Enforce strict maximum length limit for photo captions in Telegram (1024 characters)
     # Telegram max caption is 1024.
-    if len(text) > 1020:
+    if len(text) > 995:
         # Try to find the last double newline before 980 chars
         safe_cut = text.rfind("\n\n", 0, 980)
         if safe_cut == -1:
@@ -1251,9 +1253,9 @@ def _format_unified_caption_safety(
             safe_cut = text.rfind("\n", 0, 980)
         if safe_cut == -1:
             # Fallback to last space
-            safe_cut = text.rfind(" ", 0, 980)
+            safe_cut = text.rfind(" ", 0, 950)
         if safe_cut == -1:
-            safe_cut = 980
+            safe_cut = 950
             
         text = text[:safe_cut] + "…"
         
@@ -1382,7 +1384,7 @@ async def main(event=None, context=None):
     log   = context.log   if context and hasattr(context, "log")   else print
     error = context.error if context and hasattr(context, "error") else print
 
-    log("═══ FashionBot v13.2 Universal Thematic & Engagement Agent started ═══")
+    log("═══ FashionBot v13.3 Ultimate Product-First Album Agent started ═══")
 
     loop       = asyncio.get_running_loop()
     start_time = loop.time()
