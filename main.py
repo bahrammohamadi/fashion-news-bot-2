@@ -1588,7 +1588,7 @@ async def main(event=None, context=None):
         post_type = "news"
 
     elif post_type == "poll":
-        poll_prompt = _PROMPT_POLL_GENERATOR.format(occasion=occasion_context)
+        poll_prompt = _PROMPT_POLL_GENERATOR.replace("{occasion}", occasion_context)
         poll_raw    = await _parallel_ai_race(poll_prompt, AI_RACE_TIMEOUT, log)
         if poll_raw:
             try:
@@ -3182,7 +3182,7 @@ _PROMPT_POLL_GENERATOR = '''تو یک استراتژیست ارشد محتوا،
 - در صورت انتخاب حالت quiz، حتماً شماره گزینه صحیح (`correct_option_id` از 0) و یک جمله توضیح آموزنده (`explanation`) ارائه بده. در حالت regular این دو فیلد را null بگذار.
 
 ساختار JSON مورد انتظار:
-{
+{{
   "type": "regular",  // یا "quiz"
   "question": "[سوال جذاب، کوتاه و چالش‌برانگیز فارسی]",
   "options": [
@@ -3192,4 +3192,4 @@ _PROMPT_POLL_GENERATOR = '''تو یک استراتژیست ارشد محتوا،
   ],
   "correct_option_id": 0,  // در حالت regular برابر null و در حالت quiz شماره ایندکس گزینه صحیح
   "explanation": "[در حالت regular برابر null و در حالت quiz یک جمله توضیح آموزنده و الهام‌بخش]"
-}'''
+}}'''
